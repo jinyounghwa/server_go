@@ -183,4 +183,35 @@ impl Kms {
             })
             .collect()
     }
+
+    pub fn snap_save(&self) -> Value {
+        let keys: Vec<Value> = self.keys.iter().map(|(id, k)| json!({
+            "id": id, "arn": k.arn, "desc": k.desc, "enabled": k.enabled,
+            "created": k.created, "deletion": k.deletion, "secret": b64(&k.secret),
+        })).collect();
+        json!({"keys": keys, "aliases": self.aliases})
+    }
+
+    pub fn snap_load(&mut self, v: &Value) {
+        self.keys.clear();
+        self.aliases.clear();
+        for k in v["keys"].as_array().into_iter().flatten() {
+            let Some(id) = k["id"].as_str() else { continue };
+            self.keys.insert(id.into(), Key {
+                arn: k["arn"].as_str().unwrap_or("").into(),
+                desc: k["desc"].as_str().unwrap_or("").into(),
+                enabled: k["enabled"].as_bool().unwrap_or(true),
+                created: k["created"].as_f64().unwrap_or_else(epoch),
+                deletion: k["deletion"].as_f64(),
+                secret: k["secret"].as_str().and_then(unb64).unwrap_or_else(|| rand_bytes(32)),
+            });
+        }
+        if let Some(m) = v["aliases"].as_object() {
+            for (a, kid) in m {
+                if let Some(id) = kid.as_str() {
+                    self.aliases.insert(a.clone(), id.into());
+                }
+            }
+        }
+    }
 }

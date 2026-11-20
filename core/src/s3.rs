@@ -530,4 +530,37 @@ impl Store {
                 "objects": b.objs.iter().take(100).map(|(k, o)| serde_json::json!({"key": k, "size": o.data.len(), "type": o.ctype, "modified": iso(&o.modified)})).collect::<Vec<_>>()}))
             .collect()
     }
+
+    pub fn snap_save(&self) -> serde_json::Value {
+        let buckets: Vec<serde_json::Value> = self.buckets.iter().map(|(n, b)| {
+            let objs: Vec<serde_json::Value> = b.objs.iter().map(|(k, o)| serde_json::json!({
+                "key": k, "data": crate::b64(&o.data), "ctype": o.ctype,
+                "modified": o.modified.to_rfc3339(), "meta": o.meta,
+            })).collect();
+            serde_json::json!({"name": n, "created": b.created.to_rfc3339(), "objects": objs})
+        }).collect();
+        serde_json::json!(buckets)
+    }
+
+    pub fn snap_load(&mut self, v: &serde_json::Value) {
+        self.buckets.clear();
+        self.uploads.clear();
+        self.pending.clear();
+        for b in v.as_array().into_iter().flatten() {
+            let Some(name) = b["name"].as_str() else { continue };
+            let created = b["created"].as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map_or_else(Utc::now, |d| d.with_timezone(&Utc));
+            let mut objs = BTreeMap::new();
+            for o in b["objects"].as_array().into_iter().flatten() {
+                let Some(key) = o["key"].as_str() else { continue };
+                let data = Bytes::from(o["data"].as_str().and_then(crate::unb64).unwrap_or_default());
+                let etag = etag_of(&data);
+                let ctype = o["ctype"].as_str().unwrap_or("application/octet-stream").into();
+                let modified = o["modified"].as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map_or_else(Utc::now, |d| d.with_timezone(&Utc));
+                let meta: Vec<(String, String)> = o["meta"].as_array().into_iter().flatten()
+                    .filter_map(|m| Some((m[0].as_str()?.into(), m[1].as_str()?.into()))).collect();
+                objs.insert(key.into(), Obj { data, etag, ctype, modified, meta });
+            }
+            self.buckets.insert(name.into(), Bucket { created, objs, notif: vec![], notif_xml: String::new() });
+        }
+    }
 }

@@ -172,4 +172,37 @@ impl Secrets {
             })
             .collect()
     }
+
+    pub fn snap_save(&self) -> Value {
+        let items: Vec<Value> = self.s.iter().map(|(n, x)| {
+            let vers: Vec<Value> = x.versions.iter().map(|v| json!({
+                "id": v.id, "string": v.string, "binary": v.binary, "stages": v.stages, "created": v.created,
+            })).collect();
+            json!({"name": n, "arn": x.arn, "description": x.description, "versions": vers,
+                   "created": x.created, "changed": x.changed, "deleted": x.deleted})
+        }).collect();
+        json!(items)
+    }
+
+    pub fn snap_load(&mut self, v: &Value) {
+        self.s.clear();
+        for x in v.as_array().into_iter().flatten() {
+            let Some(name) = x["name"].as_str() else { continue };
+            let versions: Vec<Version> = x["versions"].as_array().into_iter().flatten().map(|v| Version {
+                id: v["id"].as_str().unwrap_or("").into(),
+                string: v["string"].as_str().map(String::from),
+                binary: v["binary"].as_str().map(String::from),
+                stages: v["stages"].as_array().into_iter().flatten().filter_map(|s| s.as_str().map(String::from)).collect(),
+                created: v["created"].as_f64().unwrap_or_else(epoch),
+            }).collect();
+            self.s.insert(name.into(), Secret {
+                arn: x["arn"].as_str().unwrap_or("").into(),
+                description: x["description"].as_str().map(String::from),
+                versions,
+                created: x["created"].as_f64().unwrap_or_else(epoch),
+                changed: x["changed"].as_f64().unwrap_or_else(epoch),
+                deleted: x["deleted"].as_f64(),
+            });
+        }
+    }
 }

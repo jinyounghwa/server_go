@@ -1120,6 +1120,50 @@ def test_inspector():
     assert json.load(urllib.request.urlopen(EP + "/_admin/chaos"))["rules"] == []
 
 
+def test_snapshot():
+    import urllib.request
+    H = {"x-rocalcloud": "1", "content-type": "application/json"}
+    sns, ssm, sm, kms, iam = (boto3.client(n, **kw) for n in ("sns", "ssm", "secretsmanager", "kms", "iam"))
+    p = f"snap{run}"
+    ddb.create_table(TableName=p, BillingMode="PAY_PER_REQUEST", KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+                     AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}])
+    ddb.put_item(TableName=p, Item={"id": {"S": "k1"}, "v": {"S": "saved"}})
+    s3.create_bucket(Bucket=p)
+    s3.put_object(Bucket=p, Key="a.txt", Body=b"hello-snap", ContentType="text/plain")
+    q = sqs.create_queue(QueueName=p)["QueueUrl"]
+    sqs.send_message(QueueUrl=q, MessageBody="queued-msg")
+    t = sns.create_topic(Name=p)["TopicArn"]
+    sns.subscribe(TopicArn=t, Protocol="sqs", Endpoint=f"arn:aws:sqs:us-east-1:000000000000:{p}", Attributes={"RawMessageDelivery": "true"})
+    ssm.put_parameter(Name=f"/{p}/k", Value="v1", Type="String")
+    sm.create_secret(Name=p, SecretString="s-val")
+    kid = kms.create_key(Description=p)["KeyMetadata"]["KeyId"]
+    ct = kms.encrypt(KeyId=kid, Plaintext=b"kms-secret")["CiphertextBlob"]
+    iam.create_user(UserName=p)
+    ak = iam.create_access_key(UserName=p)["AccessKey"]
+    iam.put_user_policy(UserName=p, PolicyName="allow", PolicyDocument=json.dumps(
+        {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{p}/*"}]}))
+
+    snap = urllib.request.urlopen(f"{EP}/_admin/snapshot").read()
+    urllib.request.urlopen(urllib.request.Request(f"{EP}/_admin/reset", headers={"x-rocalcloud": "1"}, method="POST"))
+    assert p not in ddb.list_tables()["TableNames"]
+    assert not [b for b in s3.list_buckets()["Buckets"] if b["Name"] == p]
+
+    res = json.load(urllib.request.urlopen(urllib.request.Request(f"{EP}/_admin/snapshot", data=snap, headers=H, method="POST")))
+    assert res["restored"] is True, res
+    assert ddb.get_item(TableName=p, Key={"id": {"S": "k1"}})["Item"]["v"]["S"] == "saved"
+    assert s3.get_object(Bucket=p, Key="a.txt")["Body"].read() == b"hello-snap"
+    assert sqs.receive_message(QueueUrl=q)["Messages"][0]["Body"] == "queued-msg"
+    assert ssm.get_parameter(Name=f"/{p}/k")["Parameter"]["Value"] == "v1"
+    assert sm.get_secret_value(SecretId=p)["SecretString"] == "s-val"
+    assert kms.decrypt(CiphertextBlob=ct)["Plaintext"] == b"kms-secret"
+    # Restored IAM user & policy still enforced
+    u_s3 = boto3.client("s3", endpoint_url=EP, region_name="us-east-1",
+                        aws_access_key_id=ak["AccessKeyId"], aws_secret_access_key=ak["SecretAccessKey"])
+    assert u_s3.get_object(Bucket=p, Key="a.txt")["Body"].read() == b"hello-snap"
+    assert code(u_s3.list_buckets) == "AccessDenied"
+    urllib.request.urlopen(urllib.request.Request(f"{EP}/_admin/reset", headers={"x-rocalcloud": "1"}, method="POST"))
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

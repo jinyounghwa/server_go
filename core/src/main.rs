@@ -774,6 +774,71 @@ async fn state(State(app): State<Arc<App>>) -> Json<Value> {
     }))
 }
 
+fn export_snapshot(app: &App) -> Value {
+    json!({
+        "version": 1,
+        "saved_at": chrono::Utc::now().to_rfc3339(),
+        "services": {
+            "dynamodb": app.ddb.lock().unwrap().snap_save(),
+            "s3": app.s3.lock().unwrap().snap_save(),
+            "sqs": app.sqs.lock().unwrap().snap_save(),
+            "sns": app.sns.lock().unwrap().snap_save(),
+            "iam": app.iam.lock().unwrap().snap_save(),
+            "ssm": app.ssm.lock().unwrap().snap_save(),
+            "secrets": app.secrets.lock().unwrap().snap_save(),
+            "kms": app.kms.lock().unwrap().snap_save(),
+        }
+    })
+}
+
+fn import_snapshot(app: &App, snap: &Value) {
+    let s = &snap["services"];
+    if s["dynamodb"].is_array() { app.ddb.lock().unwrap().snap_load(&s["dynamodb"]); }
+    if s["s3"].is_array() { app.s3.lock().unwrap().snap_load(&s["s3"]); }
+    if s["sqs"].is_array() { app.sqs.lock().unwrap().snap_load(&s["sqs"]); }
+    if s["sns"].is_object() { app.sns.lock().unwrap().snap_load(&s["sns"]); }
+    if s["iam"].is_object() { app.iam.lock().unwrap().snap_load(&s["iam"]); }
+    if s["ssm"].is_array() { app.ssm.lock().unwrap().snap_load(&s["ssm"]); }
+    if s["secrets"].is_array() { app.secrets.lock().unwrap().snap_load(&s["secrets"]); }
+    if s["kms"].is_object() { app.kms.lock().unwrap().snap_load(&s["kms"]); }
+}
+
+async fn get_snapshot(State(app): State<Arc<App>>) -> Response {
+    Response::builder()
+        .header("content-type", "application/json")
+        .header("content-disposition", "attachment; filename=\"rocalcloud-snapshot.json\"")
+        .body(Body::from(export_snapshot(&app).to_string()))
+        .unwrap()
+}
+
+async fn post_snapshot(State(app): State<Arc<App>>, h: HeaderMap, body: Bytes) -> Response {
+    if !h.contains_key("x-rocalcloud") {
+        return Response::builder().status(403).body(Body::empty()).unwrap();
+    }
+    let Ok(snap) = serde_json::from_slice::<Value>(&body) else {
+        return Response::builder().status(400).body(Body::from("invalid snapshot JSON")).unwrap();
+    };
+    if !snap["services"].is_object() {
+        return Response::builder().status(400).body(Body::from("missing services object")).unwrap();
+    }
+    import_snapshot(&app, &snap);
+    emit(&app, json!({"ts": chrono::Utc::now().to_rfc3339(), "service": "admin", "op": "SnapshotLoaded", "status": 200}));
+    Json(json!({"restored": true, "saved_at": snap["saved_at"]})).into_response()
+}
+
+async fn save_snapshot_file(State(app): State<Arc<App>>, h: HeaderMap) -> Response {
+    if !h.contains_key("x-rocalcloud") {
+        return Response::builder().status(403).body(Body::empty()).unwrap();
+    }
+    let Ok(path) = std::env::var("RC_STATE_FILE") else {
+        return Response::builder().status(400).body(Body::from("RC_STATE_FILE is not set")).unwrap();
+    };
+    match std::fs::write(&path, serde_json::to_string_pretty(&export_snapshot(&app)).unwrap_or_default()) {
+        Ok(()) => Json(json!({"saved": path})).into_response(),
+        Err(e) => Response::builder().status(500).body(Body::from(e.to_string())).unwrap(),
+    }
+}
+
 // Custom header forces a CORS preflight, so other websites can't wipe state with a blind POST.
 async fn reset(State(app): State<Arc<App>>, h: HeaderMap) -> axum::http::StatusCode {
     if !h.contains_key("x-rocalcloud") {
@@ -959,6 +1024,8 @@ async fn main() {
         .route("/_inspect/replay", post(inspect_replay))
         .route("/favicon.ico", get(|| async { axum::http::StatusCode::NO_CONTENT })) // keep browsers out of the S3 log
         .route("/_admin/state", get(state))
+        .route("/_admin/snapshot", get(get_snapshot).post(post_snapshot))
+        .route("/_admin/snapshot/save", post(save_snapshot_file))
         .route("/_admin/reset", post(reset))
         .route("/_admin/reach", get(reach))
         .route("/_api/{*rest}", axum::routing::any(api_invoke))
@@ -968,6 +1035,14 @@ async fn main() {
         .layer(DefaultBodyLimit::max(MAX_BODY)) // ponytail: 256 MiB per request, bodies are held in memory
         .layer(axum::middleware::from_fn(reject_oversize))
         .with_state(app.clone());
+    if let Ok(path) = std::env::var("RC_STATE_FILE") {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(snap) = serde_json::from_str::<Value>(&text) {
+                import_snapshot(&app, &snap);
+                eprintln!("rocalcloud restored snapshot from {path}");
+            }
+        }
+    }
     tokio::spawn(managed::cleanup());
     route53::serve_dns(app.clone());
     let l = tokio::net::TcpListener::bind(&bind).await.expect("bind");

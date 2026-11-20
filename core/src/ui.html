@@ -90,6 +90,8 @@ pre { margin: 4px 0 10px; padding: 8px 10px; background: var(--panel); border: 1
   <form class="ask" id="askform"><input id="q" placeholder="에이전트에게 묻기 (예: 최근 오류 왜 났어?)" aria-label="에이전트에게 질문"><button>묻기</button></form>
   <span class="muted" id="llm"></span>
   <button id="inspectbtn">검사</button>
+  <a href="/_admin/snapshot" download="rocalcloud-snapshot.json" style="color:inherit">스냅샷 저장</a>
+  <button id="snapload">스냅샷 복원</button><input id="snapfile" type="file" accept="application/json" hidden>
   <a href="/_town" style="color:inherit">마을 보기</a>
   <button id="refresh">새로고침</button>
   <button id="reset" class="danger">전체 초기화</button>
@@ -354,6 +356,15 @@ fromHash();
 $("filter").oninput = renderLog;
 $("clear").onclick = () => { events.length = 0; renderLog(); };
 $("refresh").onclick = load;
+$("snapload").onclick = () => $("snapfile").click();
+$("snapfile").onchange = async ev => {
+  const f = ev.target.files[0]; if (!f) return;
+  const text = await f.text();
+  const r = await fetch("/_admin/snapshot", {method: "POST", headers: H, body: text});
+  if (!r.ok) alert("스냅샷 복원 실패: " + await r.text());
+  else { sel = null; viewMode = "resource"; load(); }
+  ev.target.value = "";
+};
 $("reset").onclick = async () => {
   if (!confirm("모든 테이블, 버킷, 큐를 지웁니다. 계속할까요?")) return;
   await fetch("/_admin/reset", {method: "POST", headers: {"x-rocalcloud": "1"}});

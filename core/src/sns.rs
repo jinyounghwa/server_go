@@ -198,4 +198,32 @@ impl Sns {
     pub fn export(&self) -> (Vec<String>, Vec<(String, String, String, BTreeMap<String, String>)>) {
         (self.topics.keys().cloned().collect(), self.subs.values().map(|s| (s.topic.clone(), s.protocol.clone(), s.endpoint.clone(), s.attrs.clone())).collect())
     }
+
+    pub fn snap_save(&self) -> Value {
+        let subs: Vec<Value> = self.subs.iter().map(|(arn, s)| json!({
+            "arn": arn, "topic": s.topic, "protocol": s.protocol, "endpoint": s.endpoint, "attrs": s.attrs,
+        })).collect();
+        json!({"topics": self.topics, "subs": subs})
+    }
+
+    pub fn snap_load(&mut self, v: &Value) {
+        self.topics.clear();
+        self.subs.clear();
+        self.published.clear();
+        if let Some(m) = v["topics"].as_object() {
+            for (arn, attrs) in m {
+                let a: BTreeMap<String, String> = attrs.as_object().into_iter().flatten()
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").into())).collect();
+                self.topics.insert(arn.clone(), a);
+            }
+        }
+        for s in v["subs"].as_array().into_iter().flatten() {
+            let (Some(arn), Some(topic), Some(protocol), Some(endpoint)) = (
+                s["arn"].as_str(), s["topic"].as_str(), s["protocol"].as_str(), s["endpoint"].as_str(),
+            ) else { continue };
+            let attrs: BTreeMap<String, String> = s["attrs"].as_object().into_iter().flatten()
+                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").into())).collect();
+            self.subs.insert(arn.into(), Sub { topic: topic.into(), protocol: protocol.into(), endpoint: endpoint.into(), attrs });
+        }
+    }
 }

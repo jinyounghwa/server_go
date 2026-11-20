@@ -281,4 +281,35 @@ impl Queues {
             (n.clone(), a)
         }).collect()
     }
+
+    pub fn snap_save(&self) -> Value {
+        let qs: Vec<Value> = self.q.iter().map(|(n, q)| {
+            let msgs: Vec<Value> = q.msgs.iter().map(|m| json!({
+                "id": m.id, "body": m.body, "md5": m.md5, "receives": m.receives, "sent": m.sent as u64,
+            })).collect();
+            json!({"name": n, "attrs": q.attrs, "msgs": msgs})
+        }).collect();
+        json!(qs)
+    }
+
+    pub fn snap_load(&mut self, v: &Value) {
+        self.q.clear();
+        let now = Instant::now();
+        for q in v.as_array().into_iter().flatten() {
+            let Some(name) = q["name"].as_str() else { continue };
+            let attrs = str_map(&q["attrs"]);
+            let msgs: Vec<Msg> = q["msgs"].as_array().into_iter().flatten().map(|m| {
+                let body = m["body"].as_str().unwrap_or("").to_string();
+                let md5 = m["md5"].as_str().map(String::from).unwrap_or_else(|| format!("{:x}", Md5::digest(&body)));
+                Msg {
+                    id: m["id"].as_str().map(String::from).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    body, md5, visible_at: now, receipt: None,
+                    receives: m["receives"].as_u64().unwrap_or(0),
+                    sent: m["sent"].as_u64().map_or_else(now_ms, |x| x as u128),
+                    first: None,
+                }
+            }).collect();
+            self.q.insert(name.into(), Queue { attrs, msgs });
+        }
+    }
 }

@@ -828,4 +828,31 @@ impl Db {
             (n.clone(), p)
         }).collect()
     }
+
+    pub fn snap_save(&self) -> Value {
+        let tables: Vec<Value> = self.tables.iter().map(|(n, t)| json!({
+            "name": n, "desc": t.desc, "hash": t.hash, "range": t.range,
+            "items": t.items.values().cloned().collect::<Vec<_>>(),
+        })).collect();
+        json!(tables)
+    }
+
+    pub fn snap_load(&mut self, v: &Value) {
+        self.tables.clear();
+        for t in v.as_array().into_iter().flatten() {
+            let Some(name) = t["name"].as_str() else { continue };
+            let Some(hash) = t["hash"].as_str() else { continue };
+            let range = t["range"].as_str().map(String::from);
+            let mut items = BTreeMap::new();
+            for it in t["items"].as_array().into_iter().flatten() {
+                if let Some(m) = it.as_object() {
+                    if let Some(hk) = m.get(hash).and_then(kpart) {
+                        let rk = range.as_deref().and_then(|r| m.get(r).and_then(kpart));
+                        items.insert((hk, rk), m.clone());
+                    }
+                }
+            }
+            self.tables.insert(name.into(), Table { desc: t["desc"].clone(), hash: hash.into(), range, items });
+        }
+    }
 }

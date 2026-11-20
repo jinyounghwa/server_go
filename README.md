@@ -132,7 +132,7 @@ animations.
 - `GET /_town` — character town
 - `GET /_agent/status`, `POST /_agent/explain`, `POST /_agent/ask`, `GET /_agent/template` — explanation agent
 - `POST /_inspect/run`, `GET /_inspect/reports`, `GET /_inspect/report/{id}`, `POST /_inspect/replay` — verification agent
-- `GET /_admin/state`, `POST /_admin/reset`, `GET/POST /_admin/chaos` (POSTs need header `x-rocalcloud`)
+- `GET /_admin/state`, `GET/POST /_admin/snapshot` (JSON state export/restore; `RC_STATE_FILE` auto-restores on startup, `POST /_admin/snapshot/save` writes to it), `POST /_admin/reset`, `GET/POST /_admin/chaos` (POSTs need header `x-rocalcloud`)
 - `GET /_admin/reach?from=internet|<instance-id>&to=...&protocol=tcp&port=443` — step-by-step reachability
   (route table → internet gateway, public IP, security group rules). NACLs, peering and NAT are not modeled yet.
 

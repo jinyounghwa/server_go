@@ -531,6 +531,70 @@ pub fn to_xml(v: &Value) -> String {
     }
 }
 
+impl Iam {
+    pub fn snap_save(&self) -> Value {
+        let ent = |m: &BTreeMap<String, Entity>| -> Vec<Value> {
+            m.iter().map(|(n, e)| json!({
+                "name": n, "id": e.id, "created": e.created, "attached": e.attached, "inline": e.inline, "trust": e.trust,
+            })).collect()
+        };
+        let policies: Vec<Value> = self.policies.iter().map(|(arn, p)| json!({
+            "arn": arn, "name": p.name, "id": p.id, "created": p.created, "doc": p.doc,
+        })).collect();
+        let keys: Vec<Value> = self.keys.iter().map(|(akid, k)| {
+            let (kind, a, b) = match &k.owner {
+                Principal::Root => ("root", "", ""),
+                Principal::User(u) => ("user", u.as_str(), ""),
+                Principal::Role { role, session } => ("role", role.as_str(), session.as_str()),
+            };
+            json!({"akid": akid, "secret": k.secret, "kind": kind, "a": a, "b": b, "created": k.created, "token": k.token})
+        }).collect();
+        json!({"users": ent(&self.users), "roles": ent(&self.roles), "policies": policies, "keys": keys})
+    }
+
+    pub fn snap_load(&mut self, v: &Value) {
+        self.users.clear();
+        self.roles.clear();
+        self.policies.clear();
+        self.keys.clear();
+        let load_ent = |arr: &Value, dst: &mut BTreeMap<String, Entity>| {
+            for e in arr.as_array().into_iter().flatten() {
+                let Some(name) = e["name"].as_str() else { continue };
+                let attached = e["attached"].as_array().into_iter().flatten().filter_map(|s| s.as_str().map(String::from)).collect();
+                let inline = e["inline"].as_object().into_iter().flatten().map(|(k, v)| (k.clone(), v.clone())).collect();
+                dst.insert(name.into(), Entity {
+                    id: e["id"].as_str().unwrap_or("").into(),
+                    created: e["created"].as_str().map(String::from).unwrap_or_else(now),
+                    attached, inline, trust: e["trust"].clone(),
+                });
+            }
+        };
+        load_ent(&v["users"], &mut self.users);
+        load_ent(&v["roles"], &mut self.roles);
+        for p in v["policies"].as_array().into_iter().flatten() {
+            let (Some(arn), Some(name)) = (p["arn"].as_str(), p["name"].as_str()) else { continue };
+            self.policies.insert(arn.into(), Policy {
+                name: name.into(), id: p["id"].as_str().unwrap_or("").into(),
+                created: p["created"].as_str().map(String::from).unwrap_or_else(now),
+                doc: p["doc"].clone(),
+            });
+        }
+        for k in v["keys"].as_array().into_iter().flatten() {
+            let Some(akid) = k["akid"].as_str() else { continue };
+            let owner = match k["kind"].as_str().unwrap_or("root") {
+                "user" => Principal::User(k["a"].as_str().unwrap_or("").into()),
+                "role" => Principal::Role { role: k["a"].as_str().unwrap_or("").into(), session: k["b"].as_str().unwrap_or("").into() },
+                _ => Principal::Root,
+            };
+            self.keys.insert(akid.into(), Key {
+                secret: k["secret"].as_str().unwrap_or("").into(), owner,
+                created: k["created"].as_str().map(String::from).unwrap_or_else(now),
+                token: k["token"].as_str().map(String::from),
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

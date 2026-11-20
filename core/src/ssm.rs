@@ -99,4 +99,26 @@ impl Ssm {
     pub fn export(&self) -> Vec<(String, String, String)> {
         self.p.iter().map(|(n, p)| (n.clone(), p.ty.clone(), p.value.clone())).collect()
     }
+
+    pub fn snap_save(&self) -> Value {
+        let items: Vec<Value> = self.p.iter().map(|(n, p)| json!({
+            "name": n, "value": p.value, "ty": p.ty, "version": p.version,
+            "modified": p.modified, "description": p.description,
+        })).collect();
+        json!(items)
+    }
+
+    pub fn snap_load(&mut self, v: &Value) {
+        self.p.clear();
+        for x in v.as_array().into_iter().flatten() {
+            let Some(name) = x["name"].as_str() else { continue };
+            self.p.insert(name.into(), Param {
+                value: x["value"].as_str().unwrap_or("").into(),
+                ty: x["ty"].as_str().unwrap_or("String").into(),
+                version: x["version"].as_i64().unwrap_or(1),
+                modified: x["modified"].as_f64().unwrap_or_else(epoch),
+                description: x["description"].as_str().map(String::from),
+            });
+        }
+    }
 }
