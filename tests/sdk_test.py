@@ -309,6 +309,12 @@ def test_sigv4():
         assert e.code == 403
     assert "Buckets" in s3.list_buckets()
 
+def test_config():
+    import urllib.request
+    c = json.loads(urllib.request.urlopen(EP + "/_admin/config").read())
+    assert c["enforce_iam"] is True and c["vars"]["ENFORCE_IAM"] == "1" and "RC_ROOT_SECRET" not in c["vars"], c
+
+
 def test_sns_to_sqs():
     sns = boto3.client("sns", **kw)
     t = sns.create_topic(Name=f"orders{run}")["TopicArn"]

@@ -544,8 +544,18 @@ fn check(t: &Table, key: &PK, r: &Value) -> Result<(), ApiErr> {
     Ok(())
 }
 
+// DynamoDB's 400 KB item limit. ponytail: measured as the item's JSON length, which slightly overcounts
+// type tags and quotes compared with DynamoDB's name+value bytes.
+fn fits(item: &Item) -> Result<(), ApiErr> {
+    if serde_json::to_string(item).map_or(0, |s| s.len()) > 400 * 1024 {
+        return Err(verr("Item size has exceeded the maximum allowed size"));
+    }
+    Ok(())
+}
+
 fn put(t: &mut Table, r: &Value) -> Result<Option<Item>, ApiErr> {
     let item = obj(r, "Item")?.clone();
+    fits(&item)?;
     let k = t.key_of(&item)?;
     check(t, &k, r)?;
     Ok(t.items.insert(k, item))
@@ -569,6 +579,7 @@ fn update(t: &mut Table, r: &Value) -> Result<(Option<Item>, Item), ApiErr> {
     if t.key_of(&new)? != k {
         return Err(verr("Cannot update attribute that is part of the key"));
     }
+    fits(&new)?;
     t.items.insert(k, new.clone());
     Ok((old, new))
 }

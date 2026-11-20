@@ -5,7 +5,8 @@
 
 ## 1. 현재 상태
 
-- 계획서 6장 순서 **1~8단계 전부 완료** (코어·22개 서비스·GUI·캐릭터 마을·해설 에이전트·검증 에이전트·Python/JS/Rust 3개 SDK 호환성 스위트·Dockerfile/Homebrew/GitHub Actions CI·Release 패키징·문서 정비).
+- 계획서 4장 체크리스트를 실제 상태로 표시했다(2026-11-21). 6장 순서 **1~8단계 전부 완료** (코어·22개 서비스·GUI·캐릭터 마을·해설 에이전트·검증 에이전트·Python/JS/Rust 3개 SDK 호환성 스위트·Dockerfile/Homebrew/GitHub Actions CI·Release 패키징·문서 정비).
+- 2026-11-21 추가: 선택적 SigV4 검증, SQS FIFO, DynamoDB 400KB 한도, 검사 시나리오 7개, 설정 파일·설정 화면, SKILL.md.
 - 이후 추가: JSON 상태 스냅샷, 3D(Three.js) 캐릭터 마을, GitHub Pages 마을(`pages.yml`). Pages 마을은 방문자 PC의 로컬 에뮬레이터
   (`127.0.0.1:4566`, `?api=`)에 SSE로 붙어 실제 트래픽을 보여 주고, 연결 전에만 목업 트래픽을 돌린다(5초마다 재시도).
 - `v0.1.0` 릴리스 완료(2026-11-21): 바이너리 3종 + SHA256SUMS, Homebrew sha256 반영.
@@ -17,7 +18,8 @@
 
 ```
 core/            Rust 단일 바이너리 (axum + tokio), 모든 서비스가 여기 있다
-  src/main.rs    라우팅, 인증(IAM 판정), 장애 주입, 이벤트 발행, 관리 엔드포인트
+  src/main.rs    라우팅, 인증(서명 검증·IAM 판정), 장애 주입, 이벤트 발행, 관리 엔드포인트, 설정(RC_CONFIG)
+  src/sigv4.rs   SigV4 서명·검증(VERIFY_SIGV4=1), HMAC은 sha2로 직접 구현
   src/<svc>.rs   서비스별 모듈. 상태 struct + handle() + admin()
   src/ui.html    관리 GUI (/_ui), town.html 캐릭터 마을 (/_town) — include_str!로 내장
 gui/             Tauri 2 창. /_ui를 여는 껍데기일 뿐
@@ -30,7 +32,7 @@ lambda, events, sfn, apigw, cognito, kinesis, ses, managed(RDS·ElastiCache, Doc
 agent(해설 에이전트), inspector(검증 에이전트).
 
 ### 요청 흐름 (main.rs `handle`)
-1. SigV4 헤더에서 access key와 서비스 이름을 읽는다(서명 검증은 안 함).
+1. SigV4 헤더에서 access key와 서비스 이름을 읽는다. `VERIFY_SIGV4=1`이면 3단계 전에 서명을 검증한다.
 2. `Svc` enum으로 분류: X-Amz-Target(JSON 프로토콜), 경로(REST), form `Action`+`Version`(Query 프로토콜).
 3. `checks()`가 (IAM action, resource ARN) 목록을 만들고 `iam.authorize()`로 판정. `ENFORCE_IAM=1`일 때만 거부.
 4. `chaos_fault()`가 장애 주입 규칙 적용.
@@ -47,7 +49,7 @@ agent(해설 에이전트), inspector(검증 에이전트).
 - 다른 서비스로 보내는 일(배달, 트리거)은 main.rs `send_to_target()`/`deliver()`를 쓴다.
 
 ### 관리 엔드포인트
-`/_ui` `/_town` `/_events`(SSE) `/_admin/state` `/_admin/reset`(POST) `/_admin/reach` `/_admin/chaos`(GET/POST)
+`/_ui` `/_town` `/_events`(SSE) `/_admin/config` `/_admin/state` `/_admin/reset`(POST) `/_admin/reach` `/_admin/chaos`(GET/POST)
 `/_api/{apiId}/...`(API GW 호출) `/_cognito/{pool}/.well-known/*` `/_agent/status|explain|ask|template` `/_inspect/run|reports|report/{id}|replay`.
 **POST 관리 엔드포인트는 `x-rocalcloud` 헤더를 요구한다**(다른 웹사이트의 CSRF 차단). 새 POST도 같은 규칙.
 
@@ -59,7 +61,7 @@ ENFORCE_IAM=1 cargo run --release            # 127.0.0.1:4566
 cargo test                                   # 단위 테스트
 uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with redis --with dnspython tests/sdk_test.py
 ```
-- 테스트는 반드시 `ENFORCE_IAM=1` 서버로 돌린다. 맥에는 Docker 데몬이 없어 RDS·ECS 테스트는 `skip`으로 나온다.
+- 테스트는 반드시 `ENFORCE_IAM=1` 서버로 돌린다. 서명 검증도 보려면 `ENFORCE_IAM=1 VERIFY_SIGV4=1`로 한 번 더(CI도 두 번 돈다). 맥에는 Docker 데몬이 없어 RDS·ECS 테스트는 `skip`으로 나온다.
 - 전체 검증은 우분투에서 한다(아래 4절). 끝나면 남은 컨테이너가 0개인지 `docker ps -a`로 확인.
 - 화면 확인은 Playwright + 설치된 Chrome: `uv run --with playwright python script.py` 안에서 `launch(channel="chrome")`.
   사용자의 Chrome 설정(Apple Events JS 등)은 바꾸지 않는다.
@@ -91,30 +93,21 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
 - LLM은 코어 바깥에만 둔다. LLM이 꺼져도 모든 기능이 동작해야 한다(규칙 기반 폴백 먼저).
 - 결과 보고는 사실대로: 실패와 생략을 숨기지 않는다. 테스트 채점 기준이 느슨했다면 그것도 밝힌다.
 
-## 6. 다음 일: 7단계 검증 에이전트 (계획서 10절)
+## 6. 검증 에이전트 요점 (inspector.rs)
+- 실행기·판정기는 결정적 코드, 대상은 127.0.0.1만. LLM은 시나리오 제안만 한다(꺼져 있으면 내장 시나리오만).
+- 내장 시나리오 20개: 보안 7, 장애 6(스로틀·5xx·지연·부분 실패·연결 끊김·부하 중 재생성), 사고 4(DLQ·Lambda 반복 실패·
+  큐 폭주·저장소 한도), 성능 2(동시 처리량·메모리 증가), 퍼징 1. 파괴적 작업은 `rc-insp-` 접두사 리소스에서만.
+- 요청은 `local_http()` 하나로 나가며 `resign()`이 진짜 SigV4로 서명한다(`sig_header()`의 `Signature=00`은 자리표시).
+  `VERIFY_SIGV4=1`이면 서명 없는 요청도 루트로 서명한다. 서명 없이 보내야 하는 검사는 `x-rc-unsigned` 헤더를 단다.
+- 새 시나리오: `sc_x()` 함수 → `run_inner()`의 `plan` 목록과 `match id`에 추가 → `make_result()`로 결과.
 
-권장 설계 (기존 코드를 재사용):
-- `core/src/inspector.rs` + `POST /_inspect/run`(헤더 필수), 진행은 이벤트(`service: "inspector"`)로 발행.
-- **실행기는 결정적 코드**: 시나리오는 `{name, kind, steps:[{service, op, params}], expect:{status, error_code}}` JSON.
-  에뮬레이터 자신에게만 요청한다(외부 네트워크 금지, 대상은 127.0.0.1만 허용).
-  내부 호출은 agent.rs `call_api()`나 cfn.rs의 내부 호출 방식을 재사용.
-- **판정기는 규칙**: 기대 status/오류 코드와 실제 비교. LLM 판정 금지.
-- **LLM은 시나리오 생성기로만**: agent.rs `chat()`(직렬화·간격·짧은 출력 이미 구현)과 JSON 스키마 강제.
-  LLM이 꺼져 있으면 내장 기본 시나리오만 돈다.
-- 기본 시나리오(우선순위): IAM 거부(명시·암묵), S3 키 경로 조작(`../`, 인코딩), 과대 페이로드(256 MiB 한도),
-  서명 누락 요청, chaos(스로틀·5xx) 중 SDK 재시도, DLQ 적체, Lambda 반복 실패, 동시 요청 처리량,
-  무작위 입력 퍼징(패닉 탐지: 서버가 계속 살아 있는지).
-- 안전장치: 실행 횟수·시간 상한, 로컬 대상만, 파괴적 시나리오는 전용 접두사 리소스에서만.
-- 리포트: 심각도별 목록 + 재현 요청 저장(`tests/regressions/*.json`), HTML/Markdown 내보내기.
-- 화면: ui.html에 검사 탭(진행률, 통과/실패, 재현 요청), town.html에 검사관 캐릭터(경비가 막으면 성공 연출).
-- `test_inspector`를 sdk_test.py에 추가.
-
-## 7. 그다음: 8단계 (계획서 9절)
-- JS(@aws-sdk v3)와 Rust(aws-sdk-rust) 호환성 스위트 추가(지금은 Python만).
-- 패키징: 릴리스 바이너리, brew, Dockerfile. README의 지원 API 표 점검. 상표·이름 최종 확인.
-- Netlify 데모 배포는 사용자 계정 연결이 필요하다(직접 하지 말고 물어볼 것).
+## 7. 남은 일 (계획서 4장의 `[~]` 항목)
+- SQLite 저장소: JSON 스냅샷으로 대신함. 대용량 상태가 필요해지면 추가.
+- SDK 간 응답 자동 대조: 지금은 Python·JS·Rust 스위트가 각자 검증만 한다.
+- 우분투 전체 검증(Docker 필요 테스트 포함)은 큰 변경 뒤마다 4절 방법으로 돌린다.
 
 ## 8. 알려진 한계 (요약)
-상태는 메모리 전용(JSON 스냅샷 파일 `RC_STATE_FILE`로 보존, SQLite 없음), SigV4 서명은 `VERIFY_SIGV4=1`일 때만 검증(SigV2 거부), 리소스 기반 정책 미평가, KMS는 진짜 암호 아님,
+상태는 메모리 전용(JSON 스냅샷 파일 `RC_STATE_FILE`로 보존, SQLite 없음), SigV4 서명은 `VERIFY_SIGV4=1`일 때만 검증(SigV2 거부,
+aws-chunked 조각 서명은 미검증), 리소스 기반 정책 미평가, KMS는 진짜 암호 아님,
 ALB는 L4 라운드로빈(경로 규칙 없음), Step Functions 병렬 가지가 순차 실행, SQS 메시지 속성 미저장, Query 프로토콜 구버전 SQS 미지원,
 ECS 태스크가 에뮬레이터를 부르려면 `BIND=0.0.0.0:4566` 필요. 세부는 각 파일의 `ponytail:` 주석.

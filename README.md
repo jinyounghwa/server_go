@@ -7,6 +7,7 @@ A local, in-memory emulator for the cloud APIs your app actually uses. Point an 
 
 ```sh
 cd core && cargo run --release        # emulator on 127.0.0.1:4566 (BIND, REGION env vars)
+RC_CONFIG=rocalcloud.env cargo run --release   # same settings from a KEY=VALUE file; real env vars win
 cd gui && cargo run                   # desktop window (Tauri), or open http://127.0.0.1:4566/_ui
 ```
 
@@ -44,7 +45,7 @@ cd tests/rust && cargo run
 |---|---|
 | DynamoDB | Create/Describe/List/DeleteTable, Put/Get/Update/DeleteItem, Query, Scan, BatchWrite/GetItem, TransactWrite/GetItems, GSI/LSI, condition/filter/update/projection expressions |
 | S3 | List/Create/Head/DeleteBucket, Put/Get/Head/Delete/CopyObject, Range, ListObjects(V2) with prefix/delimiter/paging, DeleteObjects, multipart upload, presigned URLs |
-| SQS | Create/Delete/List/PurgeQueue, GetQueueUrl, Get/SetQueueAttributes, Send/Receive/DeleteMessage (+Batch), ChangeMessageVisibility, long polling, dead-letter queues |
+| SQS | Create/Delete/List/PurgeQueue, GetQueueUrl, Get/SetQueueAttributes, Send/Receive/DeleteMessage (+Batch), ChangeMessageVisibility, long polling, dead-letter queues, FIFO queues (MessageGroupId ordering, deduplication ids and content-based dedup, 5-minute window) |
 | IAM / STS | Users, roles, managed + inline policies, access keys, SimulatePrincipalPolicy, AssumeRole (trust policy checked), GetCallerIdentity |
 | SNS | Topics, subscriptions (SQS, Lambda), filter policies, raw delivery, topic/subscription attributes |
 | Secrets Manager | Create/Get/Put/Update/Describe/List/Delete/RestoreSecret, version stages, GetRandomPassword |
@@ -72,6 +73,15 @@ Every request is evaluated against the caller's identity policies (Allow/Deny, w
 String/Arn/Bool conditions). Unregistered access keys (e.g. `test`) act as the account root and are always allowed.
 With `ENFORCE_IAM=1` denied requests fail like the real service; without it the decision and its reason only
 appear in the event stream and GUI.
+
+## Signature verification
+
+Signatures are parsed but not checked by default. With `VERIFY_SIGV4=1` every request (header auth and presigned
+query auth, including session tokens and expiry) must carry a valid SigV4 signature: wrong secrets get
+`SignatureDoesNotMatch` / `InvalidSignatureException`, unsigned calls get `MissingAuthenticationToken` (Cognito's
+public operations stay unsigned, as on AWS). Unregistered keys sign with `RC_ROOT_SECRET` (default `test`).
+SigV2 presigned URLs are refused with a clear error; presign with `signature_version="s3v4"`. aws-chunked bodies are
+trusted by their declared payload hash (chunk signatures are not checked).
 
 Unsupported S3 sub-resources answer `501 NotImplemented`. State lives in memory only for now.
 
@@ -119,7 +129,10 @@ LLM calls are serialized, spaced at least 1.5 s apart and kept short. If Ollama 
 `POST /_inspect/run` (header `x-rocalcloud`) runs deterministic security, chaos, incident, performance, fuzzing, and
 regression scenarios against `127.0.0.1` only: IAM implicit/explicit deny, CSRF header enforcement, S3 path traversal,
 missing/malformed SigV4, >256 MiB payload rejection (413), injection payloads, chaos throttle/5xx recovery, SQS DLQ
-buildup, Lambda repeated failures, 40-request concurrent burst, and 15 malformed fuzz inputs.
+buildup, Lambda repeated failures, 40-request concurrent burst, and 15 malformed fuzz inputs, plus latency injection,
+50% partial failure, connections dropped mid-request, a table deleted and recreated under write load, a 1000-message
+queue flood, DynamoDB 400 KB item and SQS 256 KiB message limits, and resident-memory growth over 2000 write/delete
+cycles. The inspector signs its own requests, so it runs with or without `VERIFY_SIGV4=1`.
 
 Set `{"use_llm": true}` to let the local LLM propose additional non-destructive scenarios (executed and judged by
 deterministic code). Reports can be exported via `GET /_inspect/report/{id}?format=md` or `?format=html`, failed cases
@@ -134,6 +147,7 @@ animations.
 - `GET /_town` — character town
 - `GET /_agent/status`, `POST /_agent/explain`, `POST /_agent/ask`, `GET /_agent/template` — explanation agent
 - `POST /_inspect/run`, `GET /_inspect/reports`, `GET /_inspect/report/{id}`, `POST /_inspect/replay` — verification agent
+- `GET /_admin/config` — startup settings (also the GUI's **설정** screen, which edits chaos rules)
 - `GET /_admin/state`, `GET/POST /_admin/snapshot` (JSON state export/restore; `RC_STATE_FILE` auto-restores on startup, `POST /_admin/snapshot/save` writes to it), `POST /_admin/reset`, `GET/POST /_admin/chaos` (POSTs need header `x-rocalcloud`)
 - `GET /_admin/reach?from=internet|<instance-id>&to=...&protocol=tcp&port=443` — step-by-step reachability
   (route table → internet gateway, public IP, security group rules). NACLs, peering and NAT are not modeled yet.

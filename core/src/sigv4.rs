@@ -145,6 +145,36 @@ mod tests {
         assert_eq!(s, "5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31");
     }
 
+    // Property: for random paths, queries and bodies, a signed request verifies, and flipping any one body byte breaks it.
+    #[test]
+    fn prop_random_requests_verify_and_tamper_fails() {
+        use rand::{Rng, RngCore};
+        let mut rng = rand::thread_rng();
+        let chars = b"abcXYZ019-_.~ /%+=&?!:";
+        for _ in 0..200 {
+            let mut seg = |n: usize| (0..n).map(|_| chars[rng.gen_range(0..chars.len())] as char).collect::<String>();
+            let path = format!("/{}", enc(&seg(12), true));
+            let (k, v) = (enc(&seg(5), false), enc(&seg(7), false));
+            let pq = format!("{path}?{k}={v}&b=2");
+            let mut body = vec![0u8; rand::thread_rng().gen_range(1..300)];
+            rand::thread_rng().fill_bytes(&mut body);
+            let svc = if rand::thread_rng().gen_bool(0.5) { "s3" } else { "lambda" };
+            let hs = sign("PUT", &pq, "127.0.0.1:4566", &[], &body, "AK", "sk", "us-east-1", svc);
+            let mut h = HeaderMap::new();
+            h.insert("host", "127.0.0.1:4566".parse().unwrap());
+            for (k, v) in &hs {
+                h.insert(axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+            }
+            let uri: Uri = pq.parse().unwrap();
+            assert!(verify(&Method::PUT, &uri, &h, &body, |_| ("sk".into(), None)).is_ok(), "{pq}");
+            // The signed payload hash header must match the body; a changed body changes it.
+            let i = rand::thread_rng().gen_range(0..body.len());
+            body[i] ^= 1;
+            h.insert("x-amz-content-sha256", sha256_hex(&body).parse().unwrap());
+            assert!(verify(&Method::PUT, &uri, &h, &body, |_| ("sk".into(), None)).is_err());
+        }
+    }
+
     #[test]
     fn sign_then_verify_roundtrip_and_tamper() {
         let body = br#"{"TableName":"t"}"#;

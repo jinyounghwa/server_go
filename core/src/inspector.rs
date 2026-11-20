@@ -689,6 +689,212 @@ async fn sc_fuzz_random() -> Value {
         json!({"alive": alive, "crashed": crashed}), repro)
 }
 
+// ---------- added scenarios: latency, partial failure, dropped connections, recreate-under-load, flood, limits, memory ----------
+
+fn ms_since(t: Instant) -> f64 {
+    t.elapsed().as_secs_f64() * 1000.0
+}
+
+fn json_body(r: &Result<HttpResp, String>) -> Value {
+    r.as_ref().ok().and_then(|r| serde_json::from_str(&r.body).ok()).unwrap_or_default()
+}
+
+async fn sc_chaos_latency(app: &App) -> Value {
+    let t0 = Instant::now();
+    let prev = app.chaos.lock().unwrap().clone();
+    *app.chaos.lock().unwrap() = vec![json!({"service": "dynamodb", "op": "ListTables", "latency_ms": 300})];
+    let s = Instant::now();
+    let hit = call_json("dynamodb", "ListTables", &json!({}), None).await;
+    let slow = ms_since(s);
+    *app.chaos.lock().unwrap() = prev;
+    let s = Instant::now();
+    let rec = call_json("dynamodb", "ListTables", &json!({}), None).await;
+    let fast = ms_since(s);
+    let ok = hit.is_ok_and(|r| r.status == 200) && rec.is_ok_and(|r| r.status == 200) && slow >= 300.0 && fast < 300.0;
+    make_result("chaos-latency", "장애 주입(지연 300ms) 및 해제 후 복구", "chaos", "low", "dynamodb", ok, false,
+        format!("주입 중 {slow:.0}ms, 해제 후 {fast:.0}ms"), ms_since(t0),
+        json!({"latency_ms_gte": 300, "recovered_ms_lt": 300}), json!({"slow_ms": slow.round(), "fast_ms": fast.round()}),
+        vec![repro_step("POST", "/", &[("x-amz-target", "DynamoDB_20120810.ListTables")], "{}")])
+}
+
+async fn sc_chaos_partial(app: &App) -> Value {
+    let t0 = Instant::now();
+    let prev = app.chaos.lock().unwrap().clone();
+    *app.chaos.lock().unwrap() = vec![json!({"service": "sqs", "op": "ListQueues", "error_rate": 0.5})];
+    let (mut ok_n, mut err_n, mut other) = (0, 0, vec![]);
+    for _ in 0..30 {
+        match call_json("sqs", "ListQueues", &json!({}), None).await {
+            Ok(r) if r.status == 200 => ok_n += 1,
+            Ok(r) if r.status == 500 => err_n += 1,
+            Ok(r) => other.push(r.status.to_string()),
+            Err(e) => other.push(e),
+        }
+    }
+    *app.chaos.lock().unwrap() = prev;
+    let ok = ok_n > 0 && err_n > 0 && other.is_empty();
+    make_result("chaos-partial-failure", "부분 실패(오류율 50%) 주입", "chaos", "medium", "sqs", ok, false,
+        format!("30건 중 성공 {ok_n}, 500 {err_n}{}", if other.is_empty() { String::new() } else { format!(", 예상 밖 {}", other.join(",")) }),
+        ms_since(t0), json!({"both_outcomes": true, "only": [200, 500]}), json!({"ok": ok_n, "err500": err_n, "other": other}),
+        vec![repro_step("POST", "/", &[("x-amz-target", "AmazonSQS.ListQueues")], "{}")])
+}
+
+async fn sc_conn_drop() -> Value {
+    let t0 = Instant::now();
+    let Ok(hostport) = loopback_hostport() else {
+        return make_result("chaos-conn-drop", "연결 끊김(요청 도중 종료) 내성", "chaos", "high", "dynamodb", false, false,
+            "로컬 대상이 아닙니다".into(), 0.0, json!({}), json!({}), vec![]);
+    };
+    let partial = [
+        format!("POST / HTTP/1.1\r\nHost: {hostport}\r\nX-Amz-Target: DynamoDB_20120810.ListTables\r\nContent-Length: 100\r\n\r\n{{\"Tab"),
+        "GET / HT".to_string(),
+        format!("POST / HTTP/1.1\r\nHost: {hostport}\r\nX-Amz-Target: DynamoDB_20120810.ListTables\r\nContent-Type: application/x-amz-json-1.0\r\nContent-Length: 2\r\n\r\n{{}}"),
+    ];
+    let mut dropped = 0;
+    for i in 0..12 {
+        if let Ok(Ok(mut s)) = tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(&hostport)).await {
+            let _ = s.write_all(partial[i % 3].as_bytes()).await;
+            drop(s); // close without reading the response
+            dropped += 1;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let alive = local_http("GET", "/_admin/state", &[], b"").await.is_ok_and(|r| r.status == 200)
+        && call_json("dynamodb", "ListTables", &json!({}), None).await.is_ok_and(|r| r.status == 200);
+    let ok = alive && dropped == 12;
+    make_result("chaos-conn-drop", "연결 끊김(요청 도중 종료) 내성", "chaos", "high", "dynamodb", ok, false,
+        if ok { "요청 도중 끊은 연결 12건 뒤에도 서버가 정상 응답했습니다.".into() } else { format!("끊은 연결 {dropped}/12, 생존={alive}") },
+        ms_since(t0), json!({"alive": true}), json!({"dropped": dropped, "alive": alive}),
+        vec![repro_step("POST", "/", &[("x-amz-target", "DynamoDB_20120810.ListTables"), ("content-length", "100")], "{\"Tab")])
+}
+
+fn ddb_table(name: &str) -> Value {
+    json!({"TableName": name, "BillingMode": "PAY_PER_REQUEST",
+           "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
+           "AttributeDefinitions": [{"AttributeName": "id", "AttributeType": "S"}]})
+}
+
+// "Restart while serving": the prefixed table is deleted and recreated while writers hit it.
+async fn sc_recreate_under_load(tag: &str) -> Value {
+    let t0 = Instant::now();
+    let tname = format!("{PREFIX}restart-{tag}");
+    let _ = call_json("dynamodb", "CreateTable", &ddb_table(&tname), None).await;
+    let mut writers = vec![];
+    for w in 0..6 {
+        let tn = tname.clone();
+        writers.push(tokio::spawn(async move {
+            let mut st = vec![];
+            for i in 0..25 {
+                let r = call_json("dynamodb", "PutItem", &json!({"TableName": tn, "Item": {"id": {"S": format!("w{w}-{i}")}}}), None).await;
+                st.push(r.map(|r| (r.status, r.error_code.unwrap_or_default())).unwrap_or((0, "connection".into())));
+            }
+            st
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(3)).await;
+    let _ = call_json("dynamodb", "DeleteTable", &json!({"TableName": tname}), None).await;
+    let _ = call_json("dynamodb", "CreateTable", &ddb_table(&tname), None).await;
+    let mut bad = vec![];
+    let (mut n200, mut n400) = (0, 0);
+    for w in writers {
+        for (s, c) in w.await.unwrap_or_default() {
+            match s {
+                200 => n200 += 1,
+                400 if c == "ResourceNotFoundException" => n400 += 1,
+                _ => bad.push(format!("{s} {c}")),
+            }
+        }
+    }
+    let after = call_json("dynamodb", "PutItem", &json!({"TableName": tname, "Item": {"id": {"S": "after"}}}), None).await.is_ok_and(|r| r.status == 200);
+    let _ = call_json("dynamodb", "DeleteTable", &json!({"TableName": tname}), None).await;
+    let ok = bad.is_empty() && after;
+    make_result("chaos-recreate-under-load", "리소스 재생성(재시작) 중 요청 처리", "chaos", "high", "dynamodb", ok, false,
+        format!("성공 {n200}, 테이블 없음 400 {n400}, 재생성 후 쓰기 {}{}", if after { "정상" } else { "실패" },
+            if bad.is_empty() { String::new() } else { format!(", 예상 밖 {}", bad.join(",")) }),
+        ms_since(t0), json!({"status_in": [200, 400], "after": true}), json!({"ok": n200, "not_found": n400, "unexpected": bad}), vec![])
+}
+
+async fn sc_queue_flood(tag: &str) -> Value {
+    let t0 = Instant::now();
+    let qn = format!("{PREFIX}flood-{tag}");
+    let url = json_body(&call_json("sqs", "CreateQueue", &json!({"QueueName": qn}), None).await)["QueueUrl"].as_str().unwrap_or("").to_string();
+    let mut failed = 0;
+    for b in 0..100 {
+        let entries: Vec<Value> = (0..10).map(|i| json!({"Id": format!("m{i}"), "MessageBody": format!("flood-{b}-{i}")})).collect();
+        let r = call_json("sqs", "SendMessageBatch", &json!({"QueueUrl": url, "Entries": entries}), None).await;
+        failed += json_body(&r)["Failed"].as_array().map_or(10, Vec::len);
+    }
+    let send_ms = ms_since(t0);
+    let depth = json_body(&call_json("sqs", "GetQueueAttributes", &json!({"QueueUrl": url, "AttributeNames": ["ApproximateNumberOfMessages"]}), None).await)
+        ["Attributes"]["ApproximateNumberOfMessages"].as_str().unwrap_or("0").to_string();
+    let got = json_body(&call_json("sqs", "ReceiveMessage", &json!({"QueueUrl": url, "MaxNumberOfMessages": 10}), None).await)["Messages"].as_array().map_or(0, Vec::len);
+    let _ = call_json("sqs", "DeleteQueue", &json!({"QueueUrl": url}), None).await;
+    let ok = failed == 0 && depth == "1000" && got == 10;
+    make_result("inc-queue-flood", "큐 폭주(메시지 1000건)", "incident", "medium", "sqs", ok, false,
+        format!("전송 실패 {failed}, 적체 {depth}건, 수신 {got}건, 전송 {send_ms:.0}ms"), ms_since(t0),
+        json!({"depth": 1000, "received": 10}), json!({"failed": failed, "depth": depth, "received": got, "send_ms": send_ms.round()}), vec![])
+}
+
+async fn sc_storage_limits(tag: &str) -> Value {
+    let t0 = Instant::now();
+    let tname = format!("{PREFIX}full-{tag}");
+    let qn = format!("{PREFIX}full-{tag}");
+    let _ = call_json("dynamodb", "CreateTable", &ddb_table(&tname), None).await;
+    let url = json_body(&call_json("sqs", "CreateQueue", &json!({"QueueName": qn}), None).await)["QueueUrl"].as_str().unwrap_or("").to_string();
+    let big = "x".repeat(410 * 1024);
+    let item = call_json("dynamodb", "PutItem", &json!({"TableName": tname, "Item": {"id": {"S": "big"}, "v": {"S": big}}}), None).await;
+    let msg = call_json("sqs", "SendMessage", &json!({"QueueUrl": url, "MessageBody": "y".repeat(300 * 1024)}), None).await;
+    let small = call_json("dynamodb", "PutItem", &json!({"TableName": tname, "Item": {"id": {"S": "small"}}}), None).await;
+    let _ = call_json("dynamodb", "DeleteTable", &json!({"TableName": tname}), None).await;
+    let _ = call_json("sqs", "DeleteQueue", &json!({"QueueUrl": url}), None).await;
+    let code = |r: &Result<HttpResp, String>| r.as_ref().map(|r| (r.status, r.error_code.clone().unwrap_or_default())).unwrap_or((0, String::new()));
+    let (i, m, s) = (code(&item), code(&msg), code(&small));
+    let ok = i == (400, "ValidationException".into()) && m == (400, "InvalidParameterValue".into()) && s.0 == 200;
+    make_result("inc-storage-limits", "저장소 한도 초과(항목 400KB·메시지 256KiB)", "incident", "medium", "dynamodb", ok, false,
+        format!("DynamoDB 410KB → {} {}, SQS 300KiB → {} {}, 이후 작은 쓰기 → {}", i.0, i.1, m.0, m.1, s.0), ms_since(t0),
+        json!({"ddb": [400, "ValidationException"], "sqs": [400, "InvalidParameterValue"], "after": 200}),
+        json!({"ddb": [i.0, i.1], "sqs": [m.0, m.1], "after": s.0}), vec![])
+}
+
+// Resident memory of this process in KiB (Linux /proc, otherwise ps).
+fn rss_kib() -> Option<u64> {
+    if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+        return s.lines().find_map(|l| l.strip_prefix("VmRSS:")).and_then(|v| v.split_whitespace().next()?.parse().ok());
+    }
+    let o = std::process::Command::new("ps").args(["-o", "rss=", "-p", &std::process::id().to_string()]).output().ok()?;
+    String::from_utf8_lossy(&o.stdout).trim().parse().ok()
+}
+
+async fn sc_memory_growth(tag: &str) -> Value {
+    let t0 = Instant::now();
+    let tname = format!("{PREFIX}mem-{tag}");
+    let _ = call_json("dynamodb", "CreateTable", &ddb_table(&tname), None).await;
+    let cycle = |tn: String, n: usize, w: usize| async move {
+        for i in 0..n {
+            let id = format!("w{w}-{i}");
+            let _ = call_json("dynamodb", "PutItem", &json!({"TableName": tn, "Item": {"id": {"S": id}, "pad": {"S": "p".repeat(1024)}}}), None).await;
+            let _ = call_json("dynamodb", "DeleteItem", &json!({"TableName": tn, "Key": {"id": {"S": id}}}), None).await;
+        }
+    };
+    cycle(tname.clone(), 100, 99).await; // warm-up fills allocator pools and the 1000-event history
+    let before = rss_kib();
+    let ws: Vec<_> = (0..10).map(|w| tokio::spawn(cycle(tname.clone(), 100, w))).collect();
+    for w in ws {
+        let _ = w.await;
+    }
+    let after = rss_kib();
+    let _ = call_json("dynamodb", "DeleteTable", &json!({"TableName": tname}), None).await;
+    let (ok, detail, growth) = match (before, after) {
+        (Some(b), Some(a)) => {
+            let g = a as i64 - b as i64;
+            (g < 32 * 1024, format!("쓰기·삭제 2000건 후 RSS {} → {} MiB (증가 {:.1} MiB, 한도 32 MiB)", b / 1024, a / 1024, g as f64 / 1024.0), json!(g))
+        }
+        // ponytail: no /proc and no ps (minimal containers) means the growth cannot be measured; reported, not failed.
+        _ => (true, "RSS를 읽을 수 없어 메모리 증가를 측정하지 못했습니다(/proc·ps 없음). 판정에서 제외.".into(), Value::Null),
+    };
+    make_result("perf-memory-growth", "메모리 증가 측정(쓰기·삭제 2000건)", "perf", "medium", "dynamodb", ok, false, detail, ms_since(t0),
+        json!({"growth_kib_lt": 32 * 1024}), json!({"before_kib": before, "after_kib": after, "growth_kib": growth}), vec![])
+}
+
 // ---------- generic replay / regression / LLM scenario runner ----------
 
 pub async fn run_custom_scenario(sc: &Value) -> Value {
@@ -886,13 +1092,15 @@ async fn run_inner(app: &Arc<App>, req: &Value) -> Result<Value, ApiErr> {
         ]);
     }
     if has("chaos") {
-        plan.extend([("chaos-throttle-recovery", "chaos"), ("chaos-5xx-recovery", "chaos")]);
+        plan.extend([("chaos-throttle-recovery", "chaos"), ("chaos-5xx-recovery", "chaos"), ("chaos-latency", "chaos"),
+            ("chaos-partial-failure", "chaos"), ("chaos-conn-drop", "chaos"), ("chaos-recreate-under-load", "chaos")]);
     }
     if has("incident") {
-        plan.extend([("inc-dlq-buildup", "incident"), ("inc-lambda-repeated-fail", "incident")]);
+        plan.extend([("inc-dlq-buildup", "incident"), ("inc-lambda-repeated-fail", "incident"), ("inc-queue-flood", "incident"),
+            ("inc-storage-limits", "incident")]);
     }
     if has("perf") {
-        plan.push(("perf-concurrent-burst", "perf"));
+        plan.extend([("perf-concurrent-burst", "perf"), ("perf-memory-growth", "perf")]);
     }
     if has("fuzz") {
         plan.push(("fuzz-random-inputs", "fuzz"));
@@ -928,6 +1136,13 @@ async fn run_inner(app: &Arc<App>, req: &Value) -> Result<Value, ApiErr> {
             "inc-lambda-repeated-fail" => sc_lambda_repeated_fail(tag).await,
             "perf-concurrent-burst" => sc_perf_concurrent(tag).await,
             "fuzz-random-inputs" => sc_fuzz_random().await,
+            "chaos-latency" => sc_chaos_latency(app).await,
+            "chaos-partial-failure" => sc_chaos_partial(app).await,
+            "chaos-conn-drop" => sc_conn_drop().await,
+            "chaos-recreate-under-load" => sc_recreate_under_load(tag).await,
+            "inc-queue-flood" => sc_queue_flood(tag).await,
+            "inc-storage-limits" => sc_storage_limits(tag).await,
+            "perf-memory-growth" => sc_memory_growth(tag).await,
             _ => continue,
         };
         if save_reg && r["passed"] == false {

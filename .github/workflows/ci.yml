@@ -38,3 +38,14 @@ jobs:
           done
           uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with redis --with dnspython tests/sdk_test.py
           (cd tests/js && npm install --no-audit --no-fund && npm test)
+
+      - name: Python suite again with SigV4 verification on
+        run: |
+          ENFORCE_IAM=1 VERIFY_SIGV4=1 ./core/target/release/rocalcloud >/tmp/rocalcloud-verify.log 2>&1 &
+          PID=$!
+          trap 'kill $PID 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:4566/_admin/state >/dev/null && break
+            sleep 0.2
+          done
+          uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with redis --with dnspython tests/sdk_test.py

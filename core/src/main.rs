@@ -1022,8 +1022,34 @@ async fn reject_oversize(req: axum::extract::Request, next: axum::middleware::Ne
     next.run(req).await
 }
 
-#[tokio::main]
-async fn main() {
+// RC_CONFIG names a KEY=VALUE file (# comments). Variables already in the environment win. It is read before the
+// runtime starts any thread, so setting the process environment here is safe.
+fn load_config() {
+    let Ok(path) = std::env::var("RC_CONFIG") else { return };
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("RC_CONFIG {path}: {e}"));
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let Some((k, v)) = line.split_once('=') else { panic!("RC_CONFIG {path}: not KEY=VALUE: {line}") };
+        if std::env::var_os(k.trim()).is_none() {
+            std::env::set_var(k.trim(), v.trim().trim_matches('"'));
+        }
+    }
+}
+
+const CONFIG_KEYS: &[&str] = &["ENFORCE_IAM", "VERIFY_SIGV4", "BIND", "REGION", "RC_CONFIG", "RC_STATE_FILE", "RC_TOWN_ORIGIN",
+    "RC_LLM_URL", "RC_LLM_MODEL", "RC_DNS_PORT", "RC_DOCKER", "RC_CONTAINER_MEMORY", "RC_PYTHON", "RC_NODE"];
+
+async fn get_config() -> Json<Value> {
+    let vars: serde_json::Map<String, Value> = CONFIG_KEYS.iter().map(|k| (k.to_string(), json!(std::env::var(k).ok()))).collect();
+    Json(json!({"vars": vars, "endpoint": endpoint(), "enforce_iam": *ENFORCE, "verify_sigv4": *VERIFY,
+        "root_secret": if std::env::var_os("RC_ROOT_SECRET").is_some() { "설정됨" } else { "기본값(test)" }}))
+}
+
+fn main() {
+    load_config();
+    tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime").block_on(serve());
+}
+
+async fn serve() {
     let bind = BIND.clone();
     let app = Arc::new(App {
         ddb: Default::default(),
@@ -1068,6 +1094,7 @@ async fn main() {
         .route("/_inspect/replay", post(inspect_replay))
         .route("/favicon.ico", get(|| async { axum::http::StatusCode::NO_CONTENT })) // keep browsers out of the S3 log
         .route("/_admin/state", get(state))
+        .route("/_admin/config", get(get_config))
         .route("/_admin/snapshot", get(get_snapshot).post(post_snapshot))
         .route("/_admin/snapshot/save", post(save_snapshot_file))
         .route("/_admin/reset", post(reset))

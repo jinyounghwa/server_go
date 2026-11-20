@@ -90,6 +90,7 @@ pre { margin: 4px 0 10px; padding: 8px 10px; background: var(--panel); border: 1
   <form class="ask" id="askform"><input id="q" placeholder="에이전트에게 묻기 (예: 최근 오류 왜 났어?)" aria-label="에이전트에게 질문"><button>묻기</button></form>
   <span class="muted" id="llm"></span>
   <button id="inspectbtn">검사</button>
+  <button id="settingsbtn">설정</button>
   <a href="/_admin/snapshot" download="rocalcloud-snapshot.json" style="color:inherit">스냅샷 저장</a>
   <button id="snapload">스냅샷 복원</button><input id="snapfile" type="file" accept="application/json" hidden>
   <a href="/_town" style="color:inherit">마을 보기</a>
@@ -309,6 +310,31 @@ function renderInspector() {
     ${insp.running ? `<div class="muted">진행 중 (${insp.done}/${insp.total || "?"}): ${esc(insp.current)}</div><div class="prog"><div style="width:${pct}%"></div></div>` : ""}
     ${cards}${trend}${rows}`;
 }
+// ---------- settings: startup config (read-only), chaos rules, state file ----------
+async function showSettings(msg) {
+  const [c, ch] = await Promise.all([fetch("/_admin/config").then(r => r.json()), fetch("/_admin/chaos").then(r => r.json())]);
+  const rows = Object.entries(c.vars).map(([k, v]) => [k, v ?? "(기본값)"]);
+  showAgent(`<h2>설정</h2><div class="sub">엔드포인트 ${esc(c.endpoint)} · IAM 강제 ${c.enforce_iam ? "켜짐" : "꺼짐"} · SigV4 검증 ${c.verify_sigv4 ? "켜짐" : "꺼짐"} · 루트 시크릿 ${esc(c.root_secret)}</div>
+    <h4>시작 설정</h4><div class="muted">환경변수나 RC_CONFIG 파일(KEY=VALUE)로 정하며, 바꾸려면 재시작해야 합니다.</div>${table(["변수", "값"], rows)}
+    <h4>장애 주입 규칙</h4><div class="muted">예: [{"service": "dynamodb", "op": "Get*", "latency_ms": 200, "error_rate": 0.1, "throttle_rate": 0.2}]</div>
+    <textarea id="chaosrules" rows="6" style="width:100%;font-family:ui-monospace,monospace">${esc(JSON.stringify(ch.rules, null, 2))}</textarea>
+    <p><button id="chaosapply">규칙 적용</button> <button id="chaosclear">모두 해제</button>
+       <button id="statesave" ${c.vars.RC_STATE_FILE ? "" : "disabled title=\"RC_STATE_FILE이 설정되지 않음\""}>상태 파일에 저장</button>
+       <span class="muted">${esc(msg || "")}</span></p>`);
+}
+$("settingsbtn").onclick = () => showSettings();
+document.addEventListener("click", async ev => {
+  const id = ev.target.id;
+  if (id === "chaosapply" || id === "chaosclear") {
+    let rules;
+    try { rules = id === "chaosclear" ? [] : JSON.parse($("chaosrules").value); } catch (e) { return showSettings("JSON 오류: " + e.message); }
+    const r = await fetch("/_admin/chaos", {method: "POST", headers: H, body: JSON.stringify({rules})});
+    showSettings(r.ok ? `규칙 ${rules.length}개 적용됨` : "적용 실패: HTTP " + r.status);
+  } else if (id === "statesave") {
+    const r = await fetch("/_admin/snapshot/save", {method: "POST", headers: H});
+    showSettings(r.ok ? "상태 파일에 저장됨" : "저장 실패: " + await r.text());
+  }
+});
 $("inspectbtn").onclick = () => { viewMode = "inspector"; sel = null; location.hash = ""; renderNav(); loadInspector(); renderInspector(); };
 
 $("detail").onclick = async ev => {
