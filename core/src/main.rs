@@ -799,14 +799,27 @@ fn town_view(s: String) -> String {
     Value::Object(out).to_string()
 }
 
+fn is_shutdown_event(s: &str) -> bool {
+    serde_json::from_str::<Value>(s)
+        .ok()
+        .is_some_and(|v| v["service"] == "admin" && v["op"] == "Shutdown")
+}
+
 async fn events(State(app): State<Arc<App>>, h: HeaderMap) -> Response {
     let cross = TOWN_ORIGIN.as_ref().is_some_and(|allowed| {
         h.get("origin").and_then(|o| o.to_str().ok()).is_some_and(|o| o == allowed.to_str().unwrap_or(""))
     });
-    let sse = Sse::new(futures_util::stream::unfold(app.events.subscribe(), move |mut rx| async move {
+    let sse = Sse::new(futures_util::stream::unfold((app.events.subscribe(), false), move |(mut rx, done)| async move {
+        if done {
+            return None;
+        }
         loop {
             match rx.recv().await {
-                Ok(s) => return Some((Ok::<_, Infallible>(Event::default().data(if cross { town_view(s) } else { s })), rx)),
+                Ok(s) => {
+                    let closing = is_shutdown_event(&s);
+                    let data = if cross { town_view(s) } else { s };
+                    return Some((Ok::<_, Infallible>(Event::default().data(data)), (rx, closing)));
+                }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => return None,
             }
@@ -1076,6 +1089,31 @@ async fn get_config() -> Json<Value> {
         "root_secret": if std::env::var_os("RC_ROOT_SECRET").is_some() { "설정됨" } else { "기본값(test)" }}))
 }
 
+async fn shutdown_signal(app: Arc<App>) {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            sig.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    let _ = app.events.send(json!({"ts": chrono::Utc::now().to_rfc3339(), "service": "admin", "op": "Shutdown", "status": 200}).to_string());
+    // Give SSE subscribers a brief moment to receive the Shutdown event before the listener closes.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    eprintln!("rocalcloud shutting down");
+}
+
 fn main() {
     load_config();
     tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime").block_on(serve());
@@ -1150,7 +1188,7 @@ async fn serve() {
     route53::serve_dns(app.clone());
     let l = tokio::net::TcpListener::bind(&bind).await.expect("bind");
     eprintln!("rocalcloud listening on http://{bind}  (GUI: /_ui, town: /_town, events: /_events, ENFORCE_IAM={})", *ENFORCE as u8);
-    axum::serve(l, router).await.unwrap();
+    axum::serve(l, router).with_graceful_shutdown(shutdown_signal(app)).await.unwrap();
 }
 
 #[cfg(test)]

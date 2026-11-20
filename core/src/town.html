@@ -123,6 +123,27 @@ canvas#c:active { cursor: grabbing; }
   #hud-tr { width: 260px; max-height: 40vh; }
   #hint3d { display: none; }
 }
+#shutdown-overlay {
+  position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center;
+  background: rgba(7, 11, 20, 0.84); backdrop-filter: blur(12px);
+}
+#shutdown-overlay[hidden] { display: none; }
+.shutdown-card {
+  max-width: 400px; width: calc(100% - 32px); padding: 24px 26px; border-radius: 18px; text-align: center;
+  background: var(--glass-hi); border: 1px solid rgba(248, 113, 113, 0.35);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.65);
+}
+.shutdown-card h2 { margin: 0 0 8px; font-size: 18px; color: #f8fafc; }
+.shutdown-card p { margin: 0 0 18px; font-size: 13px; color: var(--muted); line-height: 1.55; }
+.shutdown-actions { display: flex; gap: 10px; justify-content: center; }
+.shutdown-actions button {
+  font: inherit; font-size: 13px; font-weight: 600; color: var(--ink); padding: 8px 16px; border-radius: 10px;
+  cursor: pointer; border: 1px solid rgba(255, 255, 255, 0.16); background: rgba(255, 255, 255, 0.08);
+  transition: all .15s;
+}
+.shutdown-actions button.primary { background: rgba(56, 189, 248, 0.25); border-color: var(--accent); color: #e0f2fe; }
+.shutdown-actions button:hover { background: rgba(56, 189, 248, 0.38); border-color: var(--accent); }
+#close_hint { margin-top: 12px; font-size: 11.5px; color: var(--warn); }
 </style>
 </head>
 <body>
@@ -186,6 +207,17 @@ canvas#c:active { cursor: grabbing; }
 </div>
 <div id="hint3d">드래그: 360° 회전 · 휠: 줌 · 건물 클릭: 포커스</div>
 <div id="tip"></div>
+<div id="shutdown-overlay" hidden role="dialog" aria-modal="true" aria-labelledby="shutdown-title">
+  <div class="shutdown-card">
+    <h2 id="shutdown-title">rocalcloud 마을이 종료되었습니다</h2>
+    <p id="shutdown-reason">로컬 에뮬레이터가 종료되어 3D 시티와 실시간 연결을 중지했습니다.</p>
+    <div class="shutdown-actions">
+      <button id="btn_reconnect" class="primary">다시 연결</button>
+      <button id="btn_close_tab">창 닫기</button>
+    </div>
+    <div id="close_hint" hidden>브라우저 정책상 탭을 자동으로 닫을 수 없습니다. 탭을 직접 닫아주세요.</div>
+  </div>
+</div>
 
 <script type="importmap">
 {
@@ -1134,8 +1166,9 @@ function project(v) {
   return { x: (tmpV.x * 0.5 + 0.5) * window.innerWidth, y: (-tmpV.y * 0.5 + 0.5) * window.innerHeight, visible: tmpV.z < 1 };
 }
 
-let last = performance.now(), clock = 0;
+let last = performance.now(), clock = 0, townStopped = false;
 function animate(now) {
+  if (townStopped) return;
   requestAnimationFrame(animate);
   const dt = Math.min(0.05, (now - last) / 1000) * (paused ? 0 : speed);
   last = now; clock += dt;
@@ -1294,8 +1327,16 @@ function caption(e) {
   $("st_total").textContent = stTotal; $("st_ok").textContent = stOk; $("st_err").textContent = stErr;
 }
 function handle(e) {
-  if (e.service === "admin") { caption({...e, op: e.op === "Reset" ? "전체 초기화" : e.op}); return; }
-  if (paused) return;
+  if (e.service === "admin") {
+    if (e.op === "Shutdown") {
+      caption({...e, op: "에뮬레이터 종료"});
+      shutdownTown("로컬 에뮬레이터가 종료되어 마을도 함께 종료되었습니다.");
+      return;
+    }
+    caption({...e, op: e.op === "Reset" ? "전체 초기화" : e.op});
+    return;
+  }
+  if (paused || townStopped) return;
   spawn(e);
   caption(e);
 }
@@ -1319,7 +1360,41 @@ const API = sameOrigin ? "" : safeLocalApi(params.get("api"));
 $("gui").href = API + "/_ui";
 let es = null, demoTimer = null, retryTimer = null;
 function setMode(kind, text) { $("dot").className = "sdot " + kind; $("mode").textContent = text; }
+
+function shutdownTown(reason) {
+  if (townStopped) return;
+  townStopped = true;
+  if (es) { es.close(); es = null; }
+  stopDemo();
+  setMode("", "종료됨 · 로컬 에뮬레이터 오프라인");
+  $("connect").hidden = true;
+  $("gui").hidden = true;
+  $("shutdown-reason").textContent = reason || "로컬 에뮬레이터가 종료되어 3D 시티와 실시간 연결을 중지했습니다.";
+  $("close_hint").hidden = true;
+  $("shutdown-overlay").hidden = false;
+  // Best-effort close for popup / Tauri windows; browsers ignore this on normal user-opened tabs.
+  try { window.close(); } catch {}
+}
+
+function resumeLive() {
+  $("shutdown-overlay").hidden = true;
+  $("close_hint").hidden = true;
+  if (townStopped) {
+    townStopped = false;
+    last = performance.now();
+    requestAnimationFrame(animate);
+  }
+  live();
+}
+
+$("btn_reconnect").onclick = () => resumeLive();
+$("btn_close_tab").onclick = () => {
+  window.close();
+  $("close_hint").hidden = false;
+};
+
 function live() {
+  if (townStopped) return;
   stopDemo();
   clearTimeout(retryTimer);
   es = new EventSource(API + "/_events");
@@ -1330,7 +1405,12 @@ function live() {
   };
   es.onmessage = m => { try { handle(JSON.parse(m.data)); } catch {} };
   es.onerror = () => {
-    if (es.readyState !== 2 && opened) return; // EventSource reconnects by itself
+    if (townStopped) return;
+    // Once connected to a local emulator (or when served from /_town), shutting down the emulator shuts down the town.
+    if (opened || sameOrigin) {
+      shutdownTown("로컬 에뮬레이터가 종료되어 마을도 함께 종료되었습니다.");
+      return;
+    }
     startDemo("에뮬레이터 연결 대기 중 · 목업 트래픽");
     $("connect").hidden = sameOrigin; $("gui").hidden = true;
     retryTimer = setTimeout(live, 5000); // ponytail: fixed 5 s poll until the local emulator answers
