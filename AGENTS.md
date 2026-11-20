@@ -115,6 +115,6 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
 - Netlify 데모 배포는 사용자 계정 연결이 필요하다(직접 하지 말고 물어볼 것).
 
 ## 8. 알려진 한계 (요약)
-상태는 메모리 전용(SQLite·스냅샷 없음), SigV4 서명 미검증, 리소스 기반 정책 미평가, KMS는 진짜 암호 아님,
-ALB는 L4 라운드로빈(경로 규칙 없음), Step Functions 병렬 가지가 순차 실행, Query 프로토콜 구버전 SQS 미지원,
+상태는 메모리 전용(JSON 스냅샷 파일 `RC_STATE_FILE`로 보존, SQLite 없음), SigV4 서명은 `VERIFY_SIGV4=1`일 때만 검증(SigV2 거부), 리소스 기반 정책 미평가, KMS는 진짜 암호 아님,
+ALB는 L4 라운드로빈(경로 규칙 없음), Step Functions 병렬 가지가 순차 실행, SQS 메시지 속성 미저장, Query 프로토콜 구버전 SQS 미지원,
 ECS 태스크가 에뮬레이터를 부르려면 `BIND=0.0.0.0:4566` 필요. 세부는 각 파일의 `ponytail:` 주석.

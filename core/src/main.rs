@@ -19,6 +19,7 @@ mod s3;
 mod ses;
 mod sfn;
 mod secrets;
+mod sigv4;
 mod sns;
 mod sqs;
 mod ssm;
@@ -48,6 +49,9 @@ pub const ACCOUNT: &str = "000000000000";
 pub static REGION: LazyLock<String> =
     LazyLock::new(|| std::env::var("REGION").unwrap_or_else(|_| "us-east-1".into()));
 
+pub(crate) static VERIFY: LazyLock<bool> = LazyLock::new(|| std::env::var("VERIFY_SIGV4").is_ok_and(|v| v == "1"));
+// The running app, for the inspector's signing client.
+pub(crate) static APP: std::sync::OnceLock<Arc<App>> = std::sync::OnceLock::new();
 static BIND: LazyLock<String> = LazyLock::new(|| std::env::var("BIND").unwrap_or_else(|_| "127.0.0.1:4566".into()));
 // URL that code running inside the emulator (Lambda) uses to reach it.
 pub fn endpoint() -> String {
@@ -413,8 +417,26 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
         }
         last
     };
-    // A request either fails authorization, gets a chaos fault, or runs.
-    let denied = decision.as_ref().filter(|d| !d.allowed && *ENFORCE).map(|d| {
+    // VERIFY_SIGV4=1: a bad or missing signature is refused before IAM (Cognito's public ops are unsigned).
+    let json_proto = matches!(svc, Svc::Ddb(_) | Svc::Json(..) | Svc::Sqs(_));
+    let sig_err = (*VERIFY && !(service == "cognito-idp" && COGNITO_PUBLIC.contains(&op.as_str())))
+        .then(|| {
+            let iam = app.iam.lock().unwrap();
+            sigv4::verify(&method, &uri, &headers, &body, |k| iam.secret_of(k)).err()
+        })
+        .flatten()
+        .map(|(code, msg)| {
+            let code = match (code, json_proto, matches!(svc, Svc::S3(_))) {
+                ("SignatureDoesNotMatch", true, _) => "InvalidSignatureException",
+                ("MissingAuthenticationToken", true, _) => "MissingAuthenticationTokenException",
+                ("MissingAuthenticationToken", _, true) => "AccessDenied",
+                ("InvalidClientTokenId", true, _) => "UnrecognizedClientException",
+                (c, ..) => c,
+            };
+            ApiErr { status: if json_proto { 400 } else { 403 }, ..err(code, msg) }
+        });
+    // A request either fails its signature or authorization, gets a chaos fault, or runs.
+    let denied = sig_err.or(decision.as_ref().filter(|d| !d.allowed && *ENFORCE).map(|d| {
         let (status, code) = match &svc {
             Svc::Ddb(_) | Svc::Json(..) => (400, "AccessDeniedException"),
             Svc::Lambda(..) => (403, "AccessDeniedException"),
@@ -423,7 +445,7 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
             _ => (403, "AccessDenied"),
         };
         ApiErr { status, ..err(code, d.reason.clone()) }
-    });
+    }));
     let chaos = if denied.is_none() { chaos_fault(&app, service, &op).await } else { None };
     let fault = denied.or(chaos.as_ref().and_then(|(_, e)| e.as_ref().map(|e| ApiErr { status: e.status, code: e.code.clone(), msg: e.msg.clone(), extra: None })));
 
@@ -1031,6 +1053,7 @@ async fn main() {
         events: broadcast::channel(1024).0,
         recent: Default::default(),
     });
+    let _ = APP.set(app.clone());
     let router = Router::new()
         .route("/_events", get(events))
         .route("/_ui", get(ui))

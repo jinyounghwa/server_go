@@ -49,7 +49,6 @@ struct Policy {
     created: String,
     doc: Value,
 }
-#[allow(dead_code)] // secret kept for optional SigV4 verification
 struct Key {
     secret: String,
     owner: Principal,
@@ -163,6 +162,11 @@ fn principal_match(p: &Value, c: &Principal) -> bool {
 }
 
 impl Iam {
+    // Secret and session token for SigV4 verification; unregistered keys are root and sign with RC_ROOT_SECRET.
+    pub fn secret_of(&self, akid: &str) -> (String, Option<String>) {
+        self.keys.get(akid).map_or_else(|| (std::env::var("RC_ROOT_SECRET").unwrap_or_else(|_| "test".into()), None), |k| (k.secret.clone(), k.token.clone()))
+    }
+
     pub fn principal(&self, akid: &str) -> Principal {
         self.keys.get(akid).map_or(Principal::Root, |k| k.owner.clone())
     }

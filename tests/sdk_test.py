@@ -10,7 +10,7 @@ from botocore.exceptions import ClientError
 EP = os.environ.get("ENDPOINT", "http://127.0.0.1:4566")
 kw = dict(endpoint_url=EP, region_name="us-east-1", aws_access_key_id="test", aws_secret_access_key="test")
 ddb = boto3.client("dynamodb", **kw)
-s3 = boto3.client("s3", config=Config(s3={"addressing_style": "path"}), **kw)
+s3 = boto3.client("s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}), **kw)
 sqs = boto3.client("sqs", **kw)
 run = uuid.uuid4().hex[:8]
 
@@ -268,6 +268,47 @@ def test_network():
     assert code(ec2.describe_vpcs, VpcIds=[vpc]) == "InvalidVpcID.NotFound"
 
 
+
+def test_sqs_fifo():
+    q = sqs.create_queue(QueueName=f"orders{run}.fifo", Attributes={"FifoQueue": "true"})["QueueUrl"]
+    assert code(sqs.send_message, QueueUrl=q, MessageBody="x", MessageDeduplicationId="d") == "MissingParameter"
+    assert code(sqs.send_message, QueueUrl=q, MessageBody="x", MessageGroupId="g") == "InvalidParameterValue"
+    a = sqs.send_message(QueueUrl=q, MessageBody="a1", MessageGroupId="A", MessageDeduplicationId="1")
+    dup = sqs.send_message(QueueUrl=q, MessageBody="a1", MessageGroupId="A", MessageDeduplicationId="1")
+    assert dup["MessageId"] == a["MessageId"] and dup["SequenceNumber"] == a["SequenceNumber"]
+    for body, g, d in [("a2", "A", "2"), ("b1", "B", "3")]:
+        sqs.send_message(QueueUrl=q, MessageBody=body, MessageGroupId=g, MessageDeduplicationId=d)
+    # One message from group A in flight holds back a2; group B still flows.
+    m1 = sqs.receive_message(QueueUrl=q, MaxNumberOfMessages=1, AttributeNames=["All"])["Messages"]
+    assert m1[0]["Body"] == "a1" and m1[0]["Attributes"]["MessageGroupId"] == "A"
+    m2 = sqs.receive_message(QueueUrl=q, MaxNumberOfMessages=10)["Messages"]
+    assert [m["Body"] for m in m2] == ["b1"], m2
+    sqs.delete_message(QueueUrl=q, ReceiptHandle=m1[0]["ReceiptHandle"])
+    assert [m["Body"] for m in sqs.receive_message(QueueUrl=q, MaxNumberOfMessages=10)["Messages"]] == ["a2"]
+    cq = sqs.create_queue(QueueName=f"cbd{run}.fifo", Attributes={"FifoQueue": "true", "ContentBasedDeduplication": "true"})["QueueUrl"]
+    x, y = (sqs.send_message(QueueUrl=cq, MessageBody="same", MessageGroupId="g") for _ in range(2))
+    assert x["MessageId"] == y["MessageId"]
+    assert code(sqs.create_queue, QueueName=f"nofifo{run}", Attributes={"FifoQueue": "true"}) == "InvalidParameterValue"
+
+
+def test_sigv4():
+    bad = boto3.client("dynamodb", **dict(kw, aws_secret_access_key="wrong"))
+    try:
+        bad.list_tables()
+    except ClientError as e:
+        assert e.response["Error"]["Code"] == "InvalidSignatureException", e.response
+    else:
+        raise Skip("VERIFY_SIGV4 off")
+    s3b = boto3.client("s3", config=Config(s3={"addressing_style": "path"}), **dict(kw, aws_secret_access_key="wrong"))
+    assert code(s3b.list_buckets) == "SignatureDoesNotMatch"
+    import urllib.request, urllib.error
+    try:
+        urllib.request.urlopen(EP + "/")
+        raise AssertionError("unsigned request accepted")
+    except urllib.error.HTTPError as e:
+        assert e.code == 403
+    assert "Buckets" in s3.list_buckets()
+
 def test_sns_to_sqs():
     sns = boto3.client("sns", **kw)
     t = sns.create_topic(Name=f"orders{run}")["TopicArn"]
@@ -362,17 +403,31 @@ def test_logs():
 
 
 PY_FN = r"""
-import json, os, time, urllib.request
+import datetime, hashlib, hmac, json, os, time, urllib.request
+def signed(method, url, body, service, headers=None):
+    # Minimal SigV4 with the function's session keys (stdlib only), so VERIFY_SIGV4=1 accepts it.
+    e = os.environ
+    host, path = url.split("://", 1)[1].split("/", 1)
+    t = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    h = {"host": host, "x-amz-date": t, "x-amz-content-sha256": hashlib.sha256(body).hexdigest(), "x-amz-security-token": e["AWS_SESSION_TOKEN"]}
+    names = ";".join(sorted(h))
+    creq = "\n".join([method, "/" + path, "", "".join(f"{k}:{h[k]}\n" for k in sorted(h)), names, h["x-amz-content-sha256"]])
+    scope = f"{t[:8]}/us-east-1/{service}/aws4_request"
+    k = ("AWS4" + e["AWS_SECRET_ACCESS_KEY"]).encode()
+    for p in (t[:8], "us-east-1", service, "aws4_request"):
+        k = hmac.new(k, p.encode(), hashlib.sha256).digest()
+    sts = f"AWS4-HMAC-SHA256\n{t}\n{scope}\n" + hashlib.sha256(creq.encode()).hexdigest()
+    h["Authorization"] = f"AWS4-HMAC-SHA256 Credential={e['AWS_ACCESS_KEY_ID']}/{scope}, SignedHeaders={names}, Signature=" + hmac.new(k, sts.encode(), hashlib.sha256).hexdigest()
+    del h["host"]
+    return urllib.request.Request(url, data=body, method=method, headers={**h, **(headers or {})})
 def handler(event, ctx):
     print("hello log", ctx.function_name)
     ep = os.environ["AWS_ENDPOINT_URL"]
-    auth = f"AWS4-HMAC-SHA256 Credential={os.environ['AWS_ACCESS_KEY_ID']}/20260101/us-east-1/sts/aws4_request, SignedHeaders=host, Signature=x"
-    req = urllib.request.Request(ep + "/", data=b"Action=GetCallerIdentity&Version=2011-06-15",
-                                 headers={"Authorization": auth, "Content-Type": "application/x-www-form-urlencoded"})
+    req = signed("POST", ep + "/", b"Action=GetCallerIdentity&Version=2011-06-15", "sts", {"Content-Type": "application/x-www-form-urlencoded"})
     who = urllib.request.urlopen(req).read().decode()
     for r in event.get("Records", []):
         body = r.get("body") or r.get("Sns", {}).get("Message")
-        urllib.request.urlopen(urllib.request.Request(f"{ep}/{os.environ['BUCKET']}/{body}", data=b"x", method="PUT"))
+        urllib.request.urlopen(signed("PUT", f"{ep}/{os.environ['BUCKET']}/{body}", b"x", "s3"))
     return {"echo": event.get("x"), "who": who, "stage": os.environ.get("STAGE")}
 def boom(event, ctx):
     raise ValueError("bad input")
@@ -395,6 +450,8 @@ def test_lambda():
     lam, iam, logs, sns = (boto3.client(n, **kw) for n in ("lambda", "iam", "logs", "sns"))
     role = iam.create_role(RoleName=f"exec{run}", AssumeRolePolicyDocument=json.dumps({"Statement": [
         {"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]}))["Role"]["Arn"]
+    iam.put_role_policy(RoleName=f"exec{run}", PolicyName="writes", PolicyDocument=json.dumps({"Statement": [
+        {"Effect": "Allow", "Action": "s3:PutObject", "Resource": "*"}]}))
     b = f"lam{run}"
     s3.create_bucket(Bucket=b)
     fn = f"fn{run}"

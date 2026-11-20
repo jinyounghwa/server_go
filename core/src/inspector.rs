@@ -58,15 +58,54 @@ fn decode_chunked(body: &str) -> String {
     r
 }
 
+// Requests built with sig_header() carry a placeholder signature; sign them for real so VERIFY_SIGV4=1 accepts them.
+// With VERIFY_SIGV4=1, unsigned requests are signed as root, except probes marked x-rc-unsigned.
+fn resign(method: &str, path: &str, host: &str, headers: &[(&str, &str)], body: &[u8]) -> Vec<(String, String)> {
+    let get = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| *v);
+    let unsigned = get("authorization").is_none() && get("x-rc-unsigned").is_none() && *crate::VERIFY;
+    let auth = get("authorization").filter(|a| a.ends_with("Signature=00"));
+    let mut rest: Vec<(String, String)> = headers.iter()
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("x-rc-unsigned") && (auth.is_none() || !k.eq_ignore_ascii_case("authorization")))
+        .map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    let Some(app) = crate::APP.get() else { return rest };
+    let root;
+    let a = match auth {
+        Some(a) => a,
+        None if unsigned => {
+            let svc = match get("x-amz-target") {
+                Some(t) => ["dynamodb", "sqs", "secretsmanager", "ssm", "kms", "logs", "events", "states", "cognito-idp", "kinesis", "ecs"]
+                    .into_iter().find(|s| json_target_prefix(s).is_some_and(|p| t.starts_with(p))).unwrap_or("s3"),
+                None if path.starts_with("/2015-03-31/") => "lambda",
+                None => "s3",
+            };
+            root = sig_header("test", svc);
+            &root
+        }
+        None => return rest,
+    };
+    let cred = a.split("Credential=").nth(1).unwrap_or("").split(',').next().unwrap_or("");
+    let p: Vec<&str> = cred.split('/').collect();
+    let (secret, token) = app.iam.lock().unwrap().secret_of(p[0]);
+    if let Some(t) = token {
+        rest.push(("x-amz-security-token".into(), t));
+    }
+    let extra: Vec<(&str, &str)> = rest.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let signed = crate::sigv4::sign(method, path, host, &extra, body, p[0], &secret, p.get(2).unwrap_or(&""), p.get(3).unwrap_or(&""));
+    rest.extend(signed);
+    rest
+}
+
 async fn local_http(method: &str, path: &str, headers: &[(&str, &str)], body: &[u8]) -> Result<HttpResp, String> {
     let hostport = loopback_hostport()?;
+    let owned = resign(method, path, &hostport, headers, body);
+    let headers: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let mut s = tokio::time::timeout(Duration::from_secs(3), tokio::net::TcpStream::connect(&hostport))
         .await
         .map_err(|_| "로컬 에뮬레이터 연결 시간 초과".to_string())?
         .map_err(|e| format!("로컬 에뮬레이터 연결 실패: {e}"))?;
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n");
     let has_cl = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
-    for (k, v) in headers {
+    for (k, v) in &headers {
         req.push_str(&format!("{k}: {v}\r\n"));
     }
     if !has_cl {
@@ -379,7 +418,7 @@ async fn sc_s3_path_traversal(tag: &str) -> Value {
 async fn sc_missing_sigv4() -> Value {
     let t0 = Instant::now();
     let probes: [(&str, Vec<(&str, &str)>); 2] = [
-        ("서명 헤더 누락", vec![("x-amz-target", "DynamoDB_20120810.ListTables"), ("content-type", "application/x-amz-json-1.0")]),
+        ("서명 헤더 누락", vec![("x-amz-target", "DynamoDB_20120810.ListTables"), ("content-type", "application/x-amz-json-1.0"), ("x-rc-unsigned", "1")]),
         ("기형 SigV4 헤더", vec![("x-amz-target", "DynamoDB_20120810.ListTables"), ("content-type", "application/x-amz-json-1.0"), ("authorization", "AWS4-HMAC-SHA256 Credential=BAD")]),
     ];
     let mut bad = vec![];
@@ -387,14 +426,14 @@ async fn sc_missing_sigv4() -> Value {
     for (label, hdrs) in probes {
         repro.push(repro_step("POST", "/", &hdrs, "{}"));
         match local_http("POST", "/", &hdrs, b"{}").await {
-            Ok(r) if r.status < 500 && r.headers.contains_key("x-amzn-requestid") => {}
+            Ok(r) if r.status < 500 && r.headers.contains_key("x-amzn-requestid") && (!*crate::VERIFY || r.status >= 400) => {}
             Ok(r) => bad.push(format!("{label} → HTTP {}", r.status)),
             Err(e) => bad.push(format!("{label} → {e}")),
         }
     }
     let ok = bad.is_empty();
     make_result("sec-missing-sigv4", "서명 누락·기형 SigV4 안전 처리", "security", "medium", "iam", ok, false,
-        if ok { "서명 누락·기형 헤더 요청이 패닉이나 5xx 없이 처리됐습니다 (참고: 서명 검증은 미구현).".into() } else { bad.join("; ") },
+        if ok { if *crate::VERIFY { "서명 누락·기형 헤더 요청이 패닉이나 5xx 없이 거부됐습니다 (VERIFY_SIGV4=1)." } else { "서명 누락·기형 헤더 요청이 패닉이나 5xx 없이 처리됐습니다 (서명 검증은 VERIFY_SIGV4=1일 때만)." }.into() } else { bad.join("; ") },
         t0.elapsed().as_secs_f64() * 1000.0, json!({"status_lt": 500}), json!({"failures": bad}), repro)
 }
 

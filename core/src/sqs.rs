@@ -6,8 +6,15 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-// ponytail: FIFO queues behave like ordered standard queues (no dedup / group locking); message attributes are not stored.
+// FIFO: MessageGroupId is required, a group with a message in flight is held back (strict per-group order),
+// and duplicates (MessageDeduplicationId or ContentBasedDeduplication) within 5 minutes return the first MessageId.
+// ponytail: message attributes are not stored; FIFO high-throughput mode and per-message DelaySeconds rules are not emulated.
+const DEDUP_WINDOW: Duration = Duration::from_secs(300);
+
 struct Msg {
+    group: Option<String>,
+    dedup: Option<String>,
+    seq: u64,
     id: String,
     body: String,
     md5: String,
@@ -21,6 +28,8 @@ struct Msg {
 struct Queue {
     attrs: BTreeMap<String, String>,
     msgs: Vec<Msg>,
+    seen: BTreeMap<String, (Instant, String, u64)>, // FIFO dedup id -> (sent, MessageId, SequenceNumber)
+    seq: u64,
 }
 
 #[derive(Default)]
@@ -71,7 +80,28 @@ fn send(q: &mut Queue, e: &Value) -> Result<Value, ApiErr> {
         return Err(err("InvalidParameterValue", format!("Message must be shorter than {max} bytes.")));
     }
     let delay = e["DelaySeconds"].as_u64().unwrap_or_else(|| q.attrs["DelaySeconds"].parse().unwrap_or(0));
+    let fifo = q.attrs.get("FifoQueue").is_some_and(|v| v == "true");
+    let (group, dedup) = if fifo {
+        let g = e["MessageGroupId"].as_str().ok_or_else(|| err("MissingParameter", "The request must contain the parameter MessageGroupId."))?;
+        let d = match e["MessageDeduplicationId"].as_str() {
+            Some(d) => d.to_string(),
+            None if q.attrs.get("ContentBasedDeduplication").is_some_and(|v| v == "true") => crate::sigv4::sha256_hex(body.as_bytes()),
+            None => return Err(err("InvalidParameterValue", "The queue should either have ContentBasedDeduplication enabled or MessageDeduplicationId provided explicitly")),
+        };
+        let now = Instant::now();
+        q.seen.retain(|_, (t, ..)| now.duration_since(*t) < DEDUP_WINDOW);
+        if let Some((_, id, seq)) = q.seen.get(&d) {
+            return Ok(json!({"MessageId": id, "MD5OfMessageBody": format!("{:x}", Md5::digest(body.as_bytes())), "SequenceNumber": seq.to_string()}));
+        }
+        (Some(g.to_string()), Some(d))
+    } else {
+        (None, None)
+    };
+    q.seq += 1;
     let m = Msg {
+        group,
+        dedup,
+        seq: q.seq,
         id: uuid::Uuid::new_v4().to_string(),
         md5: format!("{:x}", Md5::digest(body.as_bytes())),
         body,
@@ -81,7 +111,11 @@ fn send(q: &mut Queue, e: &Value) -> Result<Value, ApiErr> {
         sent: now_ms(),
         first: None,
     };
-    let out = json!({"MessageId": m.id, "MD5OfMessageBody": m.md5});
+    let mut out = json!({"MessageId": m.id, "MD5OfMessageBody": m.md5});
+    if let Some(d) = &m.dedup {
+        out["SequenceNumber"] = json!(m.seq.to_string());
+        q.seen.insert(d.clone(), (Instant::now(), m.id.clone(), m.seq));
+    }
     q.msgs.push(m);
     Ok(out)
 }
@@ -106,7 +140,10 @@ fn call(qs: &mut Queues, op: &str, r: &Value, host: &str) -> Result<Value, ApiEr
             attrs.insert("QueueArn".into(), format!("arn:aws:sqs:{}:{ACCOUNT}:{n}", *REGION));
             attrs.insert("CreatedTimestamp".into(), (now_ms() / 1000).to_string());
             attrs.extend(given);
-            qs.q.insert(n.into(), Queue { attrs, msgs: vec![] });
+            if attrs.get("FifoQueue").is_some_and(|v| v == "true") != n.ends_with(".fifo") {
+                return Err(err("InvalidParameterValue", "The name of a FIFO queue can only include alphanumeric characters, hyphens, or underscores, must end with .fifo suffix."));
+            }
+            qs.q.insert(n.into(), Queue { attrs, msgs: vec![], seen: BTreeMap::new(), seq: 0 });
             Ok(json!({"QueueUrl": url(n)}))
         }
         "GetQueueUrl" => {
@@ -177,8 +214,14 @@ fn call(qs: &mut Queues, op: &str, r: &Value, host: &str) -> Result<Value, ApiEr
             let now = Instant::now();
             let (mut out, mut dead) = (vec![], vec![]);
             let mut i = 0;
+            let mut held: Vec<String> = vec![]; // FIFO groups whose earlier message is in flight or delayed
             while i < q.msgs.len() && out.len() < max {
+                if q.msgs[i].group.as_ref().is_some_and(|g| held.contains(g)) {
+                    i += 1;
+                    continue;
+                }
                 if q.msgs[i].visible_at > now {
+                    held.extend(q.msgs[i].group.clone());
                     i += 1;
                     continue;
                 }
@@ -199,6 +242,11 @@ fn call(qs: &mut Queues, op: &str, r: &Value, host: &str) -> Result<Value, ApiEr
                         "SentTimestamp": m.sent.to_string(),
                         "ApproximateFirstReceiveTimestamp": first.to_string(),
                     });
+                    if let (Some(g), Some(d)) = (&m.group, &m.dedup) {
+                        j["Attributes"]["MessageGroupId"] = json!(g);
+                        j["Attributes"]["MessageDeduplicationId"] = json!(d);
+                        j["Attributes"]["SequenceNumber"] = json!(m.seq.to_string());
+                    }
                 }
                 out.push(j);
                 i += 1;
@@ -286,6 +334,7 @@ impl Queues {
         let qs: Vec<Value> = self.q.iter().map(|(n, q)| {
             let msgs: Vec<Value> = q.msgs.iter().map(|m| json!({
                 "id": m.id, "body": m.body, "md5": m.md5, "receives": m.receives, "sent": m.sent as u64,
+                "group": m.group, "dedup": m.dedup, "seq": m.seq,
             })).collect();
             json!({"name": n, "attrs": q.attrs, "msgs": msgs})
         }).collect();
@@ -298,10 +347,13 @@ impl Queues {
         for q in v.as_array().into_iter().flatten() {
             let Some(name) = q["name"].as_str() else { continue };
             let attrs = str_map(&q["attrs"]);
-            let msgs: Vec<Msg> = q["msgs"].as_array().into_iter().flatten().map(|m| {
+            let msgs: Vec<Msg> = q["msgs"].as_array().into_iter().flatten().enumerate().map(|(i, m)| {
                 let body = m["body"].as_str().unwrap_or("").to_string();
                 let md5 = m["md5"].as_str().map(String::from).unwrap_or_else(|| format!("{:x}", Md5::digest(&body)));
                 Msg {
+                    group: m["group"].as_str().map(String::from),
+                    dedup: m["dedup"].as_str().map(String::from),
+                    seq: m["seq"].as_u64().unwrap_or(i as u64 + 1),
                     id: m["id"].as_str().map(String::from).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     body, md5, visible_at: now, receipt: None,
                     receives: m["receives"].as_u64().unwrap_or(0),
@@ -309,7 +361,8 @@ impl Queues {
                     first: None,
                 }
             }).collect();
-            self.q.insert(name.into(), Queue { attrs, msgs });
+            let seq = msgs.iter().map(|m| m.seq).max().unwrap_or(0);
+            self.q.insert(name.into(), Queue { attrs, msgs, seen: BTreeMap::new(), seq });
         }
     }
 }
