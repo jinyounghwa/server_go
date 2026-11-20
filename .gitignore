@@ -2,3 +2,4 @@ target/
 .venv/
 __pycache__/
 gui/gen/
+web/

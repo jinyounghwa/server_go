@@ -804,6 +804,10 @@ async fn reach(State(app): State<Arc<App>>, axum::extract::Query(q): axum::extra
     Json(app.net.lock().unwrap().reach(&g("from", ""), &g("to", ""), &g("protocol", "tcp"), port))
 }
 
+async fn town() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("town.html"))
+}
+
 async fn ui() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("ui.html"))
 }
@@ -840,6 +844,7 @@ async fn main() {
     let router = Router::new()
         .route("/_events", get(events))
         .route("/_ui", get(ui))
+        .route("/_town", get(town))
         .route("/favicon.ico", get(|| async { axum::http::StatusCode::NO_CONTENT })) // keep browsers out of the S3 log
         .route("/_admin/state", get(state))
         .route("/_admin/reset", post(reset))
@@ -853,6 +858,6 @@ async fn main() {
     tokio::spawn(managed::cleanup());
     route53::serve_dns(app.clone());
     let l = tokio::net::TcpListener::bind(&bind).await.expect("bind");
-    eprintln!("rocalcloud listening on http://{bind}  (GUI: /_ui, events: /_events, ENFORCE_IAM={})", *ENFORCE as u8);
+    eprintln!("rocalcloud listening on http://{bind}  (GUI: /_ui, town: /_town, events: /_events, ENFORCE_IAM={})", *ENFORCE as u8);
     axum::serve(l, router).await.unwrap();
 }

@@ -65,10 +65,18 @@ RDS, ElastiCache and ECS start containers through the `docker` CLI (`RC_DOCKER` 
 127.0.0.1 only and capped at `RC_CONTAINER_MEMORY` (default 512m) and 1 CPU. Leftover `rocalcloud-*` containers are
 removed at startup and on reset.
 
+## Character town
+
+`/_town` shows the event stream as a small town: every request is a courier walking from the gate (IAM guard) to its
+service's building, service-to-service deliveries walk between buildings, and results show as ✓ / ! / ✗ / ✋ / ⚡.
+A text log mirrors the animation. Opened anywhere else (or with `?demo`) it plays scripted mock events; `netlify.toml`
+publishes it as a static demo.
+
 ## Built-in endpoints
 
 - `GET /_events` — Server-Sent Events, one JSON event per request
 - `GET /_ui` — GUI page
+- `GET /_town` — character town
 - `GET /_admin/state`, `POST /_admin/reset` (needs header `x-rocalcloud`)
 - `GET /_admin/reach?from=internet|<instance-id>&to=...&protocol=tcp&port=443` — step-by-step reachability
   (route table → internet gateway, public IP, security group rules). NACLs, peering and NAT are not modeled yet.

@@ -1,0 +1,4 @@
+# Static demo of the character town (runs on mock events when not served by the emulator).
+[build]
+  command = "mkdir -p web && cp core/src/town.html web/index.html"
+  publish = "web"
