@@ -1,29 +1,185 @@
 # rocalcloud
 
-A local, in-memory emulator for the cloud APIs your app actually uses. Point an official SDK at
-`http://127.0.0.1:4566` and it works offline. Plan and roadmap: [local-cloud-emulator-plan.md](local-cloud-emulator-plan.md).
+A fast, deterministic, single-binary local cloud emulator written in Rust. Point your official cloud SDKs (Python, JavaScript, Rust, etc.) at `http://127.0.0.1:4566` and develop, test, and debug completely offline—complete with a built-in web/desktop GUI, a real-time 3D Character Town visualizer, chaos engineering, and optional local LLM explanation & verification agents.
 
-## Run
+> **Architecture & Project Roadmap:** See [local-cloud-emulator-plan.md](local-cloud-emulator-plan.md) for the full design principles, system architecture, and implementation checklist.
 
-```sh
-cd core && cargo run --release        # emulator on 127.0.0.1:4566 (BIND, REGION env vars)
-RC_CONFIG=rocalcloud.env cargo run --release   # same settings from a KEY=VALUE file; real env vars win
-cd gui && cargo run                   # desktop window (Tauri), or open http://127.0.0.1:4566/_ui
+---
+
+## Architecture Overview
+
+```text
+[Official SDKs / App Code]  ──►  http://127.0.0.1:4566
+                                       │
+                        ┌──────────────▼──────────────┐
+                        │   rocalcloud (Rust binary)  │
+                        │  • SigV4 + IAM Policy Engine│
+                        │  • Chaos Fault Injector     │
+                        │  • 22+ Cloud Service Modules│
+                        │  • In-Memory + JSON Snapshot│
+                        └──────────────┬──────────────┘
+                                       │ SSE (/_events)
+             ┌─────────────────────────┼─────────────────────────┐
+             ▼                         ▼                         ▼
+     Desktop / Web GUI        3D Character Town         Local LLM Agents
+    (Tauri / /_ui)         (/_town & GitHub Pages)    (Explain & Inspector)
 ```
 
-### Docker
+---
+
+## Quick Start
+
+### Run from source
+
+```sh
+cd core && cargo run --release                  # starts emulator on http://127.0.0.1:4566
+ENFORCE_IAM=1 cargo run --release               # enable strict IAM policy enforcement
+ENFORCE_IAM=1 VERIFY_SIGV4=1 cargo run --release # also verify SigV4 request signatures
+RC_CONFIG=rocalcloud.env cargo run --release    # load settings from a KEY=VALUE file (env vars win)
+```
+
+Open the built-in web interfaces in your browser:
+- **Management GUI:** `http://127.0.0.1:4566/_ui` (or run `cd gui && cargo run` for the Tauri desktop window)
+- **3D Character Town:** `http://127.0.0.1:4566/_town`
+
+### Run with Docker
 
 ```sh
 docker build -t rocalcloud .
 docker run --rm -p 127.0.0.1:4566:4566 -e ENFORCE_IAM=1 rocalcloud
 ```
 
-### Compatibility test suites (Python · JS · Rust)
+### Prebuilt Binaries & Homebrew
 
-Start the server with `ENFORCE_IAM=1`, then run any of the official SDK suites:
+- **GitHub Releases:** Pushing a `v*` tag builds macOS (`arm64` / `x86_64`) and Linux (`x86_64`) binaries with `SHA256SUMS` via [`.github/workflows/release.yml`](.github/workflows/release.yml).
+- **Homebrew:** Formula is located at [`packaging/homebrew/rocalcloud.rb`](packaging/homebrew/rocalcloud.rb).
+
+### Pointing an SDK at rocalcloud
+
+Configure your SDK with endpoint `http://127.0.0.1:4566`, any region (default `us-east-1`), and credentials `test` / `test` (unregistered access keys act as the account root). For S3, use path-style addressing (`addressing_style="path"` in boto3, `forcePathStyle: true` in JS SDK v3).
+
+---
+
+## Configuration
+
+All options can be set via environment variables or a `KEY=VALUE` file pointed to by `RC_CONFIG` (real environment variables always take precedence). Inspect active settings at `GET /_admin/config`.
+
+| Variable | Default | Description |
+|---|---|---|
+| `BIND` | `127.0.0.1:4566` | HTTP listen address (keep `127.0.0.1` unless Docker containers need to call back) |
+| `REGION` | `us-east-1` | Default region for ARNs and responses |
+| `ENFORCE_IAM` | `0` | Set `1` to enforce IAM policy decisions (otherwise logged only) |
+| `VERIFY_SIGV4` | `0` | Set `1` to verify SigV4 header and presigned query signatures |
+| `RC_ROOT_SECRET` | `test` | Secret key used for unregistered (root) access keys when `VERIFY_SIGV4=1` |
+| `RC_CONFIG` | *(unset)* | Path to a `KEY=VALUE` configuration file (`#` comments supported) |
+| `RC_STATE_FILE` | *(unset)* | JSON snapshot file auto-loaded on startup and written via `POST /_admin/snapshot/save` |
+| `RC_TOWN_ORIGIN` | `https://jinyounghwa.github.io` | Single CORS origin allowed to read scrubbed `/_events` for GitHub Pages; set `off` to disable |
+| `RC_LLM_URL` | `http://127.0.0.1:11434` | Local Ollama endpoint for the explanation and verification agents |
+| `RC_LLM_MODEL` | `qwen3.5:9b` | Model name used by Ollama |
+| `RC_DNS_PORT` | `10053` | Local UDP port (`127.0.0.1`) for the Route 53 DNS server |
+| `RC_DOCKER` | `docker` | Docker CLI binary used by RDS, ElastiCache, and ECS |
+| `RC_CONTAINER_MEMORY` | `512m` | Memory limit applied to each spawned Docker container |
+
+---
+
+## Supported Services
+
+| Service | Emulated Operations & Features |
+|---|---|
+| **DynamoDB** | Create/Describe/List/DeleteTable, Put/Get/Update/DeleteItem, Query, Scan, BatchWrite/GetItem, TransactWrite/GetItems, GSI/LSI, condition/filter/update/projection expressions, 400 KB item limit |
+| **S3** | List/Create/Head/DeleteBucket, Put/Get/Head/Delete/CopyObject, Range reads, ListObjects(V2) with prefix/delimiter/paging, DeleteObjects, multipart upload, SigV4 presigned URLs |
+| **SQS** | Create/Delete/List/PurgeQueue, GetQueueUrl, Get/SetQueueAttributes, Send/Receive/DeleteMessage (+Batch), ChangeMessageVisibility, long polling, DLQs, FIFO queues (`MessageGroupId` ordering, deduplication IDs & content-based dedup, 5-min window), 256 KiB message limit |
+| **IAM / STS** | Users, roles, managed & inline policies, access keys, `SimulatePrincipalPolicy`, `AssumeRole` (trust policy checked), `GetCallerIdentity` |
+| **SNS** | Topics, subscriptions (SQS, Lambda), filter policies, raw delivery, topic/subscription attributes |
+| **Secrets Manager** | Create/Get/Put/Update/Describe/List/Delete/RestoreSecret, version stages, `GetRandomPassword` |
+| **SSM** | Parameter Store: Put/Get/GetParameters(ByPath)/Delete/DescribeParameters, `SecureString` |
+| **KMS** | Keys, aliases, Encrypt/Decrypt with encryption context, `GenerateDataKey`, enable/disable, scheduled deletion *(local obfuscation only, not real cryptography)* |
+| **CloudWatch Logs** | Log groups, streams, `PutLogEvents`, `GetLogEvents`, `FilterLogEvents` (plain terms), retention |
+| **Lambda** | `python*` / `nodejs*` functions run as local processes; `Invoke` (sync, Event, DryRun, log tail), timeouts, errors, env vars, execution-role credentials, SQS event source mappings, logs to CloudWatch Logs |
+| **EventBridge** | Buses, rules (event patterns incl. prefix/numeric/exists/anything-but, `rate()` schedules), SQS/SNS/Lambda targets, `Input`/`InputPath` |
+| **Step Functions** | ASL interpreter: Pass, Task (`lambda:invoke`, `sqs:sendMessage`, `sns:publish`, `dynamodb:*`), Choice, Wait, Succeed, Fail, Parallel, Map, Retry/Catch, Parameters/ResultSelector/ResultPath/OutputPath, intrinsics (`Format`, `StringToJson`, `JsonToString`, `Array`, `UUID`, `MathAdd`), execution history, `StopExecution` |
+| **API Gateway (HTTP APIs)** | `apigatewayv2` APIs, Lambda proxy integrations (payload 2.0), routes with `{params}` and `{proxy+}`, stages, quick create; invoke at `/_api/{apiId}/[{stage}/]path` |
+| **Cognito** | User pools, app clients (with secrets), SignUp/Confirm, ForgotPassword, `USER_PASSWORD_AUTH`, refresh tokens, `NEW_PASSWORD_REQUIRED`, admin user APIs, RS256 JWTs with JWKS at `/_cognito/{poolId}/.well-known/jwks.json`; verification codes emit `CodeSent` events |
+| **Kinesis** | Streams, shards (MD5 hash ranges), `PutRecord(s)`, shard iterators (`TRIM_HORIZON`, `LATEST`, `AT/AFTER_SEQUENCE_NUMBER`, `AT_TIMESTAMP`), `GetRecords` |
+| **SES** | v1 (Query) and v2 (REST): identities, `SendEmail`, `SendRawEmail`; messages appear in the GUI mailbox and are never sent externally |
+| **RDS** | `postgres` / `mysql` / `mariadb` instances as real Docker containers on `127.0.0.1`; create, describe, stop, start, reboot, delete |
+| **ElastiCache** | `redis` / `valkey` / `memcached` clusters as Docker containers; create, describe (with node endpoints), delete |
+| **ECS** | Clusters, task definitions (revisions), `RunTask`/`StopTask` as Docker containers with port mappings, env, overrides, task-role credentials, `awslogs` → CloudWatch Logs; services maintain `desiredCount` and register with ALB target groups |
+| **ELB v2 (ALB)** | Load balancers, target groups, listeners bound to `127.0.0.1:{Port}` (>= 1024) with round-robin L4 forwarding to healthy targets, fixed responses, target health |
+| **Route 53** | Hosted zones, record sets (`CREATE`/`UPSERT`/`DELETE`, aliases, wildcards), plus a local UDP DNS server on `127.0.0.1:10053` (`RC_DNS_PORT`) answering `A`/`AAAA`/`CNAME`/`TXT` |
+| **CloudFormation** | JSON/YAML templates (short tags), Parameters, Conditions, Mappings, `Ref`/`GetAtt`/`Sub`/`Join`/`Select`/`Split`/`If`/`FindInMap`/`GetAZs`/`Base64`, dependency ordering, Outputs, create/update/delete with rollback |
+| **EC2 (Network)** | VPCs, subnets, internet gateways, route tables, security groups, instances (metadata records), `DescribeAvailabilityZones`, step-by-step reachability analysis at `/_admin/reach` |
+
+Unsupported S3 sub-resources return `501 NotImplemented`, and unsupported operations return explicit errors (`UnknownOperationException`) instead of faking success.
+
+---
+
+## IAM Enforcement & Signature Verification
+
+- **IAM (`ENFORCE_IAM=1`):** Every request is evaluated against the caller's identity policies (Allow/Deny, wildcards, `NotAction`/`NotResource`, `String`/`Arn`/`Bool` conditions). Unregistered access keys (e.g. `test`) act as account root and are always allowed. Without `ENFORCE_IAM=1`, decisions and denial reasons are recorded in the event stream and GUI without blocking requests.
+- **SigV4 (`VERIFY_SIGV4=1`):** Every request (Authorization header and presigned query auth, including session tokens and expiry) must carry a valid SigV4 signature. Wrong secrets receive `SignatureDoesNotMatch` / `InvalidSignatureException`; unsigned requests receive `MissingAuthenticationToken` (Cognito public operations remain unsigned). SigV2 presigned URLs are refused with a clear error; presign with `signature_version="s3v4"`. `aws-chunked` bodies are verified against their declared payload hash (individual chunk signatures are not verified).
+
+---
+
+## Integrations, Chaos & Docker-Backed Services
+
+- **Event-Driven Integrations:** S3 bucket notifications → SQS / SNS / Lambda (with prefix/suffix filters), SNS → SQS / Lambda, SQS → Lambda, EventBridge → SQS / SNS / Lambda. Every hop is emitted to `/_events`.
+- **Chaos Injection:** `POST /_admin/chaos` (requires header `x-rocalcloud: 1`) injects latency, HTTP 500s, and service-specific throttling:
+  ```json
+  {"rules": [{"service": "dynamodb", "op": "Get*", "latency_ms": 200, "error_rate": 0.1, "throttle_rate": 0.2}]}
+  ```
+  Send `{"rules": []}` to disable chaos rules.
+- **Docker-Backed Services:** RDS, ElastiCache, and ECS manage containers via the `docker` CLI (`RC_DOCKER`). Every container publishes ports on `127.0.0.1` only and is capped at `RC_CONTAINER_MEMORY` (default `512m`) and 1 CPU. Leftover `rocalcloud-*` containers are cleaned up at startup and on `/_admin/reset`.
+
+---
+
+## 3D Character Town (`/_town` & GitHub Pages)
+
+`/_town` visualizes the live event stream as a 3D coastal city: every request drives a delivery van past the IAM checkpoint gate to its service's building, service-to-service deliveries fly as glowing parabolic drones between rooftops, and outcomes appear as `✓` / `!` / `✗` / `✋` / `⚡` / `🛡` / `⚠` alongside a live text feed.
+
+- **Hosted Demo / Live Viewer:** [https://jinyounghwa.github.io/server_go/](https://jinyounghwa.github.io/server_go/) automatically connects to a local `rocalcloud` instance on `http://127.0.0.1:4566` (or another loopback port via `?api=http://127.0.0.1:<port>`). Until a local instance responds, it runs scripted mock traffic and retries every 5 seconds. Append `?demo` to force mock traffic.
+
+---
+
+## Security Model
+
+rocalcloud is designed for local development and takes defense-in-depth precautions so browsing external websites cannot tamper with or exfiltrate your local emulator state:
+
+1. **Loopback Binding by Default:** HTTP (`127.0.0.1:4566`), DNS (`127.0.0.1:10053`), ALB listeners, and all Docker container port mappings bind strictly to `127.0.0.1`.
+2. **CSRF Protection on Mutating Endpoints:** All state-mutating `POST` endpoints (`/_admin/reset`, `/_admin/chaos`, `/_admin/snapshot`, `/_admin/snapshot/save`, `/_agent/*`, `/_inspect/*`) require the custom `x-rocalcloud` header, forcing a CORS preflight that fails for cross-origin pages.
+3. **GitHub Pages Character Town Hardening:**
+   - **Single-Origin CORS + `Vary: Origin`:** Only the exact origin in `RC_TOWN_ORIGIN` (default `https://jinyounghwa.github.io`) receives `Access-Control-Allow-Origin` on `GET /_events`. Set `RC_TOWN_ORIGIN=off` to disable cross-origin streaming completely.
+   - **Allowlist Event Scrubbing (`town_view`):** Cross-origin `/_events` streams only forward minimal visualization fields (`ts`, `service`, `op`, `status`, `trigger`, `protocol`, `target`, inspector summary, `auth.decision/enforced`, `chaos.fault`). Sensitive fields—including Cognito confirmation `code`, IAM `principal` ARNs, `request_id`, detailed `error` payloads, IAM policy `auth.reason`, and chaos `rules`—are stripped before leaving the process.
+   - **Shared `*.github.io` Origin Caveat:** All repositories published under the same GitHub user account share the single `https://<user>.github.io` origin. If you host untrusted content on another repository under the same GitHub Pages account, or want zero cross-origin exposure, set `RC_TOWN_ORIGIN=off` and use the local `http://127.0.0.1:4566/_town` instead.
+   - **Client-Side `?api=` Loopback Validation & CSP:** `town.html` strictly restricts `?api=` to `http:`/`https:` URLs on loopback hosts (`127.0.0.1`, `localhost`, `[::1]`) to prevent `javascript:` URI XSS and phishing redirects. It also ships with a strict `<meta>` Content-Security-Policy (`connect-src` limited to loopback + `https://esm.sh`) and `referrer="no-referrer"`.
+   - **Third-Party CDN Tradeoff:** The 3D scene loads Three.js (`0.170.0`) from `https://esm.sh` via import map. For air-gapped or zero-CDN environments, use the self-contained local `/_ui` dashboard (which has zero external asset dependencies) and set `RC_TOWN_ORIGIN=off`.
+
+---
+
+## Explanation & Verification Agents
+
+### Explanation Agent
+- `POST /_agent/explain {"request_id": ...}` returns a deterministic rule-based explanation for any failed or denied request. When Ollama is reachable at `RC_LLM_URL` (default `http://127.0.0.1:11434`, model `RC_LLM_MODEL`), a concise natural-language explanation is added.
+- `POST /_agent/ask {"question": ...}` answers using four schema-constrained tools (list resources, recent events, explain event, call JSON API). Destructive actions return a confirmation token and execute only when resubmitted with `{"confirm": "<token>"}`.
+- `GET /_agent/template` drafts a CloudFormation YAML template from current S3, DynamoDB, SQS, SNS, and SSM resources.
+- LLM calls are serialized and paced at least 1.5 s apart. For a remote Ollama host, tunnel over SSH: `ssh -f -N -L 11434:127.0.0.1:11434 <host>`.
+
+### Verification Agent (Inspector)
+- `POST /_inspect/run` (header `x-rocalcloud: 1`) executes 20 deterministic security, chaos, incident, performance, and fuzzing scenarios strictly against `127.0.0.1` (auto-signing its own requests so it works with or without `VERIFY_SIGV4=1`).
+- Pass `{"use_llm": true}` to let the local LLM propose additional non-destructive scenarios (still executed and judged deterministically).
+- Export reports via `GET /_inspect/report/{id}?format=md` or `?format=html`, save regressions to `tests/regressions/*.json`, and replay single scenarios via `POST /_inspect/replay`.
+
+---
+
+## Compatibility Test Suites (Python · JS · Rust)
+
+Start the server with `ENFORCE_IAM=1` (and optionally `VERIFY_SIGV4=1`), then run any of the official SDK suites:
 
 ```sh
-# Python (boto3) — full 24-suite integration test
+# Rust unit tests (must compile with 0 warnings)
+cd core && cargo test
+
+# Python (boto3) — full integration suite
 uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with redis --with dnspython tests/sdk_test.py
 
 # JavaScript (@aws-sdk v3)
@@ -33,125 +189,42 @@ cd tests/js && npm install && npm test
 cd tests/rust && cargo run
 ```
 
-### Packaging
+---
 
-- **GitHub Releases**: Pushing a `v*` tag builds macOS (arm64/x86_64) and Linux (x86_64) release binaries via `.github/workflows/release.yml`.
-- **Homebrew**: Formula template is in [packaging/homebrew/rocalcloud.rb](packaging/homebrew/rocalcloud.rb).
-- **Contributing**: See [CONTRIBUTING.md](CONTRIBUTING.md).
+## Built-in Endpoints
 
-## Supported
-
-| Service | Operations |
+| Endpoint | Purpose |
 |---|---|
-| DynamoDB | Create/Describe/List/DeleteTable, Put/Get/Update/DeleteItem, Query, Scan, BatchWrite/GetItem, TransactWrite/GetItems, GSI/LSI, condition/filter/update/projection expressions |
-| S3 | List/Create/Head/DeleteBucket, Put/Get/Head/Delete/CopyObject, Range, ListObjects(V2) with prefix/delimiter/paging, DeleteObjects, multipart upload, presigned URLs |
-| SQS | Create/Delete/List/PurgeQueue, GetQueueUrl, Get/SetQueueAttributes, Send/Receive/DeleteMessage (+Batch), ChangeMessageVisibility, long polling, dead-letter queues, FIFO queues (MessageGroupId ordering, deduplication ids and content-based dedup, 5-minute window) |
-| IAM / STS | Users, roles, managed + inline policies, access keys, SimulatePrincipalPolicy, AssumeRole (trust policy checked), GetCallerIdentity |
-| SNS | Topics, subscriptions (SQS, Lambda), filter policies, raw delivery, topic/subscription attributes |
-| Secrets Manager | Create/Get/Put/Update/Describe/List/Delete/RestoreSecret, version stages, GetRandomPassword |
-| SSM | Parameter Store: Put/Get/GetParameters(ByPath)/Delete/DescribeParameters, SecureString |
-| KMS | Keys, aliases, Encrypt/Decrypt with encryption context, GenerateDataKey, enable/disable, scheduled deletion (local obfuscation, not real crypto) |
-| CloudWatch Logs | Groups, streams, PutLogEvents, GetLogEvents, FilterLogEvents (plain terms), retention |
-| Lambda | python* / nodejs* functions run as local processes; Invoke (sync, Event, DryRun, log tail), timeouts, errors, env vars, execution-role credentials, SQS event source mappings, logs to CloudWatch Logs |
-| EventBridge | Buses, rules (event patterns incl. prefix/numeric/exists/anything-but, rate() schedules), SQS/SNS/Lambda targets, Input/InputPath |
-| Step Functions | ASL interpreter: Pass, Task (Lambda, lambda:invoke, sqs:sendMessage, sns:publish, dynamodb:*), Choice, Wait, Succeed, Fail, Parallel, Map, Retry/Catch, Parameters/ResultSelector/ResultPath/OutputPath, intrinsics (Format, StringToJson, JsonToString, Array, UUID, MathAdd), execution history, StopExecution |
-| API Gateway (HTTP APIs) | apigatewayv2 APIs, Lambda proxy integrations (payload 2.0), routes with {params} and {proxy+}, stages, quick create; invoke at `/_api/{apiId}/[{stage}/]path` |
-| Cognito | User pools, app clients (with secrets), SignUp/Confirm, ForgotPassword, USER_PASSWORD_AUTH, refresh tokens, NEW_PASSWORD_REQUIRED, admin user APIs, RS256 JWTs with JWKS at `/_cognito/{poolId}/.well-known/jwks.json`; verification codes appear as `CodeSent` events |
-| Kinesis | Streams, shards (MD5 hash ranges), PutRecord(s), shard iterators (TRIM_HORIZON, LATEST, AT/AFTER_SEQUENCE_NUMBER, AT_TIMESTAMP), GetRecords |
-| SES | v1 (Query) and v2 (REST): identities, SendEmail, SendRawEmail; mail lands in the GUI mailbox, never sent |
-| RDS | postgres / mysql / mariadb instances as real Docker containers on 127.0.0.1; create, describe, stop, start, reboot, delete |
-| ElastiCache | redis / valkey / memcached clusters as Docker containers; create, describe (with node endpoints), delete |
-| ECS | Clusters, task definitions (revisions), RunTask/StopTask as Docker containers with port mappings, env, overrides, task-role credentials, awslogs → CloudWatch Logs; services keep desiredCount and register with ALB target groups |
-| ELB v2 (ALB) | Load balancers, target groups, listeners that really listen on 127.0.0.1:{Port} (>= 1024) and round-robin connections to healthy targets, fixed responses, target health |
-| Route 53 | Hosted zones, record sets (CREATE/UPSERT/DELETE, aliases, wildcards), plus a DNS server on 127.0.0.1:10053/udp (`RC_DNS_PORT`) answering A/AAAA/CNAME/TXT |
-| CloudFormation | JSON/YAML templates (short tags), Parameters, Conditions, Mappings, Ref/GetAtt/Sub/Join/Select/Split/If/FindInMap/GetAZs/Base64, dependency order, Outputs, create/update (unchanged resources kept, changed ones replaced)/delete with rollback; resources: S3 bucket, SQS queue, SNS topic/subscription, DynamoDB table, IAM role/policy/managed policy, Lambda function (inline or S3 code)/permission/event source mapping, Logs group, SSM parameter, Secrets Manager secret, KMS key/alias, EventBridge rule, Step Functions state machine |
-| EC2 (network) | VPCs, subnets, internet gateways, route tables, security groups, instances (records only), DescribeAvailabilityZones |
+| `GET /_events` | Server-Sent Events stream (one JSON event per request; allowlist-scrubbed for `RC_TOWN_ORIGIN`) |
+| `GET /_ui` | Built-in web GUI (resource explorer, live log, explanation agent, inspector, settings) |
+| `GET /_town` | Real-time 3D Character Town visualizer |
+| `GET /_admin/config` | Active startup configuration and flags |
+| `GET /_admin/state` | Current resource summaries across all 22+ services |
+| `GET /_admin/snapshot` / `POST /_admin/snapshot` | Export or restore JSON state snapshots (`POST` requires `x-rocalcloud`) |
+| `POST /_admin/snapshot/save` | Persist current state to `RC_STATE_FILE` (requires `x-rocalcloud`) |
+| `POST /_admin/reset` | Wipe all in-memory state and clean up Docker containers (requires `x-rocalcloud`) |
+| `GET /_admin/chaos` / `POST /_admin/chaos` | Inspect or configure chaos fault injection rules (`POST` requires `x-rocalcloud`) |
+| `GET /_admin/reach` | Step-by-step VPC reachability check (`?from=internet\|<id>&to=...&protocol=tcp&port=443`) |
+| `GET /_agent/status`, `POST /_agent/explain`, `POST /_agent/ask`, `GET /_agent/template` | Explanation agent endpoints |
+| `POST /_inspect/run`, `GET /_inspect/reports`, `GET /_inspect/report/{id}`, `POST /_inspect/replay` | Verification agent (inspector) endpoints |
 
-## IAM enforcement
+---
 
-Every request is evaluated against the caller's identity policies (Allow/Deny, wildcards, NotAction/NotResource,
-String/Arn/Bool conditions). Unregistered access keys (e.g. `test`) act as the account root and are always allowed.
-With `ENFORCE_IAM=1` denied requests fail like the real service; without it the decision and its reason only
-appear in the event stream and GUI.
+## Known Limitations
 
-## Signature verification
+- State is held in memory (persistable via JSON snapshots `RC_STATE_FILE`; no SQLite backend yet).
+- Resource-based policies (e.g. S3 bucket policies) are not evaluated yet (identity policies are).
+- KMS uses local obfuscation rather than production cryptography.
+- ALB operates at L4 (round-robin TCP forwarding without HTTP path/host routing rules).
+- Step Functions `Parallel` branches execute sequentially.
+- Deliberate shortcuts are marked with `// ponytail:` comments across `core/src/`.
 
-Signatures are parsed but not checked by default. With `VERIFY_SIGV4=1` every request (header auth and presigned
-query auth, including session tokens and expiry) must carry a valid SigV4 signature: wrong secrets get
-`SignatureDoesNotMatch` / `InvalidSignatureException`, unsigned calls get `MissingAuthenticationToken` (Cognito's
-public operations stay unsigned, as on AWS). Unregistered keys sign with `RC_ROOT_SECRET` (default `test`).
-SigV2 presigned URLs are refused with a clear error; presign with `signature_version="s3v4"`. aws-chunked bodies are
-trusted by their declared payload hash (chunk signatures are not checked).
+## Documentation
 
-Unsupported S3 sub-resources answer `501 NotImplemented`. State lives in memory only for now.
-
-## Integrations
-
-S3 bucket notifications → SQS / SNS / Lambda (prefix/suffix filters), SNS → SQS / Lambda, SQS → Lambda,
-EventBridge → SQS / SNS / Lambda. Every hop shows up in the event stream.
-
-## Chaos
-
-`POST /_admin/chaos` (header `x-rocalcloud`) with
-`{"rules": [{"service": "dynamodb", "op": "Get*", "latency_ms": 200, "error_rate": 0.1, "throttle_rate": 0.2}]}`
-injects latency, 500s and service-specific throttling errors. `{"rules": []}` turns it off.
-
-## Docker-backed services
-
-RDS, ElastiCache and ECS start containers through the `docker` CLI (`RC_DOCKER` to override). Each container is published on
-127.0.0.1 only and capped at `RC_CONTAINER_MEMORY` (default 512m) and 1 CPU. Leftover `rocalcloud-*` containers are
-removed at startup and on reset.
-
-## Character town
-
-`/_town` shows the event stream as a small town: every request is a courier walking from the gate (IAM guard) to its
-service's building, service-to-service deliveries walk between buildings, and results show as ✓ / ! / ✗ / ✋ / ⚡.
-A text log mirrors the animation. The GitHub Pages copy (https://jinyounghwa.github.io/server_go/) connects to the
-rocalcloud running on your machine (`http://127.0.0.1:4566`, or `?api=<url>`) and shows your real traffic; until one
-answers it plays mock events and retries every 5 s. `?demo` forces the mock events. Only the Pages origin gets CORS on
-`/_events` (`RC_TOWN_ORIGIN` overrides it, `off` disables it), and its copy drops Cognito confirmation codes.
-
-## Explanation agent
-
-Every failed or denied request gets a rule-based explanation (`POST /_agent/explain {"request_id": ...}`); with a
-local LLM reachable at `RC_LLM_URL` (default `http://127.0.0.1:11434`, model `RC_LLM_MODEL`, default `qwen3.5:9b`
-via Ollama) a short natural-language explanation is added. `POST /_agent/ask {"question": ...}` answers through four
-tools (list resources, recent events, explain an event, call a JSON-protocol API) with schema-constrained output;
-destructive calls return a confirmation token and run only on `{"confirm": token}`. Without an LLM it falls back to
-a rule-based summary. `GET /_agent/template` drafts CloudFormation YAML from the current S3/DynamoDB/SQS/SNS/SSM
-resources. In the GUI, click a log row to explain it, or use the question box.
-
-LLM calls are serialized, spaced at least 1.5 s apart and kept short. If Ollama runs on another machine, tunnel it:
-`ssh -f -N -L 11434:127.0.0.1:11434 <host>`.
-
-## Verification agent (inspector)
-
-`POST /_inspect/run` (header `x-rocalcloud`) runs deterministic security, chaos, incident, performance, fuzzing, and
-regression scenarios against `127.0.0.1` only: IAM implicit/explicit deny, CSRF header enforcement, S3 path traversal,
-missing/malformed SigV4, >256 MiB payload rejection (413), injection payloads, chaos throttle/5xx recovery, SQS DLQ
-buildup, Lambda repeated failures, 40-request concurrent burst, and 15 malformed fuzz inputs, plus latency injection,
-50% partial failure, connections dropped mid-request, a table deleted and recreated under write load, a 1000-message
-queue flood, DynamoDB 400 KB item and SQS 256 KiB message limits, and resident-memory growth over 2000 write/delete
-cycles. The inspector signs its own requests, so it runs with or without `VERIFY_SIGV4=1`.
-
-Set `{"use_llm": true}` to let the local LLM propose additional non-destructive scenarios (executed and judged by
-deterministic code). Reports can be exported via `GET /_inspect/report/{id}?format=md` or `?format=html`, failed cases
-can be saved to `tests/regressions/*.json`, and single scenarios can be replayed with `POST /_inspect/replay`. In the
-GUI click **검사**; in `/_town` an inspector character patrols the town and shows guard-block (`🛡`) or breach (`⚠`)
-animations.
-
-## Built-in endpoints
-
-- `GET /_events` — Server-Sent Events, one JSON event per request
-- `GET /_ui` — GUI page (resource explorer, live log, explanation agent, inspector)
-- `GET /_town` — character town
-- `GET /_agent/status`, `POST /_agent/explain`, `POST /_agent/ask`, `GET /_agent/template` — explanation agent
-- `POST /_inspect/run`, `GET /_inspect/reports`, `GET /_inspect/report/{id}`, `POST /_inspect/replay` — verification agent
-- `GET /_admin/config` — startup settings (also the GUI's **설정** screen, which edits chaos rules)
-- `GET /_admin/state`, `GET/POST /_admin/snapshot` (JSON state export/restore; `RC_STATE_FILE` auto-restores on startup, `POST /_admin/snapshot/save` writes to it), `POST /_admin/reset`, `GET/POST /_admin/chaos` (POSTs need header `x-rocalcloud`)
-- `GET /_admin/reach?from=internet|<instance-id>&to=...&protocol=tcp&port=443` — step-by-step reachability
-  (route table → internet gateway, public IP, security group rules). NACLs, peering and NAT are not modeled yet.
+- [Project Plan & Architecture Roadmap](local-cloud-emulator-plan.md) — design principles, architecture, and full implementation checklist
+- [Contributing Guide](CONTRIBUTING.md) — development rules, how to add a service, and running test suites
+- [Agent Skill Guide](SKILL.md) — quick reference for AI coding agents using `rocalcloud`
 
 ## License
 
-Apache-2.0
+Apache-2.0 — see [LICENSE](LICENSE).

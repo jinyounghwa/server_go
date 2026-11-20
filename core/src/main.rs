@@ -758,22 +758,51 @@ async fn set_chaos(State(app): State<Arc<App>>, h: HeaderMap, body: Bytes) -> ax
 
 // Event stream for GUI / character web / agents: one JSON event per request.
 // The published town page (GitHub Pages) may read the local event stream. Only this one origin gets CORS,
-// and its copy drops the Cognito confirmation code. RC_TOWN_ORIGIN overrides it, "off" disables it.
-static TOWN_ORIGIN: LazyLock<String> =
-    LazyLock::new(|| std::env::var("RC_TOWN_ORIGIN").unwrap_or_else(|_| "https://jinyounghwa.github.io".into()));
+// and its copy is scrubbed to an allowlist of visualization fields (dropping confirmation codes, principals,
+// error details, policy reasons, etc.). RC_TOWN_ORIGIN overrides it; "off" or empty disables it.
+fn parse_town_origin(raw: &str) -> Option<axum::http::HeaderValue> {
+    let s = raw.trim().trim_end_matches('/');
+    if s.is_empty() || s.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    if !(s.starts_with("https://") || s.starts_with("http://")) {
+        return None;
+    }
+    axum::http::HeaderValue::from_str(s).ok()
+}
+
+static TOWN_ORIGIN: LazyLock<Option<axum::http::HeaderValue>> = LazyLock::new(|| {
+    let raw = std::env::var("RC_TOWN_ORIGIN").unwrap_or_else(|_| "https://jinyounghwa.github.io".into());
+    parse_town_origin(&raw)
+});
 
 fn town_view(s: String) -> String {
-    match serde_json::from_str::<Value>(&s) {
-        Ok(mut v) if v.get("code").is_some() => {
-            v.as_object_mut().unwrap().remove("code");
-            v.to_string()
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&s) else { return "{}".into() };
+    let mut out = serde_json::Map::new();
+    for k in ["ts", "service", "op", "status", "trigger", "protocol", "target", "name", "target_service", "passed", "blocked", "total"] {
+        if let Some(v) = map.get(k) {
+            out.insert(k.into(), v.clone());
         }
-        _ => s,
     }
+    if let Some(Value::Object(a)) = map.get("auth") {
+        let mut ao = serde_json::Map::new();
+        for k in ["decision", "enforced"] {
+            if let Some(v) = a.get(k) { ao.insert(k.into(), v.clone()); }
+        }
+        if !ao.is_empty() { out.insert("auth".into(), Value::Object(ao)); }
+    }
+    if let Some(Value::Object(c)) = map.get("chaos") {
+        if let Some(f) = c.get("fault") {
+            out.insert("chaos".into(), json!({"fault": f}));
+        }
+    }
+    Value::Object(out).to_string()
 }
 
 async fn events(State(app): State<Arc<App>>, h: HeaderMap) -> Response {
-    let cross = h.get("origin").and_then(|o| o.to_str().ok()).is_some_and(|o| o == TOWN_ORIGIN.as_str());
+    let cross = TOWN_ORIGIN.as_ref().is_some_and(|allowed| {
+        h.get("origin").and_then(|o| o.to_str().ok()).is_some_and(|o| o == allowed.to_str().unwrap_or(""))
+    });
     let sse = Sse::new(futures_util::stream::unfold(app.events.subscribe(), move |mut rx| async move {
         loop {
             match rx.recv().await {
@@ -784,8 +813,11 @@ async fn events(State(app): State<Arc<App>>, h: HeaderMap) -> Response {
         }
     }));
     let mut resp = sse.into_response();
+    resp.headers_mut().insert("vary", axum::http::HeaderValue::from_static("Origin"));
     if cross {
-        resp.headers_mut().insert("access-control-allow-origin", TOWN_ORIGIN.parse().unwrap());
+        if let Some(allowed) = TOWN_ORIGIN.as_ref() {
+            resp.headers_mut().insert("access-control-allow-origin", allowed.clone());
+        }
     }
     resp
 }
@@ -1124,9 +1156,31 @@ async fn serve() {
 #[cfg(test)]
 mod town_tests {
     #[test]
-    fn town_view_drops_confirmation_code() {
-        let s = super::town_view(r#"{"op":"CodeSent","code":"123456","target":"u"}"#.into());
-        assert!(!s.contains("123456") && s.contains("CodeSent"));
+    fn town_view_scrubs_sensitive_fields() {
+        let s = super::town_view(
+            r#"{"ts":"2026-11-21T00:00:00Z","service":"cognito-idp","op":"CodeSent","code":"123456","target":"u","principal":"arn:aws:iam::000000000000:user/alice","request_id":"req-1","error":{"code":"AccessDenied","message":"secret"},"auth":{"decision":"explicitDeny","enforced":true,"reason":"Deny policy X"},"chaos":{"rule":"r1","fault":"ThrottlingException"}}"#.into()
+        );
+        assert!(!s.contains("123456"));
+        assert!(!s.contains("alice"));
+        assert!(!s.contains("req-1"));
+        assert!(!s.contains("secret"));
+        assert!(!s.contains("Deny policy X"));
+        assert!(!s.contains("\"rule\""));
+        assert!(s.contains("CodeSent") && s.contains("explicitDeny") && s.contains("ThrottlingException"));
         assert_eq!(super::town_view("{\"op\":\"x\"}".into()), "{\"op\":\"x\"}");
+        assert_eq!(super::town_view("not-json".into()), "{}");
+    }
+
+    #[test]
+    fn parse_town_origin_rejects_off_and_invalid() {
+        assert!(super::parse_town_origin("off").is_none());
+        assert!(super::parse_town_origin("OFF").is_none());
+        assert!(super::parse_town_origin("").is_none());
+        assert!(super::parse_town_origin("javascript:alert(1)").is_none());
+        assert!(super::parse_town_origin("https://example.com\r\nX-Bad: 1").is_none());
+        assert_eq!(
+            super::parse_town_origin("https://jinyounghwa.github.io/").unwrap().to_str().unwrap(),
+            "https://jinyounghwa.github.io"
+        );
     }
 }

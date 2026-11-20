@@ -1,188 +1,180 @@
-# 로컬 클라우드 에뮬레이터 프로젝트 계획
+# Local Cloud Emulator — Project Plan & Architecture Roadmap
 
-> 목적: 본인이 필요한 AWS 호환 백엔드 환경을 로컬에서 전부 가상으로 구현하고, 앱(GUI)·캐릭터 웹·로컬 LLM 에이전트까지 갖춘다.
-> 작성일: 2026-11-20
+> **Goal:** Emulate the full cloud backend stack needed by real applications completely offline on a local machine, paired with a desktop GUI, a 3D real-time character town, and local LLM explanation & verification agents.
+>
+> **Created:** 2026-11-20 · **Last Updated:** 2026-11-21 · **Overview & Quick Start:** [README.md](README.md)
 
 ---
 
-## 1. 핵심 결정 사항
+## 1. Key Design Decisions
 
-| 항목 | 결정 |
+| Area | Decision |
 |---|---|
-| 구현 주체 | Claude (Claude Code, 스프린트 단위) |
-| 런타임 에이전트 | 로컬 LLM 7B급 (Q4/Q5 양자화) |
-| 코어 언어 | Rust (axum, tokio, rusqlite, serde_json, quick-xml) |
-| GUI | Tauri |
-| 캐릭터 웹 | Canvas / Lottie / 스프라이트 + WebSocket |
-| 공개 | 오픈소스 (MIT 또는 Apache-2.0), 수입 목적 아님 |
-| 범위 원칙 | 전체 AWS가 아니라 "내 프로젝트가 쓰는 API"부터, 필요할 때마다 확장 |
-| 이름 | AWS, Amazon 단어 사용 금지 (상표 회피) |
+| Implementation Model | Sprint-based development, gated by official SDK compatibility suites |
+| Runtime Agents | Local 7B–9B quantized LLM (Q4/Q5 via Ollama), strictly outside the core |
+| Core Runtime | Rust single binary (`axum`, `tokio`, `serde_json`, `serde_yaml`, `sha2`, `rsa`, etc.) |
+| Desktop GUI | Tauri 2 shell wrapping the built-in `/_ui` web application |
+| Character Town | Real-time 3D interactive city (Three.js + SSE `/_events`) |
+| Licensing | Open source (Apache-2.0), non-commercial |
+| Scope Strategy | Implement APIs actually used by real projects first; expand incrementally rather than faking unimplemented features |
+| Naming | `rocalcloud` — avoids trademarked cloud provider names |
 
-## 2. 설계 원칙
+## 2. Core Design Principles
 
-- 코어는 결정적(deterministic)으로 유지한다. LLM은 코어 바깥 계층에만 둔다.
-- LLM이 꺼져 있어도 앱은 정상 동작해야 한다. 해설은 규칙 기반 템플릿이 먼저, LLM은 그 위에 얹는다.
-- 에이전트는 에뮬레이터 API를 호출하는 소수의 도구만 쓴다. 도구가 적을수록 작은 모델이 안정적이다.
-- 모든 요청은 이벤트로 발행한다. GUI, 캐릭터 웹, 검증 에이전트가 같은 이벤트 스트림을 쓴다.
-- 서비스 단위로 스프린트를 나누고, 공식 SDK 호환성 테스트 통과를 게이트로 둔다.
+- **Deterministic Core:** All service emulation logic is strictly deterministic. Local LLMs live exclusively outside the core (`agent.rs`, optional scenario proposals in `inspector.rs`).
+- **Graceful Fallback Without LLM:** Every feature must work when no LLM is running. Rule-based explanation templates and deterministic inspector scenarios run first; LLM output is layered on top.
+- **Minimal, Constrained Agent Tools:** Agents interact with the emulator through a small, well-defined tool surface with schema-constrained output so smaller local models remain reliable.
+- **Unified Event Bus:** Every API request, service-to-service delivery, IAM decision, chaos fault, and inspector action is published to a single event stream (`/_events`) consumed by the GUI, 3D Character Town, and agents.
+- **Official SDK Gates:** Every sprint is verified against official SDK integration tests (Python `boto3`, JavaScript `@aws-sdk` v3, Rust `aws-sdk-rust`) with `ENFORCE_IAM=1` and `VERIFY_SIGV4=1`.
+- **Loopback-by-Default Security:** All services and Docker containers bind to `127.0.0.1` by default; mutating admin endpoints require a custom `x-rocalcloud` header; cross-origin access to `/_events` is limited to a single configured origin (`RC_TOWN_ORIGIN`) with allowlist-scrubbed payloads.
 
-## 3. 전체 아키텍처
+## 3. System Architecture
 
-```
-[공식 AWS SDK / 앱 코드]
-        │ HTTP (엔드포인트만 로컬로 변경)
+```text
+[Official Cloud SDKs / Application Code]
+        │ HTTP (only the endpoint URL changes to http://127.0.0.1:4566)
         ▼
-[코어 런타임 (Rust)] ──► [상태 저장소 SQLite/메모리]
-   │  서비스 모듈들
-   │  이벤트 버스
-   ├──► [GUI (Tauri)]
-   ├──► [캐릭터 웹 (WebSocket)]
-   ├──► [해설 에이전트 (로컬 LLM)]
-   └──► [검증 에이전트 (보안·사고·각종 테스트)]
+[Core Runtime (Rust single binary)] ──► [In-Memory State + JSON Snapshots (RC_STATE_FILE)]
+   │  Protocol layer: AWS JSON / REST-XML / Query + optional SigV4 verification
+   │  IAM policy evaluator & chaos fault injector
+   │  22+ service modules (Docker-backed for RDS, ElastiCache, ECS)
+   │  Unified Event Bus (SSE /_events + recent ring buffer)
+   ├──► [Desktop GUI (Tauri / /_ui)]
+   ├──► [3D Character Town (Three.js / /_town & GitHub Pages)]
+   ├──► [Explanation Agent (rule-based + local Ollama LLM)]
+   └──► [Verification Agent / Inspector (deterministic security, chaos, fuzz, perf)]
 ```
 
 ---
 
-## 4. 해야 할 일 체크리스트
+## 4. Implementation Checklist
 
-상태 (2026-11-21): `[x]` 완료, `[~]` 일부 또는 다른 방법으로 대체(이유를 적음).
+Status as of **2026-11-21**: `[x]` completed, `[~]` partially implemented or intentionally replaced by an alternative (with rationale).
 
-### 0. 기반 결정
-- [x] 프로젝트 이름 (AWS, Amazon 단어 제외)
-- [x] 라이선스 (MIT 또는 Apache-2.0)
-- [x] 지원 서비스와 API 범위 표
-- [x] 레포 구조 (core / services / gui / web / agent / tests) — 서비스·웹·에이전트는 단일 바이너리 `core/src/`에 모듈로 들어감
-- [x] CLAUDE.md, SKILL.md, AGENT.md 작성 — AGENT.md는 AGENTS.md
-- [x] 스프린트 게이트 기준 (테스트 통과 시 다음 단계) — CI(단위 + Python·JS 스위트 + 서명 검증 모드)가 통과해야 함
-- [x] CI 구성
+### 0. Foundation
+- [x] Project name (`rocalcloud`, free of cloud provider trademarks)
+- [x] License (`Apache-2.0`)
+- [x] Supported services & API scope matrix (documented in [README.md](README.md))
+- [x] Repository layout (`core/`, `gui/`, `tests/`, `packaging/`) — services, web UI, town, and agents compiled into the single `core` binary
+- [x] Agent & contributor docs (`CLAUDE.md`, `SKILL.md`, `AGENTS.md`, `CONTRIBUTING.md`)
+- [x] Sprint quality gates — CI runs Rust unit tests + Python & JS SDK suites under both default and `VERIFY_SIGV4=1` modes
+- [x] CI / Release / Pages GitHub Actions workflows
 
-### 1. 코어 런타임 (Rust)
-- [x] HTTP 서버 (axum, tokio)
-- [x] 프로토콜 계층 (AWS JSON, REST-XML, Query)
-- [x] 서비스 식별과 라우팅 (헤더, 호스트, 경로)
-- [x] SigV4 헤더 파싱 (검증은 선택 옵션) — `VERIFY_SIGV4=1`
-- [x] 계정, 리전, ARN 모델
-- [~] 상태 저장소 (SQLite, 메모리 모드, 스냅샷, 초기화) — 메모리 + JSON 스냅샷 파일(`RC_STATE_FILE`) + 초기화. SQLite는 하지 않음(스냅샷으로 충분, 필요하면 추가)
-- [x] 공통 에러 포맷과 요청 ID
-- [x] 이벤트 버스 (모든 요청을 이벤트로 발행)
-- [x] 설정 파일과 환경변수 — `RC_CONFIG`(KEY=VALUE), `/_admin/config`
+### 1. Core Runtime (Rust)
+- [x] HTTP server (`axum`, `tokio`)
+- [x] Protocol adapters (AWS JSON 1.0/1.1, REST-XML, Query)
+- [x] Service identification and routing (headers, host, path, query action/version)
+- [x] SigV4 header parsing & optional full signature verification (`VERIFY_SIGV4=1`)
+- [x] Account, region, and ARN model
+- [~] State persistence (memory, snapshot, reset) — Implemented with in-memory state + JSON snapshot export/restore (`RC_STATE_FILE`, `/_admin/snapshot`). SQLite was skipped because JSON snapshots cover local dev workflows cleanly; SQLite can be added later if very large state is needed.
+- [x] Standard error formatting and request IDs (`x-amzn-requestid`, `x-amz-request-id`)
+- [x] Event bus (publishes every request to SSE `/_events` and recent ring buffer)
+- [x] Config file and environment variables (`RC_CONFIG` `KEY=VALUE`, `/_admin/config`)
 
-### 2. 쉬운 서비스
-- [x] DynamoDB (테이블, 항목, 쿼리, 스캔, GSI, 트랜잭션)
-- [x] S3 (버킷, 객체, 멀티파트, 프리사인드 URL)
-- [x] SQS (표준, FIFO, DLQ, visibility timeout) — FIFO 그룹 순서·중복 제거 포함
-- [x] SNS
+### 2. Tier-1 Services
+- [x] DynamoDB (tables, items, Query, Scan, GSI/LSI, batch & transactions, 400 KB item limit)
+- [x] S3 (buckets, objects, range reads, multipart uploads, presigned URLs)
+- [x] SQS (standard & FIFO queues with `MessageGroupId` ordering and 5-minute deduplication, DLQ, visibility timeout, long polling)
+- [x] SNS (topics, SQS/Lambda subscriptions, filter policies, raw delivery)
 - [x] Secrets Manager
-- [x] SSM
-- [x] KMS
+- [x] SSM Parameter Store
+- [x] KMS (keys, aliases, Encrypt/Decrypt with encryption context, GenerateDataKey — local obfuscation, not production cryptography)
 - [x] CloudWatch Logs
 
-### 3. 중간 난이도 서비스
-- [x] API Gateway
-- [x] Lambda (로컬 프로세스 실행)
-- [x] EventBridge
-- [x] Step Functions
-- [x] Cognito (JWT 발급, 로그인 흐름)
-- [x] SES
-- [x] Kinesis
-- [x] CloudFormation
+### 3. Tier-2 Services
+- [x] API Gateway (HTTP APIs v2, Lambda proxy 2.0, routes & stages)
+- [x] Lambda (local `python*` / `nodejs*` process execution, timeouts, env vars, SQS triggers, CloudWatch Logs)
+- [x] EventBridge (buses, pattern matching rules, `rate()` schedules, targets)
+- [x] Step Functions (ASL interpreter with Pass, Task, Choice, Wait, Succeed, Fail, Parallel, Map, Retry/Catch, intrinsics)
+- [x] Cognito (user pools, app clients, auth flows, RS256 JWTs + JWKS endpoint)
+- [x] SES (v1 Query & v2 REST, local GUI mailbox capture)
+- [x] Kinesis (streams, MD5 shard hash ranges, iterators, GetRecords)
+- [x] CloudFormation (JSON/YAML templates, intrinsics, dependency ordering, create/update/delete with rollback)
 
-### 4. 포기했던 영역의 가상화
-- [x] IAM: 사용자, 역할, STS, 정책 평가기, 거부 사유 설명
-- [x] VPC: 서브넷, 보안그룹, 라우팅 테이블, 도달성 판정 (그래프 모델)
-- [x] RDS (실제 Postgres, MySQL 연결 프로비저닝)
-- [x] ECS / EC2 (컨테이너 실행 흉내) — ECS 태스크는 Docker로 실제 실행, EC2 인스턴스는 기록만
-- [x] ElastiCache (Redis)
-- [x] ALB
-- [x] Route53
+### 4. Virtualized Infrastructure Services
+- [x] IAM & STS (users, roles, managed & inline policies, access keys, policy evaluator, `SimulatePrincipalPolicy`, `AssumeRole`, denial explanations)
+- [x] EC2 / VPC Networking (VPCs, subnets, IGWs, route tables, security groups, graph-based reachability analyzer at `/_admin/reach`)
+- [x] RDS (real Postgres / MySQL / MariaDB Docker containers bound to `127.0.0.1`)
+- [x] ECS / EC2 (ECS tasks run as real Docker containers with ALB registration & `awslogs`; EC2 instances tracked as metadata records)
+- [x] ElastiCache (real Redis / Valkey / Memcached Docker containers)
+- [x] ELB v2 / ALB (real local TCP listeners on `127.0.0.1:{Port}` with round-robin forwarding and target health)
+- [x] Route 53 (hosted zones, record sets, built-in local UDP DNS server on `127.0.0.1:10053`)
 
-### 5. 서비스 간 연동과 장애
-- [x] S3 이벤트 → SQS, SNS, Lambda
-- [x] SQS → Lambda 트리거
-- [x] 지연, 오류, 스로틀링 주입 (chaos 모드)
+### 5. Cross-Service Integrations & Chaos Engineering
+- [x] S3 bucket notifications → SQS, SNS, Lambda
+- [x] SQS → Lambda event source mappings; SNS & EventBridge → SQS / SNS / Lambda
+- [x] Chaos fault injection (`/_admin/chaos`: latency, 5xx errors, service-specific throttling)
 
-### 6. GUI (Tauri)
-- [x] 리소스 탐색기 (테이블, 버킷, 큐 내용)
-- [x] 실시간 요청 로그
-- [x] IAM 정책 시각화, 네트워크 토폴로지
-- [x] 스냅샷, 초기화, 설정 화면
+### 6. Desktop & Web GUI (Tauri + `/_ui`)
+- [x] Resource explorer (tables, buckets, queues, IAM, mail, etc.)
+- [x] Real-time request & event log
+- [x] IAM policy visualization and VPC reachability/network view
+- [x] Snapshot export/restore, full state reset, and configuration/chaos settings panel
 
-### 7. 캐릭터 웹페이지
-- [x] 이벤트 스트림 (WebSocket) — SSE(`/_events`)로 대체
-- [x] 서비스별 캐릭터 설계와 에셋 (예: S3=창고 정리, SQS=택배, IAM=경비)
-- [x] 요청 → 동작 매핑 규칙
-- [x] 성공, 거부, 에러 연출
-- [x] 목업 데이터 데모 (Netlify) — GitHub Pages로 배포, 로컬 에뮬레이터가 있으면 실시간 연결
+### 7. 3D Character Town (`/_town` & GitHub Pages)
+- [x] Real-time event stream — implemented with SSE (`/_events`) instead of WebSocket
+- [x] 3D Three.js coastal city with distinct architectural buildings per service group (warehouse, archive, post office, broadcast tower, workshop, factory, identity office, vault, container harbor, radar tower, construction crane)
+- [x] Request-to-animation mapping (delivery vans, parabolic service-to-service drones, IAM checkpoint gate & guard, inspector patrols)
+- [x] Outcome visual cues (success `✓`, 4xx `!`, 5xx `✗`, IAM deny `✋`, chaos `⚡`, inspector defend `🛡` / breach `⚠`)
+- [x] Static demo deployment via GitHub Pages (replaced Netlify) — automatically connects to a visitor's local emulator (`127.0.0.1:4566` or loopback `?api=`) and falls back to mock traffic until connected, hardened with allowlist event scrubbing, loopback-only `?api=` validation, and strict CSP
 
-### 8. 로컬 LLM 해설 에이전트
-- [x] 런타임 선택 (Ollama 또는 llama.cpp)
-- [x] 모델 선정 (3060 12GB 기준 7B급 Q4/Q5, 도구 호출 정확도 직접 테스트)
-- [x] JSON 스키마 / grammar 제약 출력 적용
-- [x] 도구 정의 (소수, 안정적으로)
-- [x] 규칙 기반 해설 템플릿 (LLM 없을 때 폴백)
-- [x] 파괴적 작업 확인 절차
-- [x] 기능: 자연어 → API 호출, 에러 해설, 인프라 코드 초안
+### 8. Local LLM Explanation Agent
+- [x] Runtime selection (Ollama)
+- [x] Model selection & hardware benchmarking (`qwen3.5:9b` tested on RTX 3060 12 GB within 6.5 GB VRAM & thermal guard)
+- [x] JSON schema / grammar-constrained tool output
+- [x] Compact 4-tool set (list resources, inspect recent events, explain event, invoke JSON API)
+- [x] Rule-based fallback explanations when LLM is unavailable
+- [x] Confirmation-token workflow for destructive operations
+- [x] Capabilities: natural-language Q&A / API calls, error & IAM denial explanation, CloudFormation YAML draft generation
 
-### 9. 품질과 공개
-- [x] 공식 SDK 호환성 테스트 스위트 (JS, Python, Rust)
-- [x] 퍼징과 속성 기반 테스트, 성능 측정 — 검사관 퍼징·처리량·메모리, sigv4.rs 무작위 속성 테스트
-- [x] 로컬 바인딩 기본값 등 보안 점검
-- [x] 패키징 (바이너리, brew, Docker)
-- [x] README, 지원 API 표, 기여 가이드
-- [x] 상표와 이름 최종 확인 — 2026-11-21 웹 검색에서 같은 이름의 제품 없음(정식 상표 조회는 아님)
-- [x] 릴리스, 공개
+### 9. Quality, Packaging & Release
+- [x] Official SDK compatibility test suites (Python `boto3`, JS `@aws-sdk` v3, Rust `aws-sdk-rust`)
+- [x] Fuzzing, property-based tests (`sigv4.rs`), throughput & memory benchmarks
+- [x] Security hardening (loopback binding, CSRF header enforcement, GitHub Pages CORS/CSP/scrubbing)
+- [x] Packaging (macOS & Linux release binaries, Homebrew formula, Dockerfile)
+- [x] Documentation (`README.md`, API support matrix, `CONTRIBUTING.md`, `SKILL.md`)
+- [x] Name & trademark sanity check (no conflicting product found as of 2026-11-21)
+- [x] Initial public release (`v0.1.0`)
 
-### 10. 검증 에이전트 (보안, 사고, 각종 테스트)
+### 10. Verification Agent (Inspector — `inspector.rs`)
 
-역할: 에뮬레이터를 스스로 공격하고 장애를 일으켜 보고, 그 과정을 화면에 보여 준다. 로컬 LLM이 시나리오를 만들고, 실행과 판정은 결정적인 코드가 맡는다.
+**Role:** Continuously probes and fault-tests the local emulator, visualizing attacks and defenses in the GUI and 3D town. The local LLM may optionally propose non-destructive scenarios, while all execution and pass/fail verdicts are strictly deterministic.
 
-**테스트 종류**
-- [x] 보안: 잘못된 IAM 권한 요청, 경로 조작(S3 키), 인젝션성 입력, 과대 페이로드, 서명 누락 요청
-- [x] 사고 시나리오: 큐 폭주, 테이블 스로틀링, Lambda 실패 반복, DLQ 적체, 저장소 가득 참 — 저장소는 항목 400KB·메시지 256KiB 한도로 검사
-- [x] 장애 주입: 지연, 연결 끊김, 부분 실패, 재시작 중 요청 — 재시작은 부하 중 테이블 삭제·재생성으로 대신함(프로세스 재시작 아님)
-- [~] 호환성: 공식 SDK로 같은 시나리오를 돌려 응답 비교 — Python·JS·Rust 스위트가 같은 서비스를 각자 검증. SDK 간 응답을 자동 대조하지는 않음
-- [x] 회귀: 찾은 버그를 시나리오로 저장하고 매번 재실행
-- [x] 성능: 동시 요청, 처리량, 메모리 증가 측정
-- [x] 퍼징: 무작위 입력으로 크래시, 패닉 탐지
+**Test Categories (20 built-in scenarios)**
+- [x] **Security (7):** IAM implicit/explicit deny, CSRF header enforcement, S3 path traversal, missing/malformed SigV4, >256 MiB payload rejection (413), injection payloads
+- [x] **Incidents (4):** 1000-message queue flood, DynamoDB 400 KB item & SQS 256 KiB message limits, Lambda repeated failures, SQS DLQ buildup
+- [x] **Chaos / Fault Injection (6):** Throttling recovery, 5xx recovery, latency injection, 50% partial failure, mid-request dropped connections, table delete/recreate under write load
+- [~] **Cross-SDK Compatibility:** Python, JS, and Rust suites each independently verify overlapping services; automated cross-SDK response diffing is not yet implemented.
+- [x] **Regression:** Failed scenarios can be saved to `tests/regressions/*.json` and replayed via `/_inspect/replay`
+- [x] **Performance (2):** 40-request concurrent burst throughput, resident-memory growth across 2000 write/delete cycles
+- [x] **Fuzzing (1):** 15 malformed inputs to detect panics or crashes
 
-**에이전트 구성**
-- [x] 시나리오 생성기 (로컬 LLM)
-- [x] 실행기: 에뮬레이터 API만 호출 (외부 네트워크 접근 금지)
-- [x] 판정기: 기대 결과와 실제 응답을 규칙으로 비교 (LLM 판단에 의존하지 않음)
-- [x] 리포터: 심각도별 정리와 재현 요청 저장
-- [x] 안전장치: 로컬 에뮬레이터에만 동작, 대상 주소 확인, 실행 횟수와 시간 제한
-
-**보여 주는 방식**
-- [x] GUI: 테스트 실행 화면 (진행률, 통과/실패, 발견 목록, 재현 요청)
-- [x] 캐릭터 웹: 검사관 캐릭터의 공격과 방어 연출 (경비가 막으면 성공, 뚫리면 경고)
-- [x] 리포트 내보내기 (HTML 또는 마크다운)
-- [x] 이력 보관과 회귀 추세 그래프
-- [x] 데모 모드: 사전 녹화 시나리오 재생 (Netlify) — 마을 목업 트래픽에 검사관 이벤트 포함, GitHub Pages
-
-**기존 항목과의 연결**
-- 5번의 chaos 기능을 이 에이전트의 도구로 노출한다.
-- 9번의 호환성 스위트와 회귀 테스트를 기본 시나리오로 재사용한다.
-- 8번 에이전트와 모델, 런타임을 공유하되 도구 권한은 분리한다.
+**Agent Architecture & UI**
+- [x] Optional LLM scenario proposer (`{"use_llm": true}`)
+- [x] Deterministic runner locked strictly to `127.0.0.1` (no external network access)
+- [x] Rule-based verdict engine (independent of LLM)
+- [x] Severity-sorted reporter with reproducible request payloads (`repro`)
+- [x] Safety guardrails: loopback-only target check, `rc-insp-` resource prefix for destructive tests, iteration & time caps
+- [x] GUI test runner, Markdown/HTML report export (`/_inspect/report/{id}?format=md|html`), run history, and 3D town inspector patrol animations
 
 ---
 
-## 5. 로컬 LLM 운영 메모 (7B)
+## 5. Local LLM Operations Notes (7B–9B Class)
 
-- 3060 12GB에서 7B Q4/Q5는 VRAM 약 5~6GB, 보통 초당 30토큰 이상.
-- 잘 맞는 일: 1~3문장 해설, 소수 도구 선택 호출, 템플릿 기반 시나리오 생성.
-- 약한 부분: 도구 호출 형식 흔들림(→ 제약 출력으로 보완), 긴 맥락 정확도(→ 컨텍스트를 짧게), 복잡한 추론과 긴 코드(→ Claude 담당).
-- 모델은 하나만 띄워 해설 에이전트와 검증 에이전트가 공유한다. 요청이 겹치면 큐로 순차 처리한다.
-- 모델 후보는 Qwen, Llama 계열 최신 7~8B instruct. 선택 시점에 최신 모델을 다시 확인한다.
+- **Footprint:** On an RTX 3060 12 GB, a 7B–9B Q4/Q5 model uses ~5–6.5 GB VRAM and generates 30+ tokens/sec.
+- **Strengths:** 1–3 sentence error/IAM explanations, selecting among a small set of tools, template-guided scenario generation.
+- **Limitations & Mitigations:** Unstable tool call syntax (mitigated with schema-constrained output), long-context drift (mitigated by keeping prompts short), complex multi-file coding (handled by development-time agents, not runtime LLM).
+- **Concurrency:** A single model instance is shared by the explanation agent and inspector; requests are serialized and spaced at least 1.5 s apart.
 
-## 6. 권장 진행 순서
+## 6. Recommended Sprint Order (Completed)
 
-1. 코어 + DynamoDB, S3, SQS (Rust)
-2. 이벤트 스트림 + 단순 GUI (Tauri)
-3. IAM, 네트워크 모델
-4. 나머지 서비스를 프로젝트 필요에 따라 추가
-5. 캐릭터 웹페이지
-6. 로컬 LLM 해설 에이전트
-7. 검증 에이전트
-8. 호환성 스위트 정비와 공개
+1. Core runtime + DynamoDB, S3, SQS (Rust)
+2. Event stream + GUI (Tauri / `/_ui`)
+3. IAM policy engine & VPC network reachability model
+4. Remaining services added iteratively by project need
+5. 3D Character Town (`/_town` + GitHub Pages)
+6. Local LLM explanation agent
+7. Verification agent (inspector)
+8. Multi-SDK compatibility suites, packaging, security hardening & public release
 
-각 단계를 독립 스프린트로 두면 중간에 멈춰도 쓸 수 있는 결과물이 남는다.
+Each stage was structured as an independent sprint so the emulator remained usable at every milestone.

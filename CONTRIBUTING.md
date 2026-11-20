@@ -1,13 +1,14 @@
 # Contributing to rocalcloud
 
 Thank you for your interest in contributing to **rocalcloud**!
+For the overall architecture and roadmap, see [local-cloud-emulator-plan.md](local-cloud-emulator-plan.md).
 
 ## Design principles
 
 1. **Deterministic core**: Keep all service emulation deterministic. Local LLMs live only outside the core (`agent.rs`, optional scenario proposals in `inspector.rs`), and everything must work with the LLM disabled.
 2. **Minimal dependencies**: Prefer the Rust standard library and crates already in `core/Cargo.toml`. Keep compiler warnings at 0.
 3. **Honest boundaries**: Never fake unsupported features — return explicit errors (`501 NotImplemented`, `UnknownOperationException`, etc.) and document deliberate shortcuts with `// ponytail:` comments.
-4. **Loopback-by-default security**: Bind to `127.0.0.1` by default, do not enable permissive CORS on `/_events`, and require the `x-rocalcloud` header on all state-mutating admin/agent/inspector `POST` endpoints.
+4. **Loopback-by-default security**: Bind to `127.0.0.1` by default, restrict cross-origin `/_events` to `RC_TOWN_ORIGIN` with allowlist scrubbing (`town_view()`), restrict `town.html`'s `?api=` parameter to loopback origins, and require the `x-rocalcloud` header on all state-mutating admin/agent/inspector `POST` endpoints.
 5. **Naming**: Do not use trademarked cloud provider names in the project, package, or binary names.
 
 ## Adding or extending a service

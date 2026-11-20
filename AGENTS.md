@@ -88,8 +88,10 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
 - 일부러 줄인 부분은 `// ponytail:` 주석으로 한계와 확장 방법을 남긴다(`grep -rn ponytail core/src`로 목록).
 - 지원하지 않는 기능은 흉내 내지 말고 명확한 오류로 답한다(S3 501, `UnknownOperationException` 등).
 - 보안 기본값: 모든 포트와 컨테이너는 127.0.0.1에만 연다. 실시간 이벤트 스트림에는 CORS를 열지 않는다
-  (Cognito 확인 코드가 이벤트에 들어 있다). 예외는 GitHub Pages 마을 출처 하나(`RC_TOWN_ORIGIN`, 기본
-  `https://jinyounghwa.github.io`, `off`로 끔)이고, 그 사본은 `town_view()`가 `code` 필드를 지운다.
+  (Cognito 확인 코드 등이 이벤트에 들어 있다). 예외는 GitHub Pages 마을 출처 하나(`RC_TOWN_ORIGIN`, 기본
+  `https://jinyounghwa.github.io`, `off`로 끔, `Vary: Origin` 포함)이고, 그 사본은 `town_view()`가
+  allowlist 필터링으로 시각화 필수 필드만 남겨 `code`·`principal`·`error`·`auth.reason`·`request_id` 등을 제거한다.
+  `town.html`은 `?api=`를 루프백(`127.0.0.1`/`localhost`/`[::1]`)으로만 제한하고 CSP와 `no-referrer`를 적용한다.
 - LLM은 코어 바깥에만 둔다. LLM이 꺼져도 모든 기능이 동작해야 한다(규칙 기반 폴백 먼저).
 - 결과 보고는 사실대로: 실패와 생략을 숨기지 않는다. 테스트 채점 기준이 느슨했다면 그것도 밝힌다.
 
