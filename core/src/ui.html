@@ -92,7 +92,7 @@ const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;
 let state = {dynamodb: [], s3: [], sqs: [], iam: {users: [], roles: [], policies: []}, vpc: []}, sel = null, count = 0;
 const reachForm = {from: "internet", to: "", protocol: "tcp", port: "443", result: null};
 // Services whose admin view is {name, count, sub, cols, rows} render with one generic table.
-const GENERIC = [["sns", "SNS 토픽"], ["secrets", "Secrets Manager"], ["ssm", "SSM 파라미터"], ["kms", "KMS 키"], ["logs", "CloudWatch 로그 그룹"], ["lambda", "Lambda 함수"], ["events", "EventBridge 규칙"]];
+const GENERIC = [["sns", "SNS 토픽"], ["secrets", "Secrets Manager"], ["ssm", "SSM 파라미터"], ["kms", "KMS 키"], ["logs", "CloudWatch 로그 그룹"], ["lambda", "Lambda 함수"], ["events", "EventBridge 규칙"], ["sfn", "Step Functions"], ["apigw", "API Gateway"], ["cognito", "Cognito 사용자 풀"]];
 const lists = () => Object.assign({dynamodb: state.dynamodb, s3: state.s3, sqs: state.sqs, iamuser: state.iam.users, iamrole: state.iam.roles, vpc: state.vpc},
   Object.fromEntries(GENERIC.map(([k]) => [k, state[k] || []])));
 const policyCount = r => r.attached.length + Object.keys(r.inline).length;

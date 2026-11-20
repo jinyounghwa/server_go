@@ -1,3 +1,5 @@
+mod apigw;
+mod cognito;
 mod ddb;
 mod events;
 mod iam;
@@ -6,6 +8,7 @@ mod lambda;
 mod logs;
 mod net;
 mod s3;
+mod sfn;
 mod secrets;
 mod sns;
 mod sqs;
@@ -91,6 +94,9 @@ pub struct App {
     pub sns: Mutex<sns::Sns>,
     pub lambda: Mutex<lambda::Lambda>,
     pub eb: Mutex<events::Events>,
+    pub sfn: Mutex<sfn::Sfn>,
+    pub apigw: Mutex<apigw::ApiGw>,
+    pub cognito: Mutex<cognito::Cognito>,
     chaos: Mutex<Vec<Value>>,
     events: broadcast::Sender<String>,
 }
@@ -165,6 +171,8 @@ const JSON_TARGETS: &[(&str, &str)] = &[
     ("TrentService.", "kms"),
     ("Logs_20140328.", "logs"),
     ("AWSEvents.", "events"),
+    ("AWSStepFunctions.", "states"),
+    ("AWSCognitoIdentityProviderService.", "cognito-idp"),
 ];
 
 pub fn emit(app: &App, ev: Value) {
@@ -172,7 +180,11 @@ pub fn emit(app: &App, ev: Value) {
     let _ = app.events.send(ev.to_string());
 }
 
+const COGNITO_PUBLIC: &[&str] = &["SignUp", "ConfirmSignUp", "InitiateAuth", "RespondToAuthChallenge", "ForgotPassword",
+    "ConfirmForgotPassword", "GetUser", "ChangePassword", "GlobalSignOut"];
+
 enum Svc {
+    ApiGw(String, String), // method, path after /v2/
     Lambda(&'static str, String, HashMap<String, String>), // op, path after the API version, query
     Json(&'static str, String),
     Sns(HashMap<String, String>),
@@ -191,16 +203,22 @@ fn arn(svc: &str, rest: &str) -> String {
 fn checks(app: &App, svc: &Svc, body: &[u8]) -> Vec<(String, String)> {
     let j: Value = serde_json::from_slice(body).unwrap_or_default();
     match svc {
+        // API Gateway's IAM model: action = HTTP verb, resource = API path.
+        Svc::ApiGw(m, path) => vec![(format!("apigateway:{m}"), format!("arn:aws:apigateway:{}::/{path}", *REGION))],
         Svc::Lambda(op, path, _) => {
             let res = lambda::path_name(path).or_else(|| j["FunctionName"].as_str().map(lambda::name_of)).map_or("*".into(), |n| lambda::arn(&n));
             vec![(format!("lambda:{op}"), res)]
         }
+        // Cognito's end-user APIs are public (token- or client-id based), not IAM-authorized.
+        Svc::Json("cognito-idp", op) if COGNITO_PUBLIC.contains(&op.as_str()) => vec![],
         Svc::Json(name, op) => {
             let res = match *name {
+                "cognito-idp" => j["UserPoolId"].as_str().map(|p| arn("cognito-idp", &format!("userpool/{p}"))),
                 "secretsmanager" => j["SecretId"].as_str().and_then(|id| app.secrets.lock().unwrap().arn_of(id))
                     .or_else(|| j["Name"].as_str().map(|n| arn("secretsmanager", &format!("secret:{n}")))),
                 "ssm" => j["Name"].as_str().map(ssm::arn),
                 "logs" => j["logGroupName"].as_str().map(|g| arn("logs", &format!("log-group:{g}"))),
+                "states" => j["executionArn"].as_str().or(j["stateMachineArn"].as_str()).map(String::from),
                 "kms" => j["KeyId"].as_str().map(|k| if k.starts_with("arn:") { k.to_string() } else if k.starts_with("alias/") { arn("kms", k) } else { arn("kms", &format!("key/{k}")) }),
                 _ => None,
             };
@@ -259,7 +277,9 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
     let target = headers.get("x-amz-target").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     let is_form = headers.get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|c| c.starts_with("application/x-www-form-urlencoded"));
     let lambda_path = ["/2015-03-31/", "/2014-11-13/"].iter().find_map(|v| uri.path().strip_prefix(v)).filter(|_| scope == "lambda" || scope.is_empty());
-    let svc = if let Some(path) = lambda_path {
+    let svc = if let Some(path) = uri.path().strip_prefix("/v2/").filter(|_| scope == "apigateway") {
+        Svc::ApiGw(method.to_string(), path.to_string())
+    } else if let Some(path) = lambda_path {
         Svc::Lambda(lambda::op_of(method.as_str(), path), path.to_string(), form(uri.query().unwrap_or("")).collect())
     } else if let Some(op) = target.strip_prefix("DynamoDB_20120810.") {
         Svc::Ddb(op.into())
@@ -284,6 +304,7 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
     let (service, op) = match &svc {
         Svc::Json(name, op) => (*name, op.clone()),
         Svc::Lambda(op, ..) => ("lambda", op.to_string()),
+        Svc::ApiGw(_, path) => ("apigateway", format!("{method} /{}", path.split('/').take(3).collect::<Vec<_>>().join("/"))),
         Svc::Sns(q) => ("sns", q.get("Action").cloned().unwrap_or_default()),
         Svc::Ec2(q) => ("ec2", q.get("Action").cloned().unwrap_or_default()),
         Svc::Ddb(op) => ("dynamodb", op.clone()),
@@ -324,7 +345,15 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
     let fault = denied.or(chaos.as_ref().and_then(|(_, e)| e.as_ref().map(|e| ApiErr { status: e.status, code: e.code.clone(), msg: e.msg.clone(), extra: None })));
 
     let mut resp = match (svc, fault) {
-        (Svc::Lambda(..), Some(e)) => lambda::error_reply(e),
+        (Svc::Lambda(..) | Svc::ApiGw(..), Some(e)) => lambda::error_reply(e),
+        (Svc::ApiGw(_, path), None) => {
+            let j: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+            match app.apigw.lock().unwrap().handle(method.as_str(), &path, &j) {
+                Ok((204, _)) => Response::builder().status(204).body(Body::empty()).unwrap(),
+                Ok((s, v)) => Response::builder().status(s).header("content-type", "application/json").body(Body::from(v.to_string())).unwrap(),
+                Err(e) => lambda::error_reply(e),
+            }
+        }
         (Svc::Lambda(op, path, q), None) => lambda::api(&app, op, &path, &q, &headers, &body).await,
         (Svc::Json(name, _), Some(e)) => json_reply(name, Err(e)),
         (Svc::Json("events", op), None) => {
@@ -339,6 +368,30 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
                 Ok(v)
             });
             json_reply("events", r)
+        }
+        (Svc::Json("states", op), None) => {
+            let r = serde_json::from_slice::<Value>(&body).map_err(|e| err("SerializationException", e.to_string())).and_then(|j| {
+                let (v, start) = app.sfn.lock().unwrap().handle(&op, &j)?;
+                if let Some(exec) = start {
+                    tokio::spawn(sfn::run(app.clone(), exec));
+                }
+                Ok(v)
+            });
+            json_reply("states", r)
+        }
+        (Svc::Json("cognito-idp", op), None) => {
+            let r = serde_json::from_slice::<Value>(&body).map_err(|e| err("SerializationException", e.to_string())).and_then(|j| {
+                let mut c = app.cognito.lock().unwrap();
+                let r = c.handle(&op, &j);
+                let codes = c.take_codes();
+                drop(c);
+                // Verification codes would be emailed; locally they are published as events.
+                for (user, code) in codes {
+                    emit(&app, json!({"ts": chrono::Utc::now().to_rfc3339(), "service": "cognito-idp", "op": "CodeSent", "target": user, "code": code, "status": 200}));
+                }
+                r
+            });
+            json_reply("cognito-idp", r)
         }
         (Svc::Json(name, op), None) => {
             let r: Result<Value, ApiErr> = serde_json::from_slice::<Value>(&body)
@@ -536,6 +589,9 @@ async fn state(State(app): State<Arc<App>>) -> Json<Value> {
         "sns": app.sns.lock().unwrap().admin(),
         "lambda": app.lambda.lock().unwrap().admin(),
         "events": app.eb.lock().unwrap().admin(),
+        "sfn": app.sfn.lock().unwrap().admin(),
+        "apigw": app.apigw.lock().unwrap().admin(),
+        "cognito": app.cognito.lock().unwrap().admin(),
         "secrets": app.secrets.lock().unwrap().admin(),
         "ssm": app.ssm.lock().unwrap().admin(),
         "kms": app.kms.lock().unwrap().admin(),
@@ -560,8 +616,31 @@ async fn reset(State(app): State<Arc<App>>, h: HeaderMap) -> axum::http::StatusC
     *app.sns.lock().unwrap() = Default::default();
     *app.lambda.lock().unwrap() = Default::default();
     *app.eb.lock().unwrap() = Default::default();
+    *app.sfn.lock().unwrap() = Default::default();
+    *app.apigw.lock().unwrap() = Default::default();
+    *app.cognito.lock().unwrap() = Default::default();
     let _ = app.events.send(json!({"ts": chrono::Utc::now().to_rfc3339(), "service": "admin", "op": "Reset", "status": 200}).to_string());
     axum::http::StatusCode::NO_CONTENT
+}
+
+// Invoke URL for HTTP APIs: /_api/{apiId}/[{stage}/]path
+async fn api_invoke(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
+    let t0 = Instant::now();
+    let rest = uri.path().strip_prefix("/_api/").unwrap_or("");
+    let (api, path) = rest.split_once('/').map_or((rest, "/".to_string()), |(a, p)| (a, format!("/{p}")));
+    let (status, hdrs, out, route) = apigw::invoke(&app, method.as_str(), api, &path, uri.query().unwrap_or(""), &headers, &body).await;
+    emit(&app, json!({"ts": chrono::Utc::now().to_rfc3339(), "service": "apigateway", "op": "Invoke", "target": format!("{api} {route}"),
+        "path": format!("{method} {path}"), "status": status, "ms": t0.elapsed().as_secs_f64() * 1000.0}));
+    let mut r = Response::builder().status(status);
+    for (k, v) in hdrs {
+        r = r.header(k, v);
+    }
+    r.body(Body::from(out)).unwrap_or_else(|_| Response::builder().status(502).body(Body::from("bad response headers from function")).unwrap())
+}
+
+// OIDC discovery and JWKS for Cognito user pools: /_cognito/{pool}/.well-known/...
+async fn cognito_wellknown(axum::extract::Path((pool, doc)): axum::extract::Path<(String, String)>) -> Json<Value> {
+    Json(if doc == "jwks.json" { cognito::jwks() } else { cognito::openid_config(&pool) })
 }
 
 // GET /_admin/reach?from=internet|i-..&to=...&protocol=tcp&port=22
@@ -591,6 +670,9 @@ async fn main() {
         sns: Default::default(),
         lambda: Default::default(),
         eb: Default::default(),
+        sfn: Default::default(),
+        apigw: Default::default(),
+        cognito: Default::default(),
         chaos: Default::default(),
         events: broadcast::channel(1024).0,
     });
@@ -601,6 +683,8 @@ async fn main() {
         .route("/_admin/state", get(state))
         .route("/_admin/reset", post(reset))
         .route("/_admin/reach", get(reach))
+        .route("/_api/{*rest}", axum::routing::any(api_invoke))
+        .route("/_cognito/{pool}/.well-known/{doc}", get(cognito_wellknown))
         .route("/_admin/chaos", get(get_chaos).post(set_chaos))
         .fallback(handle)
         .layer(DefaultBodyLimit::max(256 << 20)) // ponytail: 256 MiB per request, bodies are held in memory

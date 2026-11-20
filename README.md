@@ -8,7 +8,7 @@ A local, in-memory emulator for the cloud APIs your app actually uses. Point an 
 ```sh
 cd core && cargo run --release        # emulator on 127.0.0.1:4566 (BIND, REGION env vars)
 cd gui && cargo run                   # desktop window (Tauri), or open http://127.0.0.1:4566/_ui
-ENFORCE_IAM=1 cargo run --release & uv run --with boto3 tests/sdk_test.py  # official-SDK check
+ENFORCE_IAM=1 cargo run --release & uv run --with boto3 --with "pyjwt[crypto]" tests/sdk_test.py  # official-SDK check
 ```
 
 ## Supported
@@ -26,6 +26,9 @@ ENFORCE_IAM=1 cargo run --release & uv run --with boto3 tests/sdk_test.py  # off
 | CloudWatch Logs | Groups, streams, PutLogEvents, GetLogEvents, FilterLogEvents (plain terms), retention |
 | Lambda | python* / nodejs* functions run as local processes; Invoke (sync, Event, DryRun, log tail), timeouts, errors, env vars, execution-role credentials, SQS event source mappings, logs to CloudWatch Logs |
 | EventBridge | Buses, rules (event patterns incl. prefix/numeric/exists/anything-but, rate() schedules), SQS/SNS/Lambda targets, Input/InputPath |
+| Step Functions | ASL interpreter: Pass, Task (Lambda, lambda:invoke, sqs:sendMessage, sns:publish, dynamodb:*), Choice, Wait, Succeed, Fail, Parallel, Map, Retry/Catch, Parameters/ResultSelector/ResultPath/OutputPath, intrinsics (Format, StringToJson, JsonToString, Array, UUID, MathAdd), execution history, StopExecution |
+| API Gateway (HTTP APIs) | apigatewayv2 APIs, Lambda proxy integrations (payload 2.0), routes with {params} and {proxy+}, stages, quick create; invoke at `/_api/{apiId}/[{stage}/]path` |
+| Cognito | User pools, app clients (with secrets), SignUp/Confirm, ForgotPassword, USER_PASSWORD_AUTH, refresh tokens, NEW_PASSWORD_REQUIRED, admin user APIs, RS256 JWTs with JWKS at `/_cognito/{poolId}/.well-known/jwks.json`; verification codes appear as `CodeSent` events |
 | EC2 (network) | VPCs, subnets, internet gateways, route tables, security groups, instances (records only), DescribeAvailabilityZones |
 
 ## IAM enforcement

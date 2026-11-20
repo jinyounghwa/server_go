@@ -1,5 +1,6 @@
 """Official-SDK (boto3) compatibility check. Run: uv run --with boto3 tests/sdk_test.py
-Expects the emulator on ENDPOINT (default http://127.0.0.1:4566) started with ENFORCE_IAM=1."""
+Expects the emulator on ENDPOINT (default http://127.0.0.1:4566) started with ENFORCE_IAM=1.
+Run: uv run --with boto3 --with "pyjwt[crypto]" tests/sdk_test.py"""
 import json, os, time, uuid
 import boto3
 from botocore.config import Config
@@ -523,6 +524,178 @@ def test_eventbridge():
     eb.remove_targets(Rule="big", EventBusName=bus, Ids=["q"]); eb.delete_rule(Name="big", EventBusName=bus)
     eb.delete_event_bus(Name=bus)
     sqs.delete_queue(QueueUrl=big); sqs.delete_queue(QueueUrl=tick)
+
+
+SFN_FN = """
+def price(event, ctx):
+    return {"total": event["qty"] * 10}
+def flaky(event, ctx):
+    raise ValueError("upstream down")
+"""
+
+
+def test_step_functions():
+    sf, lam = boto3.client("stepfunctions", **kw), boto3.client("lambda", **kw)
+    lam.create_function(FunctionName=f"price{run}", Runtime="python3.12", Role="arn:aws:iam::000000000000:role/x", Handler="app.price", Code={"ZipFile": zipped({"app.py": SFN_FN})})
+    lam.create_function(FunctionName=f"flaky{run}", Runtime="python3.12", Role="arn:aws:iam::000000000000:role/x", Handler="app.flaky", Code={"ZipFile": zipped({"app.py": SFN_FN})})
+    t = f"orders{run}"
+    ddb.create_table(TableName=t, BillingMode="PAY_PER_REQUEST", KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+                     AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}])
+    q = sqs.create_queue(QueueName=f"ship{run}")["QueueUrl"]
+    order = {
+        "StartAt": "Prepare",
+        "States": {
+            "Prepare": {"Type": "Pass", "Parameters": {"id.$": "$.id", "qty.$": "$.qty", "items.$": "$.items", "label.$": "States.Format('order-{}', $.id)"}, "Next": "Price"},
+            "Price": {"Type": "Task", "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {"FunctionName": f"price{run}", "Payload": {"qty.$": "$.qty"}},
+                      "ResultSelector": {"total.$": "$.Payload.total"}, "ResultPath": "$.price", "Next": "Big?"},
+            "Big?": {"Type": "Choice", "Choices": [{"Variable": "$.price.total", "NumericGreaterThanEquals": 100, "Next": "Fulfil"}], "Default": "TooSmall"},
+            "TooSmall": {"Type": "Fail", "Error": "Order.TooSmall", "Cause": "minimum is 100"},
+            "Fulfil": {"Type": "Parallel", "ResultPath": None, "Next": "EachItem", "Branches": [
+                {"StartAt": "Ship", "States": {"Ship": {"Type": "Task", "Resource": "arn:aws:states:::sqs:sendMessage",
+                                                         "Parameters": {"QueueUrl": q, "MessageBody.$": "$.label"}, "End": True}}},
+                {"StartAt": "Save", "States": {"Save": {"Type": "Task", "Resource": "arn:aws:states:::dynamodb:putItem",
+                                                         "Parameters": {"TableName": t, "Item": {"id": {"S.$": "$.id"}}}, "End": True}}}]},
+            "EachItem": {"Type": "Map", "ItemsPath": "$.items", "ResultPath": "$.lines",
+                         "ItemSelector": {"sku.$": "$$.Map.Item.Value", "n.$": "$$.Map.Item.Index"},
+                         "ItemProcessor": {"StartAt": "Line", "States": {"Line": {"Type": "Pass", "End": True}}}, "Next": "Done"},
+            "Done": {"Type": "Succeed"},
+        },
+    }
+    sm = sf.create_state_machine(name=f"order{run}", definition=json.dumps(order), roleArn="arn:aws:iam::000000000000:role/x")["stateMachineArn"]
+
+    def finish(arn):
+        for _ in range(100):
+            d = sf.describe_execution(executionArn=arn)
+            if d["status"] != "RUNNING":
+                return d
+            time.sleep(0.1)
+        raise AssertionError("execution did not finish")
+
+    ok = finish(sf.start_execution(stateMachineArn=sm, name="big", input=json.dumps({"id": "o1", "qty": 12, "items": ["a", "b"]}))["executionArn"])
+    assert ok["status"] == "SUCCEEDED", ok
+    out = json.loads(ok["output"])
+    assert out["price"] == {"total": 120} and out["label"] == "order-o1" and out["lines"] == [{"sku": "a", "n": 0}, {"sku": "b", "n": 1}], out
+    assert sqs.receive_message(QueueUrl=q)["Messages"][0]["Body"] == "order-o1"
+    assert ddb.get_item(TableName=t, Key={"id": {"S": "o1"}})["Item"]["id"] == {"S": "o1"}
+    small = finish(sf.start_execution(stateMachineArn=sm, input=json.dumps({"id": "o2", "qty": 1, "items": []}))["executionArn"])
+    assert (small["status"], small["error"]) == ("FAILED", "Order.TooSmall"), small
+    assert len(sf.list_executions(stateMachineArn=sm)["executions"]) == 2
+    assert code(sf.start_execution, stateMachineArn=sm, name="big", input="{}") == "ExecutionAlreadyExists"
+
+    recover = {"StartAt": "Call", "States": {
+        "Call": {"Type": "Task", "Resource": lam.get_function(FunctionName=f"flaky{run}")["Configuration"]["FunctionArn"],
+                 "Retry": [{"ErrorEquals": ["ValueError"], "MaxAttempts": 1, "IntervalSeconds": 1}],
+                 "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.failure", "Next": "Recovered"}], "End": True},
+        "Recovered": {"Type": "Pass", "End": True}}}
+    sm2 = sf.create_state_machine(name=f"recover{run}", definition=json.dumps(recover), roleArn="arn:aws:iam::000000000000:role/x")["stateMachineArn"]
+    r = finish(sf.start_execution(stateMachineArn=sm2, input='{"x": 1}')["executionArn"])
+    assert r["status"] == "SUCCEEDED" and json.loads(r["output"])["failure"]["Error"] == "ValueError", r
+    hist = [e["type"] for e in sf.get_execution_history(executionArn=r["executionArn"])["events"]]
+    assert hist.count("TaskRetry") == 1 and hist[0] == "ExecutionStarted" and hist[-1] == "ExecutionSucceeded", hist
+
+    sm3 = sf.create_state_machine(name=f"wait{run}", roleArn="arn:aws:iam::000000000000:role/x",
+                                  definition=json.dumps({"StartAt": "W", "States": {"W": {"Type": "Wait", "Seconds": 30, "End": True}}}))["stateMachineArn"]
+    e = sf.start_execution(stateMachineArn=sm3)["executionArn"]
+    sf.stop_execution(executionArn=e, error="Manual")
+    assert sf.describe_execution(executionArn=e)["status"] == "ABORTED"
+    for m in (sm, sm2, sm3):
+        sf.delete_state_machine(stateMachineArn=m)
+    for f in ("price", "flaky"):
+        lam.delete_function(FunctionName=f"{f}{run}")
+    ddb.delete_table(TableName=t); sqs.delete_queue(QueueUrl=q)
+
+
+API_FN = """
+import json
+def handler(event, ctx):
+    if event["rawPath"] == "/teapot":
+        return {"statusCode": 418, "headers": {"x-kind": "tea"}, "body": "short and stout"}
+    return {"route": event["routeKey"], "params": event.get("pathParameters"), "q": event.get("queryStringParameters"),
+            "body": json.loads(event["body"]) if event.get("body") else None, "method": event["requestContext"]["http"]["method"]}
+"""
+
+
+def test_api_gateway():
+    import urllib.request, urllib.error
+    gw, lam = boto3.client("apigatewayv2", **kw), boto3.client("lambda", **kw)
+    farn = lam.create_function(FunctionName=f"api{run}", Runtime="python3.12", Role="arn:aws:iam::000000000000:role/x",
+                               Handler="app.handler", Code={"ZipFile": zipped({"app.py": API_FN})})["FunctionArn"]
+    # Quick create: one $default route to the function.
+    quick = gw.create_api(Name=f"quick{run}", ProtocolType="HTTP", Target=farn)
+    assert json.load(urllib.request.urlopen(quick["ApiEndpoint"] + "/anything"))["route"] == "$default"
+
+    api = gw.create_api(Name=f"shop{run}", ProtocolType="HTTP")["ApiId"]
+    integ = gw.create_integration(ApiId=api, IntegrationType="AWS_PROXY", IntegrationUri=farn, PayloadFormatVersion="2.0")["IntegrationId"]
+    for key in ("GET /items/{id}", "POST /items", "ANY /files/{path+}", "GET /teapot"):
+        gw.create_route(ApiId=api, RouteKey=key, Target=f"integrations/{integ}")
+    gw.create_stage(ApiId=api, StageName="prod", AutoDeploy=True)
+    assert code(gw.create_route, ApiId=api, RouteKey="POST /items", Target=f"integrations/{integ}") == "ConflictException"
+    base = gw.get_api(ApiId=api)["ApiEndpoint"] + "/prod"
+    r = json.load(urllib.request.urlopen(base + "/items/42?color=red"))
+    assert r == {"route": "GET /items/{id}", "params": {"id": "42"}, "q": {"color": "red"}, "body": None, "method": "GET"}, r
+    req = urllib.request.Request(base + "/items", data=json.dumps({"name": "pen"}).encode(), method="POST", headers={"content-type": "application/json"})
+    assert json.load(urllib.request.urlopen(req))["body"] == {"name": "pen"}
+    assert json.load(urllib.request.urlopen(base + "/files/a/b.txt"))["params"] == {"path": "a/b.txt"}
+    try:
+        urllib.request.urlopen(base + "/teapot"); raise AssertionError
+    except urllib.error.HTTPError as e:
+        assert (e.code, e.headers["x-kind"], e.read()) == (418, "tea", b"short and stout")
+    try:
+        urllib.request.urlopen(base + "/nope"); raise AssertionError
+    except urllib.error.HTTPError as e:
+        assert e.code == 404
+    assert len(gw.get_routes(ApiId=api)["Items"]) == 4
+    gw.delete_api(ApiId=api); gw.delete_api(ApiId=quick["ApiId"])
+    assert code(gw.get_api, ApiId=api) == "NotFoundException"
+    lam.delete_function(FunctionName=f"api{run}")
+
+
+def test_cognito():
+    import base64, hashlib, hmac, urllib.request
+    import jwt  # pyjwt[crypto]
+    idp = boto3.client("cognito-idp", **kw)
+    pool = idp.create_user_pool(PoolName=f"users{run}", UsernameAttributes=["email"], AutoVerifiedAttributes=["email"])["UserPool"]["Id"]
+    cid = idp.create_user_pool_client(UserPoolId=pool, ClientName="web", ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"])["UserPoolClient"]["ClientId"]
+    email = f"kim{run}@example.com"
+    assert code(idp.sign_up, ClientId=cid, Username=email, Password="weak") == "InvalidPasswordException"
+    assert idp.sign_up(ClientId=cid, Username=email, Password="Str0ng!pass", UserAttributes=[{"Name": "name", "Value": "Kim"}])["UserConfirmed"] is False
+    auth = lambda pw: idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH", AuthParameters={"USERNAME": email, "PASSWORD": pw})
+    assert code(auth, "Str0ng!pass") == "UserNotConfirmedException"
+    # The emailed code is visible to admins (GUI / event stream) instead.
+    st = json.load(urllib.request.urlopen(f"{EP}/_admin/state"))
+    sent = next(p for p in st["cognito"] if p["name"] == f"users{run}")["rows"][0][3]
+    assert code(idp.confirm_sign_up, ClientId=cid, Username=email, ConfirmationCode="000000" if sent != "000000" else "111111") == "CodeMismatchException"
+    idp.confirm_sign_up(ClientId=cid, Username=email, ConfirmationCode=sent)
+    assert code(auth, "wrong") == "NotAuthorizedException"
+    tok = auth("Str0ng!pass")["AuthenticationResult"]
+
+    iss = f"{EP}/_cognito/{pool}"
+    disco = json.load(urllib.request.urlopen(iss + "/.well-known/openid-configuration"))
+    key = jwt.PyJWKClient(disco["jwks_uri"]).get_signing_key_from_jwt(tok["IdToken"])
+    claims = jwt.decode(tok["IdToken"], key.key, algorithms=["RS256"], audience=cid, issuer=iss)
+    assert claims["email"] == email and claims["name"] == "Kim" and claims["token_use"] == "id" and claims["email_verified"] is True, claims
+    attrs = {a["Name"]: a["Value"] for a in idp.get_user(AccessToken=tok["AccessToken"])["UserAttributes"]}
+    assert attrs["email"] == email
+    again = idp.initiate_auth(ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH", AuthParameters={"REFRESH_TOKEN": tok["RefreshToken"]})
+    assert "IdToken" in again["AuthenticationResult"] and "RefreshToken" not in again["AuthenticationResult"]
+
+    # Admin-created user must set a new password first.
+    idp.admin_create_user(UserPoolId=pool, Username=f"lee{run}@example.com", TemporaryPassword="Temp0rary!")
+    ch = idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH", AuthParameters={"USERNAME": f"lee{run}@example.com", "PASSWORD": "Temp0rary!"})
+    assert ch["ChallengeName"] == "NEW_PASSWORD_REQUIRED"
+    done = idp.respond_to_auth_challenge(ClientId=cid, ChallengeName="NEW_PASSWORD_REQUIRED", Session=ch["Session"],
+                                         ChallengeResponses={"USERNAME": f"lee{run}@example.com", "NEW_PASSWORD": "N3w!password"})
+    assert "AccessToken" in done["AuthenticationResult"]
+    assert len(idp.list_users(UserPoolId=pool)["Users"]) == 2
+
+    sec = idp.create_user_pool_client(UserPoolId=pool, ClientName="server", GenerateSecret=True)["UserPoolClient"]
+    params = {"USERNAME": email, "PASSWORD": "Str0ng!pass"}
+    assert code(idp.initiate_auth, ClientId=sec["ClientId"], AuthFlow="USER_PASSWORD_AUTH", AuthParameters=params) == "NotAuthorizedException"
+    params["SECRET_HASH"] = base64.b64encode(hmac.new(sec["ClientSecret"].encode(), (email + sec["ClientId"]).encode(), hashlib.sha256).digest()).decode()
+    assert "IdToken" in idp.initiate_auth(ClientId=sec["ClientId"], AuthFlow="USER_PASSWORD_AUTH", AuthParameters=params)["AuthenticationResult"]
+    idp.delete_user_pool(UserPoolId=pool)
+    assert code(idp.get_user, AccessToken=tok["AccessToken"]) == "NotAuthorizedException"
 
 
 if __name__ == "__main__":
