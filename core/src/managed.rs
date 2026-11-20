@@ -40,7 +40,7 @@ pub fn container(kind: &str, id: &str) -> String {
 fn docker() -> String {
     std::env::var("RC_DOCKER").unwrap_or_else(|_| "docker".into())
 }
-async fn docker_ok(args: &[&str]) -> Result<String, String> {
+pub async fn docker_ok(args: &[&str]) -> Result<String, String> {
     let out = Command::new(docker()).args(args).output().await.map_err(|e| format!("cannot run {}: {e}", docker()))?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -48,7 +48,7 @@ async fn docker_ok(args: &[&str]) -> Result<String, String> {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
 }
-fn free_port() -> u16 {
+pub fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).map(|a| a.port()).unwrap_or(0)
 }
 

@@ -8,7 +8,7 @@ A local, in-memory emulator for the cloud APIs your app actually uses. Point an 
 ```sh
 cd core && cargo run --release        # emulator on 127.0.0.1:4566 (BIND, REGION env vars)
 cd gui && cargo run                   # desktop window (Tauri), or open http://127.0.0.1:4566/_ui
-ENFORCE_IAM=1 cargo run --release & uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with redis tests/sdk_test.py
+ENFORCE_IAM=1 cargo run --release & uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with redis --with dnspython tests/sdk_test.py
 ```
 
 ## Supported
@@ -33,6 +33,9 @@ ENFORCE_IAM=1 cargo run --release & uv run --with boto3 --with "pyjwt[crypto]" -
 | SES | v1 (Query) and v2 (REST): identities, SendEmail, SendRawEmail; mail lands in the GUI mailbox, never sent |
 | RDS | postgres / mysql / mariadb instances as real Docker containers on 127.0.0.1; create, describe, stop, start, reboot, delete |
 | ElastiCache | redis / valkey / memcached clusters as Docker containers; create, describe (with node endpoints), delete |
+| ECS | Clusters, task definitions (revisions), RunTask/StopTask as Docker containers with port mappings, env, overrides, task-role credentials, awslogs → CloudWatch Logs; services keep desiredCount and register with ALB target groups |
+| ELB v2 (ALB) | Load balancers, target groups, listeners that really listen on 127.0.0.1:{Port} (>= 1024) and round-robin connections to healthy targets, fixed responses, target health |
+| Route 53 | Hosted zones, record sets (CREATE/UPSERT/DELETE, aliases, wildcards), plus a DNS server on 127.0.0.1:10053/udp (`RC_DNS_PORT`) answering A/AAAA/CNAME/TXT |
 | EC2 (network) | VPCs, subnets, internet gateways, route tables, security groups, instances (records only), DescribeAvailabilityZones |
 
 ## IAM enforcement
@@ -57,7 +60,7 @@ injects latency, 500s and service-specific throttling errors. `{"rules": []}` tu
 
 ## Docker-backed services
 
-RDS and ElastiCache start containers through the `docker` CLI (`RC_DOCKER` to override). Each container is published on
+RDS, ElastiCache and ECS start containers through the `docker` CLI (`RC_DOCKER` to override). Each container is published on
 127.0.0.1 only and capped at `RC_CONTAINER_MEMORY` (default 512m) and 1 CPU. Leftover `rocalcloud-*` containers are
 removed at startup and on reset.
 

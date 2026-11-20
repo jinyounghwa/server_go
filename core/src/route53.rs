@@ -1,0 +1,281 @@
+// Route 53 (REST-XML) hosted zones and record sets, plus a tiny DNS server on 127.0.0.1:{RC_DNS_PORT or 10053}/udp
+// that answers A, AAAA, CNAME and TXT from the zones (aliases resolve inside the zones; anything else → 127.0.0.1).
+// ponytail: no routing policies (weighted/latency/failover), health checks, DNSSEC, TCP DNS or zone transfers.
+use crate::s3::{esc, tags};
+use crate::{err, ApiErr, App};
+use std::{collections::BTreeMap, net::{Ipv4Addr, Ipv6Addr}, sync::Arc};
+
+const NS: &str = "https://route53.amazonaws.com/doc/2013-04-01/";
+
+#[derive(Clone)]
+struct RecordSet {
+    name: String,
+    ty: String,
+    ttl: u32,
+    values: Vec<String>,
+    alias: Option<String>, // alias DNS name
+}
+struct Zone {
+    name: String,
+    caller: String,
+    comment: String,
+    private: bool,
+    records: Vec<RecordSet>,
+}
+
+#[derive(Default)]
+pub struct Route53 {
+    zones: BTreeMap<String, Zone>,
+}
+
+fn fqdn(n: &str) -> String {
+    let n = n.to_lowercase();
+    if n.ends_with('.') { n } else { format!("{n}.") }
+}
+fn first(x: &str, tag: &str) -> String {
+    tags(x, tag).into_iter().next().unwrap_or_default()
+}
+fn change_info() -> String {
+    format!("<ChangeInfo><Id>/change/C{}</Id><Status>INSYNC</Status><SubmittedAt>{}</SubmittedAt></ChangeInfo>",
+            &uuid::Uuid::new_v4().simple().to_string()[..13].to_uppercase(), chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ"))
+}
+fn nf(id: &str) -> ApiErr {
+    ApiErr { status: 404, ..err("NoSuchHostedZone", format!("No hosted zone found with ID: {id}")) }
+}
+
+impl Zone {
+    fn xml(&self, id: &str) -> String {
+        format!("<HostedZone><Id>/hostedzone/{id}</Id><Name>{}</Name><CallerReference>{}</CallerReference><Config><Comment>{}</Comment><PrivateZone>{}</PrivateZone></Config><ResourceRecordSetCount>{}</ResourceRecordSetCount></HostedZone>",
+                esc(&self.name), esc(&self.caller), esc(&self.comment), self.private, self.records.len())
+    }
+}
+fn rrset_xml(r: &RecordSet) -> String {
+    let body = match &r.alias {
+        Some(a) => format!("<AliasTarget><HostedZoneId>LOCAL</HostedZoneId><DNSName>{}</DNSName><EvaluateTargetHealth>false</EvaluateTargetHealth></AliasTarget>", esc(a)),
+        None => format!("<TTL>{}</TTL><ResourceRecords>{}</ResourceRecords>", r.ttl,
+                        r.values.iter().map(|v| format!("<ResourceRecord><Value>{}</Value></ResourceRecord>", esc(v))).collect::<String>()),
+    };
+    format!("<ResourceRecordSet><Name>{}</Name><Type>{}</Type>{body}</ResourceRecordSet>", esc(&r.name), r.ty)
+}
+const DELEGATION: &str = "<DelegationSet><NameServers><NameServer>ns1.rocalcloud.local</NameServer><NameServer>ns2.rocalcloud.local</NameServer></NameServers></DelegationSet>";
+
+impl Route53 {
+    // REST control plane; `path` follows /2013-04-01/. Returns (status, XML body).
+    pub fn handle(&mut self, method: &str, path: &str, body: &str) -> Result<(u16, String), ApiErr> {
+        let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+        let wrap = |name: &str, inner: String| format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<{name} xmlns=\"{NS}\">{inner}</{name}>");
+        Ok(match (method, parts.as_slice()) {
+            ("POST", ["hostedzone"]) => {
+                let name = fqdn(&first(body, "Name"));
+                if name == "." {
+                    return Err(err("InvalidDomainName", "Name is required"));
+                }
+                let caller = first(body, "CallerReference");
+                if self.zones.values().any(|z| z.caller == caller && !caller.is_empty()) {
+                    return Err(ApiErr { status: 409, ..err("HostedZoneAlreadyExists", format!("A hosted zone has already been created with the specified caller reference {caller}")) });
+                }
+                let id = format!("Z{}", &uuid::Uuid::new_v4().simple().to_string()[..20].to_uppercase());
+                let soa = RecordSet { name: name.clone(), ty: "SOA".into(), ttl: 900, values: vec![format!("ns1.rocalcloud.local. hostmaster.{name} 1 7200 900 1209600 86400")], alias: None };
+                let ns = RecordSet { name: name.clone(), ty: "NS".into(), ttl: 172800, values: vec!["ns1.rocalcloud.local.".into(), "ns2.rocalcloud.local.".into()], alias: None };
+                let z = Zone { name, caller, comment: first(body, "Comment"), private: first(body, "PrivateZone") == "true", records: vec![soa, ns] };
+                let out = wrap("CreateHostedZoneResponse", format!("{}{}{DELEGATION}", z.xml(&id), change_info()));
+                self.zones.insert(id, z);
+                (201, out)
+            }
+            ("GET", ["hostedzone"]) => {
+                let zs: String = self.zones.iter().map(|(id, z)| z.xml(id)).collect();
+                (200, wrap("ListHostedZonesResponse", format!("<HostedZones>{zs}</HostedZones><IsTruncated>false</IsTruncated><MaxItems>100</MaxItems>")))
+            }
+            ("GET", ["hostedzonesbyname"]) => {
+                let zs: String = self.zones.iter().map(|(id, z)| z.xml(id)).collect();
+                (200, wrap("ListHostedZonesByNameResponse", format!("<HostedZones>{zs}</HostedZones><IsTruncated>false</IsTruncated><MaxItems>100</MaxItems>")))
+            }
+            ("GET", ["hostedzone", id]) => {
+                let z = self.zones.get(*id).ok_or_else(|| nf(id))?;
+                (200, wrap("GetHostedZoneResponse", format!("{}{DELEGATION}", z.xml(id))))
+            }
+            ("DELETE", ["hostedzone", id]) => {
+                let z = self.zones.get(*id).ok_or_else(|| nf(id))?;
+                if z.records.iter().any(|r| r.ty != "SOA" && r.ty != "NS") {
+                    return Err(err("HostedZoneNotEmpty", "The specified hosted zone contains non-required resource record sets and so cannot be deleted."));
+                }
+                self.zones.remove(*id);
+                (200, wrap("DeleteHostedZoneResponse", change_info()))
+            }
+            ("POST", ["hostedzone", id, "rrset"]) => {
+                let z = self.zones.get_mut(*id).ok_or_else(|| nf(id))?;
+                // Validate the whole batch first: it applies atomically.
+                let mut recs = z.records.clone();
+                for c in tags(body, "Change") {
+                    let action = first(&c, "Action");
+                    let set = first(&c, "ResourceRecordSet");
+                    let r = RecordSet {
+                        name: fqdn(&first(&set, "Name")),
+                        ty: first(&set, "Type"),
+                        ttl: first(&set, "TTL").parse().unwrap_or(300),
+                        values: tags(&set, "Value"),
+                        alias: tags(&set, "AliasTarget").first().map(|a| fqdn(&first(a, "DNSName"))),
+                    };
+                    if !r.name.ends_with(&z.name) {
+                        return Err(err("InvalidChangeBatch", format!("RRSet with DNS name {} is not permitted in zone {}", r.name, z.name)));
+                    }
+                    let pos = recs.iter().position(|x| x.name == r.name && x.ty == r.ty);
+                    match (action.as_str(), pos) {
+                        ("CREATE", Some(_)) => return Err(err("InvalidChangeBatch", format!("Tried to create resource record set [name='{}', type='{}'] but it already exists", r.name, r.ty))),
+                        ("DELETE", None) => return Err(err("InvalidChangeBatch", format!("Tried to delete resource record set [name='{}', type='{}'] but it was not found", r.name, r.ty))),
+                        ("DELETE", Some(i)) => drop(recs.remove(i)),
+                        ("UPSERT", Some(i)) => recs[i] = r,
+                        ("CREATE" | "UPSERT", None) => recs.push(r),
+                        (a, _) => return Err(err("InvalidInput", format!("Unknown change action {a}"))),
+                    }
+                }
+                z.records = recs;
+                (200, wrap("ChangeResourceRecordSetsResponse", change_info()))
+            }
+            ("GET", ["hostedzone", id, "rrset"]) => {
+                let z = self.zones.get(*id).ok_or_else(|| nf(id))?;
+                let rs: String = z.records.iter().map(rrset_xml).collect();
+                (200, wrap("ListResourceRecordSetsResponse", format!("<ResourceRecordSets>{rs}</ResourceRecordSets><IsTruncated>false</IsTruncated><MaxItems>300</MaxItems>")))
+            }
+            ("GET", ["change", _]) => (200, wrap("GetChangeResponse", change_info())),
+            _ => return Err(ApiErr { status: 404, ..err("InvalidInput", "Unsupported Route 53 resource") }),
+        })
+    }
+
+    // Records answering a DNS question, following CNAMEs and aliases within the zones.
+    fn answer(&self, name: &str, qtype: &str, depth: u8) -> Vec<RecordSet> {
+        if depth > 8 {
+            return vec![];
+        }
+        let all: Vec<&RecordSet> = self.zones.values().flat_map(|z| &z.records).collect();
+        let exact: Vec<&RecordSet> = all.iter().copied().filter(|r| r.name == name).collect();
+        let found: Vec<&RecordSet> = if exact.is_empty() {
+            // *.example.com. covers one or more labels.
+            all.iter().copied().filter(|r| r.name.strip_prefix("*.").is_some_and(|base| name.ends_with(&format!(".{base}")))).collect()
+        } else {
+            exact
+        };
+        let mut out = vec![];
+        for r in found {
+            let r = RecordSet { name: name.into(), ..r.clone() };
+            if r.ty == qtype && r.alias.is_none() {
+                out.push(r);
+            } else if r.ty == qtype {
+                let target = r.alias.clone().unwrap_or_default();
+                let inner = self.answer(&target, qtype, depth + 1);
+                if inner.is_empty() && qtype == "A" {
+                    // Aliases to resources outside the zones (e.g. a local ALB) point at this host.
+                    out.push(RecordSet { values: vec!["127.0.0.1".into()], alias: None, ttl: 60, ..r });
+                } else {
+                    out.extend(inner.into_iter().map(|x| RecordSet { name: name.into(), ..x }));
+                }
+            } else if r.ty == "CNAME" && qtype != "CNAME" {
+                let target = fqdn(r.values.first().map_or("", String::as_str));
+                out.push(r);
+                out.extend(self.answer(&target, qtype, depth + 1));
+            }
+        }
+        out
+    }
+
+    pub fn admin(&self) -> serde_json::Value {
+        self.zones
+            .iter()
+            .map(|(id, z)| {
+                let rows: Vec<serde_json::Value> = z.records.iter()
+                    .map(|r| serde_json::json!([r.name, r.ty, r.alias.as_ref().map_or_else(|| r.values.join(", "), |a| format!("alias → {a}")), r.ttl])).collect();
+                serde_json::json!({"name": z.name, "count": rows.len(), "sub": format!("{id} · dig @127.0.0.1 -p {} <이름>", dns_port()), "cols": ["이름", "타입", "값", "TTL"], "rows": rows})
+            })
+            .collect()
+    }
+}
+
+pub fn dns_port() -> u16 {
+    std::env::var("RC_DNS_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(10053)
+}
+
+const TYPES: &[(&str, u16)] = &[("A", 1), ("NS", 2), ("CNAME", 5), ("SOA", 6), ("MX", 15), ("TXT", 16), ("AAAA", 28)];
+
+fn encode_name(n: &str) -> Vec<u8> {
+    let mut out = vec![];
+    for l in n.trim_end_matches('.').split('.').filter(|l| !l.is_empty()) {
+        out.push(l.len() as u8);
+        out.extend(l.as_bytes());
+    }
+    out.push(0);
+    out
+}
+
+// Build a DNS response for one query packet; None for packets we can't parse.
+fn respond(app: &App, q: &[u8]) -> Option<Vec<u8>> {
+    if q.len() < 12 {
+        return None;
+    }
+    let (mut i, mut labels) = (12, vec![]);
+    while *q.get(i)? != 0 {
+        let n = q[i] as usize;
+        labels.push(String::from_utf8_lossy(q.get(i + 1..i + 1 + n)?).to_lowercase());
+        i += 1 + n;
+    }
+    let qend = i + 5;
+    let qtype_n = u16::from_be_bytes([*q.get(i + 1)?, *q.get(i + 2)?]);
+    let name = format!("{}.", labels.join("."));
+    let qtype = TYPES.iter().find(|(_, n)| *n == qtype_n).map_or("?", |(t, _)| *t);
+    let (records, nxdomain) = {
+        let r = app.route53.lock().unwrap();
+        let in_zone = r.zones.values().any(|z| name.ends_with(&z.name));
+        let exists = r.zones.values().flat_map(|z| &z.records)
+            .any(|x| x.name == name || x.name.strip_prefix("*.").is_some_and(|b| name.ends_with(&format!(".{b}"))));
+        (r.answer(&name, qtype, 0), in_zone && !exists)
+    };
+    let mut answers = vec![];
+    for r in &records {
+        let rtype = TYPES.iter().find(|(t, _)| *t == r.ty).map_or(1, |(_, n)| *n);
+        for v in &r.values {
+            let rdata = match r.ty.as_str() {
+                "A" => v.parse::<Ipv4Addr>().ok().map(|a| a.octets().to_vec()),
+                "AAAA" => v.parse::<Ipv6Addr>().ok().map(|a| a.octets().to_vec()),
+                "CNAME" | "NS" => Some(encode_name(v)),
+                "TXT" => {
+                    let t = v.trim_matches('"').as_bytes();
+                    Some([&[t.len().min(255) as u8], &t[..t.len().min(255)]].concat())
+                }
+                _ => None,
+            };
+            if let Some(d) = rdata {
+                answers.extend(encode_name(&r.name));
+                answers.extend(rtype.to_be_bytes());
+                answers.extend(1u16.to_be_bytes());
+                answers.extend(r.ttl.to_be_bytes());
+                answers.extend((d.len() as u16).to_be_bytes());
+                answers.extend(d);
+            }
+        }
+    }
+    let count = records.iter().map(|r| r.values.len()).sum::<usize>() as u16;
+    // QR + AA + RD + RA; NXDOMAIN when the name is in one of our zones but has no records at all.
+    let rcode = if nxdomain { 3 } else { 0 };
+    let mut out = vec![q[0], q[1], 0x84 | (q[2] & 1), 0x80 | rcode];
+    out.extend(1u16.to_be_bytes());
+    out.extend(count.to_be_bytes());
+    out.extend([0, 0, 0, 0]);
+    out.extend(q.get(12..qend)?);
+    out.extend(answers);
+    Some(out)
+}
+
+pub fn serve_dns(app: Arc<App>) {
+    tokio::spawn(async move {
+        let Ok(sock) = tokio::net::UdpSocket::bind(("127.0.0.1", dns_port())).await else {
+            eprintln!("DNS: cannot bind 127.0.0.1:{} (set RC_DNS_PORT)", dns_port());
+            return;
+        };
+        let mut buf = [0u8; 512];
+        loop {
+            let Ok((n, from)) = sock.recv_from(&mut buf).await else { continue };
+            if let Some(resp) = respond(&app, &buf[..n]) {
+                let _ = sock.send_to(&resp, from).await;
+            }
+        }
+    });
+}

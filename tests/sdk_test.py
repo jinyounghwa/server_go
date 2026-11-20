@@ -1,6 +1,6 @@
 """Official-SDK (boto3) compatibility check. Run: uv run --with boto3 tests/sdk_test.py
 Expects the emulator on ENDPOINT (default http://127.0.0.1:4566) started with ENFORCE_IAM=1.
-Run: uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with redis tests/sdk_test.py
+Run: uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with redis --with dnspython tests/sdk_test.py
 test_rds_elasticache needs Docker on the emulator host and is skipped without it."""
 import json, os, time, uuid
 import boto3
@@ -13,6 +13,10 @@ ddb = boto3.client("dynamodb", **kw)
 s3 = boto3.client("s3", config=Config(s3={"addressing_style": "path"}), **kw)
 sqs = boto3.client("sqs", **kw)
 run = uuid.uuid4().hex[:8]
+
+
+class Skip(Exception):
+    pass
 
 
 def code(fn, *a, **k):
@@ -748,8 +752,7 @@ def test_ses():
 def test_rds_elasticache():
     import shutil, subprocess
     if not shutil.which("docker") or subprocess.run(["docker", "ps"], capture_output=True).returncode != 0:
-        print("skip test_rds_elasticache (no docker)")
-        return
+        raise Skip("no docker")
     import pg8000.native, pymysql, redis
     rds, ec = boto3.client("rds", **kw), boto3.client("elasticache", **kw)
     pg, my, rc = f"pg{run}", f"my{run}", f"rc{run}"
@@ -795,8 +798,116 @@ def test_rds_elasticache():
     assert run not in left, left
 
 
+def test_ecs_alb():
+    import shutil, socket, subprocess, urllib.request, urllib.error
+    if not shutil.which("docker") or subprocess.run(["docker", "ps"], capture_output=True).returncode != 0:
+        raise Skip("no docker")
+    ecs, elb, logs = boto3.client("ecs", **kw), boto3.client("elbv2", **kw), boto3.client("logs", **kw)
+    cl = f"c{run}"
+    ecs.create_cluster(clusterName=cl)
+    web = ecs.register_task_definition(family=f"web{run}", containerDefinitions=[{
+        "name": "web", "image": "busybox", "essential": True, "portMappings": [{"containerPort": 8080}],
+        "command": ["sh", "-c", "mkdir /www && hostname > /www/index.html && httpd -f -p 8080 -h /www"]}])["taskDefinition"]["taskDefinitionArn"]
+    job = ecs.register_task_definition(family=f"job{run}", containerDefinitions=[{
+        "name": "job", "image": "busybox", "command": ["sh", "-c", "echo hello from task; echo $GREETING; exit 3"],
+        "environment": [{"name": "GREETING", "value": "env works"}],
+        "logConfiguration": {"logDriver": "awslogs", "options": {"awslogs-group": f"/ecs/job{run}", "awslogs-stream-prefix": "job"}}}])["taskDefinition"]
+    assert job["revision"] == 1
+
+    def until(fn, what, secs=90):
+        for _ in range(secs * 2):
+            v = fn()
+            if v:
+                return v
+            time.sleep(0.5)
+        raise AssertionError(f"timed out waiting for {what}")
+    t = ecs.run_task(cluster=cl, taskDefinition=f"job{run}")["tasks"][0]["taskArn"]
+    done = until(lambda: (x := ecs.describe_tasks(cluster=cl, tasks=[t])["tasks"][0])["lastStatus"] == "STOPPED" and x, "batch task")
+    assert done["containers"][0]["exitCode"] == 3 and "Essential container" in done["stoppedReason"], done
+    msgs = [e["message"] for e in logs.filter_log_events(logGroupName=f"/ecs/job{run}")["events"]]
+    assert msgs == ["hello from task", "env works"], msgs
+
+    lb = elb.create_load_balancer(Name=f"lb{run}", Subnets=["subnet-a", "subnet-b"])["LoadBalancers"][0]["LoadBalancerArn"]
+    tg = elb.create_target_group(Name=f"tg{run}", Protocol="HTTP", Port=8080, VpcId="vpc-local", TargetType="ip")["TargetGroups"][0]["TargetGroupArn"]
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0)); port = sk.getsockname()[1]
+    elb.create_listener(LoadBalancerArn=lb, Protocol="HTTP", Port=port, DefaultActions=[{"Type": "forward", "TargetGroupArn": tg}])
+    ecs.create_service(cluster=cl, serviceName="web", taskDefinition=web, desiredCount=2,
+                       loadBalancers=[{"targetGroupArn": tg, "containerName": "web", "containerPort": 8080}])
+    until(lambda: ecs.describe_services(cluster=cl, services=["web"])["services"][0]["runningCount"] == 2, "2 running tasks")
+    until(lambda: [h["TargetHealth"]["State"] for h in elb.describe_target_health(TargetGroupArn=tg)["TargetHealthDescriptions"]] == ["healthy"] * 2, "healthy targets")
+    seen = {urllib.request.urlopen(f"http://127.0.0.1:{port}/").read().strip() for _ in range(6)}
+    assert len(seen) == 2, seen  # round-robin over both tasks
+
+    first = ecs.list_tasks(cluster=cl, serviceName="web")["taskArns"]
+    ecs.stop_task(cluster=cl, task=first[0], reason="chaos")
+    until(lambda: (a := ecs.list_tasks(cluster=cl, serviceName="web")["taskArns"]) and len(a) == 2 and first[0] not in a, "replacement task")
+
+    fixed = elb.create_listener(LoadBalancerArn=lb, Protocol="HTTP", Port=port + 1 if port < 65535 else port - 1,
+                                DefaultActions=[{"Type": "fixed-response", "FixedResponseConfig": {"StatusCode": "404", "MessageBody": "nothing here"}}])["Listeners"][0]
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{fixed['Port']}/x"); raise AssertionError
+    except urllib.error.HTTPError as e:
+        assert (e.code, e.read()) == (404, b"nothing here")
+
+    ecs.update_service(cluster=cl, service="web", desiredCount=0)
+    ecs.delete_service(cluster=cl, service="web")
+    until(lambda: not ecs.list_services(cluster=cl)["serviceArns"], "service deletion")
+    elb.delete_load_balancer(LoadBalancerArn=lb)
+    elb.delete_target_group(TargetGroupArn=tg)
+    ecs.delete_cluster(cluster=cl)
+    left = subprocess.run(["docker", "ps", "-a", "--format", "{{.Names}}"], capture_output=True, text=True).stdout
+    assert "rocalcloud-ecs" not in left, left
+
+
+def test_route53():
+    import dns.resolver, dns.rcode
+    r53 = boto3.client("route53", **kw)
+    zone = f"shop{run}.test"
+    z = r53.create_hosted_zone(Name=zone, CallerReference=run)["HostedZone"]["Id"]
+    assert code(r53.create_hosted_zone, Name=zone, CallerReference=run) == "HostedZoneAlreadyExists"
+    rr = lambda name, ty, vals: {"Name": name, "Type": ty, "TTL": 60, "ResourceRecords": [{"Value": v} for v in vals]}
+    r53.change_resource_record_sets(HostedZoneId=z, ChangeBatch={"Changes": [
+        {"Action": "CREATE", "ResourceRecordSet": rr(f"api.{zone}", "A", ["10.0.0.1", "10.0.0.2"])},
+        {"Action": "CREATE", "ResourceRecordSet": rr(f"www.{zone}", "CNAME", [f"api.{zone}"])},
+        {"Action": "CREATE", "ResourceRecordSet": rr(zone, "TXT", ['"v=spf1 -all"'])},
+        {"Action": "CREATE", "ResourceRecordSet": rr(f"*.dev.{zone}", "A", ["10.9.9.9"])},
+        {"Action": "CREATE", "ResourceRecordSet": {"Name": f"lb.{zone}", "Type": "A",
+            "AliasTarget": {"HostedZoneId": "Z1", "DNSName": "my-alb.local", "EvaluateTargetHealth": False}}}]})
+    assert code(r53.change_resource_record_sets, HostedZoneId=z, ChangeBatch={"Changes": [
+        {"Action": "CREATE", "ResourceRecordSet": rr(f"api.{zone}", "A", ["1.1.1.1"])}]}) == "InvalidChangeBatch"
+    sets = r53.list_resource_record_sets(HostedZoneId=z)["ResourceRecordSets"]
+    assert {(s["Name"], s["Type"]) for s in sets} >= {(f"api.{zone}.", "A"), (f"{zone}.", "SOA"), (f"{zone}.", "NS")}, sets
+
+    res = dns.resolver.Resolver(configure=False)
+    res.nameservers, res.port = ["127.0.0.1"], int(os.environ.get("RC_DNS_PORT", "10053"))
+    q = lambda name, t="A": sorted(x.to_text() for x in res.resolve(name, t))
+    assert q(f"api.{zone}") == ["10.0.0.1", "10.0.0.2"]
+    assert q(f"www.{zone}") == ["10.0.0.1", "10.0.0.2"]  # CNAME chased
+    assert q(zone, "TXT") == ['"v=spf1 -all"']
+    assert q(f"feature-x.dev.{zone}") == ["10.9.9.9"]  # wildcard
+    assert q(f"lb.{zone}") == ["127.0.0.1"]  # alias to a local resource
+    try:
+        res.resolve(f"nope.{zone}"); raise AssertionError
+    except dns.resolver.NXDOMAIN:
+        pass
+
+    r53.change_resource_record_sets(HostedZoneId=z, ChangeBatch={"Changes": [
+        {"Action": "UPSERT", "ResourceRecordSet": rr(f"api.{zone}", "A", ["10.0.0.3"])}]})
+    assert q(f"api.{zone}") == ["10.0.0.3"]
+    assert code(r53.delete_hosted_zone, Id=z) == "HostedZoneNotEmpty"
+    for s in r53.list_resource_record_sets(HostedZoneId=z)["ResourceRecordSets"]:
+        if s["Type"] not in ("SOA", "NS"):
+            r53.change_resource_record_sets(HostedZoneId=z, ChangeBatch={"Changes": [{"Action": "DELETE", "ResourceRecordSet": s}]})
+    r53.delete_hosted_zone(Id=z)
+    assert code(r53.get_hosted_zone, Id=z) == "NoSuchHostedZone"
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
-            fn()
-            print("ok", name)
+            try:
+                fn()
+                print("ok", name)
+            except Skip as e:
+                print("skip", name, f"({e})")
