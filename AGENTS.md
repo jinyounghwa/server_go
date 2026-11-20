@@ -6,7 +6,10 @@
 ## 1. 현재 상태
 
 - 계획서 6장 순서 **1~8단계 전부 완료** (코어·22개 서비스·GUI·캐릭터 마을·해설 에이전트·검증 에이전트·Python/JS/Rust 3개 SDK 호환성 스위트·Dockerfile/Homebrew/GitHub Actions CI·Release 패키징·문서 정비).
-- 남은 선택 항목: GitHub `v0.1.0` 태그 릴리스 생성, Netlify 데모 배포(사용자 계정 연결 필요).
+- 이후 추가: JSON 상태 스냅샷, 3D(Three.js) 캐릭터 마을, GitHub Pages 데모 배포(`pages.yml`, 동작 중).
+- 남은 일: `v0.1.0` 릴리스. 태그는 8b4e7f8에 푸시됐지만 Release 워크플로가 폐지된 `macos-13` 러너를 기다리며 멈춤.
+  워크플로는 macos-14 교차 빌드로 고쳤다. 멈춘 실행 취소와 태그 재지정은 사용자 승인 후. 릴리스 뒤 Homebrew sha256 채우기.
+- Netlify 배포는 GitHub Pages로 대체됨(필요하면 사용자 계정 연결).
 - 이름은 `rocalcloud`(r로 시작, 사용자가 정함), 라이선스 Apache-2.0. 이름에 AWS/Amazon 금지.
 
 ## 2. 구조
