@@ -14,9 +14,9 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: macos-14
+          - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-14 # ponytail: Intel 러너(macos-13) 폐지, Apple Silicon에서 교차 빌드
+          - os: macos-latest # 버전 고정 러너(macos-13, macos-14)는 폐지됨. Apple Silicon에서 Intel용 교차 빌드
             target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:

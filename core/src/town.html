@@ -109,6 +109,9 @@ canvas#c:active { cursor: grabbing; }
   color: #f8fafc; padding: 9px 12px; border-radius: 10px; font-size: 12px;
   box-shadow: 0 12px 28px rgba(0, 0, 0, 0.55);
 }
+#connect { margin-top: 8px; font-size: 11px; line-height: 1.5; color: var(--muted); max-width: 300px; }
+#connect code { display: block; margin: 4px 0; padding: 4px 6px; border-radius: 6px; background: rgba(0,0,0,.35); color: inherit; user-select: all; }
+#connect span code { display: inline; padding: 0 4px; margin: 0; }
 #hint3d {
   position: fixed; left: 16px; bottom: 18px; z-index: 15; font-size: 11px; color: rgba(241, 245, 249, 0.72);
   background: var(--glass); backdrop-filter: blur(8px); padding: 5px 11px; border-radius: 999px;
@@ -134,6 +137,11 @@ canvas#c:active { cursor: grabbing; }
       <span class="tag3d">REALTIME 3D</span>
     </div>
     <div class="status-row"><span id="dot" class="sdot"></span><span id="mode">연결 중…</span></div>
+    <div id="connect" hidden>
+      내 컴퓨터의 rocalcloud에 연결하면 실제 요청이 이 도시에 나타납니다. 실행하면 자동으로 연결됩니다.
+      <code>docker run --rm -p 127.0.0.1:4566:4566 rocalcloud</code>
+      <span>다른 주소는 <code>?api=http://127.0.0.1:4566</code></span>
+    </div>
     <div class="stats-row">
       <div class="stat"><span>요청</span><b id="st_total">0</b></div>
       <div class="stat"><span>성공</span><b id="st_ok" class="ok">0</b></div>
@@ -1290,15 +1298,29 @@ function handle(e) {
   caption(e);
 }
 
-let es = null, demoTimer = null;
+// On /_town the emulator serves this page itself; elsewhere (GitHub Pages, a file) connect to the local emulator.
+const params = new URLSearchParams(location.search);
+const sameOrigin = location.protocol.startsWith("http") && location.pathname.startsWith("/_town");
+const API = sameOrigin ? "" : (params.get("api") || "http://127.0.0.1:4566").replace(/\/$/, "");
+$("gui").href = API + "/_ui";
+let es = null, demoTimer = null, retryTimer = null;
 function setMode(kind, text) { $("dot").className = "sdot " + kind; $("mode").textContent = text; }
 function live() {
   stopDemo();
-  es = new EventSource("/_events");
+  clearTimeout(retryTimer);
+  es = new EventSource(API + "/_events");
   let opened = false;
-  es.onopen = () => { opened = true; setMode("live", "실시간 연결됨"); };
+  es.onopen = () => {
+    opened = true; setMode("live", sameOrigin ? "실시간 연결됨" : "실시간 연결됨 · " + API);
+    $("connect").hidden = true; $("gui").hidden = false;
+  };
   es.onmessage = m => { try { handle(JSON.parse(m.data)); } catch {} };
-  es.onerror = () => { if (es.readyState === 2 || !opened) startDemo("3D 시티 데모 (목업 트래픽)"); };
+  es.onerror = () => {
+    if (es.readyState !== 2 && opened) return; // EventSource reconnects by itself
+    startDemo("에뮬레이터 연결 대기 중 · 목업 트래픽");
+    $("connect").hidden = sameOrigin; $("gui").hidden = true;
+    retryTimer = setTimeout(live, 5000); // ponytail: fixed 5 s poll until the local emulator answers
+  };
 }
 
 const SCRIPT = [
@@ -1334,13 +1356,14 @@ function startDemo(why) {
   tick();
   demoTimer = setInterval(tick, 1150);
 }
-function stopDemo() { clearInterval(demoTimer); demoTimer = null; $("demo").textContent = "데모"; }
+function stopDemo() { clearTimeout(retryTimer); stopDemoTimer(); }
+function stopDemoTimer() { clearInterval(demoTimer); demoTimer = null; $("demo").textContent = "데모"; }
 $("demo").onclick = () => demoTimer ? live() : startDemo("3D 시티 데모");
 $("pause").onclick = () => { paused = !paused; $("pause").textContent = paused ? "재생" : "일시정지"; };
 $("speed").oninput = e => speed = +e.target.value;
 
-if (location.protocol.startsWith("http") && !new URLSearchParams(location.search).has("demo") && location.pathname.startsWith("/_town")) live();
-else { $("gui").hidden = true; startDemo("3D 시티 데모 (목업 트래픽)"); }
+if (params.has("demo")) { $("gui").hidden = true; startDemo("3D 시티 데모 (목업 트래픽)"); }
+else live();
 </script>
 </body>
 </html>

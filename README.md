@@ -96,8 +96,10 @@ removed at startup and on reset.
 
 `/_town` shows the event stream as a small town: every request is a courier walking from the gate (IAM guard) to its
 service's building, service-to-service deliveries walk between buildings, and results show as ✓ / ! / ✗ / ✋ / ⚡.
-A text log mirrors the animation. Opened anywhere else (or with `?demo`) it plays scripted mock events; `netlify.toml`
-publishes it as a static demo.
+A text log mirrors the animation. The GitHub Pages copy (https://jinyounghwa.github.io/server_go/) connects to the
+rocalcloud running on your machine (`http://127.0.0.1:4566`, or `?api=<url>`) and shows your real traffic; until one
+answers it plays mock events and retries every 5 s. `?demo` forces the mock events. Only the Pages origin gets CORS on
+`/_events` (`RC_TOWN_ORIGIN` overrides it, `off` disables it), and its copy drops Cognito confirmation codes.
 
 ## Explanation agent
 

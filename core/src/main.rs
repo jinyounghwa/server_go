@@ -735,16 +735,37 @@ async fn set_chaos(State(app): State<Arc<App>>, h: HeaderMap, body: Bytes) -> ax
 }
 
 // Event stream for GUI / character web / agents: one JSON event per request.
-async fn events(State(app): State<Arc<App>>) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
-    Sse::new(futures_util::stream::unfold(app.events.subscribe(), |mut rx| async move {
+// The published town page (GitHub Pages) may read the local event stream. Only this one origin gets CORS,
+// and its copy drops the Cognito confirmation code. RC_TOWN_ORIGIN overrides it, "off" disables it.
+static TOWN_ORIGIN: LazyLock<String> =
+    LazyLock::new(|| std::env::var("RC_TOWN_ORIGIN").unwrap_or_else(|_| "https://jinyounghwa.github.io".into()));
+
+fn town_view(s: String) -> String {
+    match serde_json::from_str::<Value>(&s) {
+        Ok(mut v) if v.get("code").is_some() => {
+            v.as_object_mut().unwrap().remove("code");
+            v.to_string()
+        }
+        _ => s,
+    }
+}
+
+async fn events(State(app): State<Arc<App>>, h: HeaderMap) -> Response {
+    let cross = h.get("origin").and_then(|o| o.to_str().ok()).is_some_and(|o| o == TOWN_ORIGIN.as_str());
+    let sse = Sse::new(futures_util::stream::unfold(app.events.subscribe(), move |mut rx| async move {
         loop {
             match rx.recv().await {
-                Ok(s) => return Some((Ok(Event::default().data(s)), rx)),
+                Ok(s) => return Some((Ok::<_, Infallible>(Event::default().data(if cross { town_view(s) } else { s })), rx)),
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => return None,
             }
         }
-    }))
+    }));
+    let mut resp = sse.into_response();
+    if cross {
+        resp.headers_mut().insert("access-control-allow-origin", TOWN_ORIGIN.parse().unwrap());
+    }
+    resp
 }
 
 async fn state(State(app): State<Arc<App>>) -> Json<Value> {
@@ -1048,4 +1069,14 @@ async fn main() {
     let l = tokio::net::TcpListener::bind(&bind).await.expect("bind");
     eprintln!("rocalcloud listening on http://{bind}  (GUI: /_ui, town: /_town, events: /_events, ENFORCE_IAM={})", *ENFORCE as u8);
     axum::serve(l, router).await.unwrap();
+}
+
+#[cfg(test)]
+mod town_tests {
+    #[test]
+    fn town_view_drops_confirmation_code() {
+        let s = super::town_view(r#"{"op":"CodeSent","code":"123456","target":"u"}"#.into());
+        assert!(!s.contains("123456") && s.contains("CodeSent"));
+        assert_eq!(super::town_view("{\"op\":\"x\"}".into()), "{\"op\":\"x\"}");
+    }
 }
