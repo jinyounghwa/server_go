@@ -34,6 +34,8 @@ aside h2 { margin: 12px 16px 6px; font-size: 13px; }
 #log li.bad::before { content: "✗ "; color: var(--bad); font-weight: 700; }
 #log li.deny::before { content: "✋ "; }
 #log li.zap::before { content: "⚡ "; }
+#log li.defend::before { content: "🛡 "; }
+#log li.breach::before { content: "⚠ "; color: var(--bad); font-weight: 700; }
 @media (max-width: 860px) {
   body { grid-template-columns: 1fr; grid-template-rows: 46px auto 1fr; }
   #stage { aspect-ratio: 16 / 9; }
@@ -60,7 +62,8 @@ aside h2 { margin: 12px 16px 6px; font-size: 13px; }
     <div class="legend">
       <div><span style="color:var(--ok)">✓</span> 성공 · <span style="color:var(--warn)">!</span> 요청 오류(4xx) · <span style="color:var(--bad)">✗</span> 서버 오류(5xx)</div>
       <div><span>✋</span> 정문 경비가 막음(IAM 거부) · <span>⚡</span> 장애 주입(chaos)</div>
-      <div>점선 택배원 = 서비스끼리 주고받는 배달</div>
+      <div><span>🛡</span> 검사관 공격 방어 성공 · <span>⚠</span> 검증 실패(경고)</div>
+      <div>점선 택배원 = 서비스끼리 주고받는 배달 · 보라색 모자 = 검사관</div>
     </div>
   </div>
   <ul id="log" aria-live="polite"></ul>
@@ -113,12 +116,22 @@ const VERBS = {
   PutLogEvents: "게시판에 기록을 붙였습니다", RunInstances: "관제탑이 새 기지를 표시했습니다",
 };
 function story(e) {
+  if (e.service === "inspector") {
+    if (e.op === "RunStarted") return `검사관: 마을 보안·안정성 순찰을 시작했습니다 (${e.total || 0}건)`;
+    if (e.op === "RunFinished") return `검사관: 순찰 완료 — 통과 ${e.passed}/${e.total}${e.failed ? ` (실패 ${e.failed})` : ""}`;
+    if (e.blocked && e.passed) return `검사관 → ${(byService[e.target_service] || {name: "정문"}).name}: ${e.name} — 경비가 막아 방어 성공`;
+    return `검사관 → ${(byService[e.target_service] || {name: e.target_service || "마을"}).name}: ${e.name} (${e.passed ? "통과" : "실패!"})`;
+  }
   const verb = VERBS[e.op] || `${e.op} 처리`;
   const who = e.principal && !/:root$/.test(e.principal) ? e.principal.replace(/^arn:aws:(iam|sts)::\d+:/, "") + " — " : "";
   const tgt = e.target ? ` (${String(e.target).replace(/^arn:aws:[^:]+:[^:]*:\d*:/, "").slice(0, 40)})` : "";
   return `${who}${(byService[e.service] || {name: e.service}).name}: ${verb}${tgt}`;
 }
 function outcome(e) {
+  if (e.service === "inspector") {
+    if (e.op === "ScenarioDone") return e.passed ? (e.blocked ? "defend" : "ok") : "breach";
+    return e.status >= 400 ? "breach" : "ok";
+  }
   if (e.auth && e.auth.decision !== "allowed" && e.auth.enforced) return "deny";
   if (e.chaos && e.chaos.fault) return "zap";
   if (e.status >= 500 && e.status !== 299) return "bad";
@@ -133,6 +146,7 @@ function origin(e) {
   return null;
 }
 function destination(e) {
+  if (e.service === "inspector") return e.op === "ScenarioDone" ? (byService[e.target_service] || B[0]) : null;
   if (e.op === "Deliver") {
     if (e.protocol === "lambda" || /:lambda:/.test(e.target || "")) return byService.lambda;
     return byService.sqs;
@@ -156,18 +170,19 @@ function spawn(e) {
   const from = origin(e);
   const out = outcome(e);
   if (walkers.length > 70) { land(to, out, e); return; } // too busy to draw everyone
-  const pts = out === "deny" ? [{x: 20, y: ROAD}, {x: guard.x - 14, y: ROAD}] : path(from, to);
-  if (!from && out !== "deny") pts.unshift({x: 20, y: ROAD});
+  const pts = (out === "deny" || out === "defend") ? [{x: 20, y: ROAD}, {x: guard.x - 14, y: ROAD}] : path(from, to);
+  if (!from && out !== "deny" && out !== "defend") pts.unshift({x: 20, y: ROAD});
   let len = 0;
   for (let i = 1; i < pts.length; i++) len += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
-  walkers.push({pts, len, t: 0, dur: reduce ? 0.01 : Math.max(0.6, len / 380), to, from, out, e, internal: !!from,
-                color: (byService[e.service] || to).color, hold: 0});
+  const isInsp = e.service === "inspector";
+  walkers.push({pts, len, t: 0, dur: reduce ? 0.01 : Math.max(0.6, len / 380), to, from, out, e, internal: !!from, inspector: isInsp,
+                color: isInsp ? "#5b2c83" : (byService[e.service] || to).color, hold: 0});
 }
 function land(b, out, e) {
   b.count++;
   b.act = 1;
   b.glow = 1;
-  b.glowColor = {ok: "#4cc27a", warn: "#f0a030", bad: "#e5483e", zap: "#f2c200"}[out] || "#fff";
+  b.glowColor = {ok: "#4cc27a", warn: "#f0a030", bad: "#e5483e", zap: "#f2c200", breach: "#e5483e", defend: "#4cc27a"}[out] || "#fff";
   if (out !== "ok") b.fail = 1;
   if (e.service === "states" && e.op === "StateEntered") b.step = (b.step || 0) + 1;
   bubbles.push({x: b.door.x, y: b.door.y + (b.y > ROAD ? -18 : 18) - (b.y > ROAD ? 0 : 0), out, life: 1.4});
@@ -284,14 +299,21 @@ function building(b, t) {
   }
 }
 
-function person(x, y, color, dir, t, dashed, item) {
+function person(x, y, color, dir, t, dashed, item, isInsp) {
   const bob = reduce ? 0 : Math.sin(t * 14) * 2;
   ctx.save(); ctx.translate(x, y - 22 + bob);
   if (dashed) ctx.globalAlpha = 0.8;
   ctx.fillStyle = color; rr(-7, 6, 14, 18, 4); ctx.fill();
   ctx.fillStyle = "#f1c9a0"; ctx.beginPath(); ctx.arc(0, 0, 7, 0, 7); ctx.fill();
-  if (dashed) { ctx.strokeStyle = "#fff"; ctx.setLineDash([3, 3]); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(0, 0, 10, 0, 7); ctx.stroke(); ctx.setLineDash([]); }
-  ctx.fillStyle = item; rr(5 * dir, 8, 10, 9, 2); ctx.fill();                                     // parcel
+  if (isInsp) {
+    // inspector hat & magnifying glass
+    ctx.fillStyle = "#3a1b54"; ctx.fillRect(-10, -7, 20, 3); rr(-6, -13, 12, 7, 2); ctx.fill();
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(9 * dir, 10, 4, 0, 7); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(12 * dir, 13); ctx.lineTo(15 * dir, 17); ctx.stroke();
+  } else {
+    if (dashed) { ctx.strokeStyle = "#fff"; ctx.setLineDash([3, 3]); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(0, 0, 10, 0, 7); ctx.stroke(); ctx.setLineDash([]); }
+    ctx.fillStyle = item; rr(5 * dir, 8, 10, 9, 2); ctx.fill();                                     // parcel
+  }
   ctx.strokeStyle = shade(color, 0.6); ctx.lineWidth = 3; ctx.lineCap = "round";
   const s = reduce ? 0 : Math.sin(t * 14) * 4;
   ctx.beginPath(); ctx.moveTo(-3, 24); ctx.lineTo(-3 + s, 31); ctx.moveTo(3, 24); ctx.lineTo(3 - s, 31); ctx.stroke();
@@ -300,8 +322,8 @@ function person(x, y, color, dir, t, dashed, item) {
 
 function bubble(bb) {
   const a = Math.min(1, bb.life);
-  const sym = {ok: "✓", warn: "!", bad: "✗", zap: "⚡", deny: "✋"}[bb.out];
-  const col = {ok: "#2f7d4f", warn: "#c06a00", bad: "#b3261e", zap: "#b58a00", deny: "#b3261e"}[bb.out];
+  const sym = {ok: "✓", warn: "!", bad: "✗", zap: "⚡", deny: "✋", defend: "🛡", breach: "⚠"}[bb.out];
+  const col = {ok: "#2f7d4f", warn: "#c06a00", bad: "#b3261e", zap: "#b58a00", deny: "#b3261e", defend: "#2f7d4f", breach: "#b3261e"}[bb.out];
   ctx.save(); ctx.globalAlpha = a; ctx.translate(bb.x, bb.y - (1.4 - bb.life) * 16);
   ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(0, -16, 13, 0, 7); ctx.fill();
   ctx.fillStyle = col; ctx.font = "700 15px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText(sym, 0, -15);
@@ -317,7 +339,7 @@ function frame(now) {
     w.t += dt;
     if (w.t >= w.dur && !w.done) {
       w.done = true;
-      if (w.out === "deny") { guard.block = 1; bubbles.push({x: guard.x - 20, y: ROAD - 34, out: "deny", life: 1.4}); w.pts = [w.pts[1], {x: 0, y: ROAD}]; w.len = guard.x; w.t = 0; w.dur = 0.8; w.leaving = true; w.done = false; }
+      if (w.out === "deny" || w.out === "defend") { guard.block = 1; bubbles.push({x: guard.x - 20, y: ROAD - 34, out: w.out, life: 1.4}); w.pts = [w.pts[1], {x: 0, y: ROAD}]; w.len = guard.x; w.t = 0; w.dur = 0.8; w.leaving = true; w.done = false; }
       else land(w.to, w.out, w.e);
     }
   }
@@ -332,7 +354,7 @@ function frame(now) {
   for (const w of walkers) {
     const p = pos(w);
     if (!w.internal && !w.leaving && p.x > guard.x - 8 && p.x < guard.x + 8) guard.pass = 1;
-    person(p.x, p.y, w.color, p.dir, clock + w.t, w.internal, w.out === "zap" ? "#f2c200" : "#d9b382");
+    person(p.x, p.y, w.color, p.dir, clock + w.t, w.internal, w.out === "zap" ? "#f2c200" : "#d9b382", w.inspector);
   }
   bubbles.forEach(bubble);
   requestAnimationFrame(frame);
@@ -395,6 +417,8 @@ const SCRIPT = [
   [{service: "lambda", op: "Invoke", target: "flaky-job", trigger: "events", status: 500}],
   [{service: "cognito-idp", op: "InitiateAuth", status: 200}],
   [{service: "sqs", op: "ReceiveMessage", status: 200}, {service: "sqs", op: "DeleteMessage", status: 200}],
+  [{service: "inspector", op: "ScenarioDone", name: "IAM 명시적 거부(Deny) 우선 차단", target_service: "s3", passed: true, blocked: true, status: 200}],
+  [{service: "inspector", op: "ScenarioDone", name: "무작위·기형 입력 퍼징 (15건)", target_service: "dynamodb", passed: true, blocked: false, status: 200}],
   [{service: "route53", op: "GET /hostedzone", status: 200}, {service: "logs", op: "FilterLogEvents", status: 200}],
 ];
 function startDemo(why) {

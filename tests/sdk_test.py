@@ -1083,6 +1083,43 @@ def test_template_roundtrip():
     cf.delete_stack(StackName=p)
 
 
+def test_inspector():
+    import urllib.request, urllib.error
+    H = {"x-rocalcloud": "1", "content-type": "application/json"}
+    post = lambda u, b: json.load(urllib.request.urlopen(urllib.request.Request(EP + u, data=json.dumps(b).encode(), headers=H, method="POST"), timeout=120))
+    # CSRF header required on POST /_inspect/run
+    try:
+        urllib.request.urlopen(urllib.request.Request(EP + "/_inspect/run", data=b"{}", headers={"content-type": "application/json"}, method="POST"))
+        raise AssertionError("expected 403 without x-rocalcloud header")
+    except urllib.error.HTTPError as e:
+        assert e.code == 403, e.code
+    # Full deterministic run (all built-in kinds)
+    rep = post("/_inspect/run", {"use_llm": False})
+    failed = [r for r in rep["results"] if not r["passed"]]
+    assert rep["summary"]["total"] >= 13 and rep["summary"]["failed"] == 0, failed
+    assert rep["enforce_iam"] is True, "sdk_test must run with ENFORCE_IAM=1"
+    rid = rep["id"]
+    # Reports list + Markdown / HTML exports
+    lst = json.load(urllib.request.urlopen(EP + "/_inspect/reports"))
+    assert lst["latest"]["id"] == rid and len(lst["runs"]) >= 1
+    md = urllib.request.urlopen(f"{EP}/_inspect/report/{rid}?format=md").read().decode()
+    html = urllib.request.urlopen(f"{EP}/_inspect/report/{rid}?format=html").read().decode()
+    assert f"({rid})" in md and "| PASS |" in md, md[:200]
+    assert f"({rid})" in html and "PASS" in html, html[:200]
+    # Replay a single custom scenario
+    replayed = post("/_inspect/replay", {
+        "id": "custom-replay", "name": "단일 재현", "service": "dynamodb",
+        "steps": [{"service": "dynamodb", "op": "DescribeTable", "params": {"TableName": "rc-insp-does-not-exist"}}],
+        "expect": {"status": 400, "error_code": "ResourceNotFoundException"},
+    })
+    assert replayed["passed"], replayed
+    # Verify cleanup: no leftover rc-insp- resources or chaos rules
+    assert not [b["Name"] for b in s3.list_buckets()["Buckets"] if b["Name"].startswith("rc-insp-")]
+    assert not [t for t in ddb.list_tables()["TableNames"] if t.startswith("rc-insp-")]
+    assert not [u for u in sqs.list_queues().get("QueueUrls", []) if "rc-insp-" in u]
+    assert json.load(urllib.request.urlopen(EP + "/_admin/chaos"))["rules"] == []
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

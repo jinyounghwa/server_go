@@ -5,8 +5,8 @@
 
 ## 1. 현재 상태
 
-- 계획서 6장 순서 1~6단계 완료, 마지막 커밋 `37e5dcf` (origin/main, 공개 저장소 github.com/jinyounghwa/server_go).
-- 다음 할 일: **7단계 검증 에이전트**(계획서 10절) → 8단계 호환성 스위트 정비와 공개(계획서 9절).
+- 계획서 6장 순서 1~7단계 완료 (7단계 검증 에이전트 구현 및 맥/우분투 전체 검증 통과).
+- 다음 할 일: **8단계 호환성 스위트 정비와 공개**(계획서 9절).
 - 이름은 `rocalcloud`(r로 시작, 사용자가 정함), 라이선스 Apache-2.0. 이름에 AWS/Amazon 금지.
 
 ## 2. 구조
@@ -23,7 +23,7 @@ netlify.toml     마을 데모 정적 배포 설정 (배포는 아직 안 함)
 
 서비스 모듈: ddb, s3, sqs, sns, iam(+STS, 정책 평가기), net(EC2 VPC + 도달성), secrets, ssm, kms, logs,
 lambda, events, sfn, apigw, cognito, kinesis, ses, managed(RDS·ElastiCache, Docker), ecs, elb, route53(+DNS), cfn,
-agent(해설 에이전트).
+agent(해설 에이전트), inspector(검증 에이전트).
 
 ### 요청 흐름 (main.rs `handle`)
 1. SigV4 헤더에서 access key와 서비스 이름을 읽는다(서명 검증은 안 함).
@@ -44,7 +44,7 @@ agent(해설 에이전트).
 
 ### 관리 엔드포인트
 `/_ui` `/_town` `/_events`(SSE) `/_admin/state` `/_admin/reset`(POST) `/_admin/reach` `/_admin/chaos`(GET/POST)
-`/_api/{apiId}/...`(API GW 호출) `/_cognito/{pool}/.well-known/*` `/_agent/status|explain|ask|template`.
+`/_api/{apiId}/...`(API GW 호출) `/_cognito/{pool}/.well-known/*` `/_agent/status|explain|ask|template` `/_inspect/run|reports|report/{id}|replay`.
 **POST 관리 엔드포인트는 `x-rocalcloud` 헤더를 요구한다**(다른 웹사이트의 CSRF 차단). 새 POST도 같은 규칙.
 
 ## 3. 실행과 테스트

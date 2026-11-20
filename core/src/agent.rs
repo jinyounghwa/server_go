@@ -99,7 +99,7 @@ async fn post_json(url: &str, body: &Value) -> Result<Value, String> {
 }
 
 // One chat completion, optionally constrained to a JSON schema.
-async fn chat(messages: &[Value], format: Option<&Value>) -> Result<String, String> {
+pub(crate) async fn chat(messages: &[Value], format: Option<&Value>) -> Result<String, String> {
     let mut gate = ONE_AT_A_TIME.lock().await;
     if let Some(t) = *gate {
         let gap = Duration::from_millis(1500);

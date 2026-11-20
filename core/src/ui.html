@@ -66,7 +66,19 @@ pre { margin: 4px 0 10px; padding: 8px 10px; background: var(--panel); border: 1
 .verdict { font-weight: 600; margin: 6px 0; } .verdict.ok { color: var(--ok); } .verdict.no { color: var(--bad); }
 .deny { color: var(--bad); } .allow { color: var(--ok); }
 .svc.iam, .svc.sts, .svc.kms, .svc.secretsmanager { color: var(--warn); } .svc.ec2, .svc.ssm { color: var(--accent); }
-.svc.sns, .svc.logs { color: var(--sqs); } .svc.lambda { color: var(--ddb); }
+.svc.sns, .svc.logs { color: var(--sqs); } .svc.lambda { color: var(--ddb); } .svc.inspector { color: #7c3aed; }
+.insp-bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 10px 0 14px; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+.insp-cards { display: flex; gap: 10px; flex-wrap: wrap; margin: 10px 0 14px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 14px; min-width: 110px; }
+.card b { display: block; font-size: 18px; }
+.badge { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
+.sev-critical, .sev-high { background: rgba(179,38,30,.14); color: var(--bad); }
+.sev-medium { background: rgba(179,107,0,.14); color: var(--warn); }
+.sev-low, .sev-info { background: rgba(47,125,79,.14); color: var(--ok); }
+.prog { height: 6px; background: var(--line); border-radius: 4px; overflow: hidden; margin: 8px 0; }
+.prog > div { height: 100%; background: var(--accent); transition: width .2s; }
+.trend { display: flex; align-items: end; gap: 6px; height: 42px; margin: 6px 0 12px; }
+.trend span { display: inline-block; width: 14px; border-radius: 3px 3px 0 0; background: var(--ok); }
 </style>
 </head>
 <body>
@@ -77,6 +89,7 @@ pre { margin: 4px 0 10px; padding: 8px 10px; background: var(--panel); border: 1
   <span class="spacer"></span>
   <form class="ask" id="askform"><input id="q" placeholder="에이전트에게 묻기 (예: 최근 오류 왜 났어?)" aria-label="에이전트에게 질문"><button>묻기</button></form>
   <span class="muted" id="llm"></span>
+  <button id="inspectbtn">검사</button>
   <a href="/_town" style="color:inherit">마을 보기</a>
   <button id="refresh">새로고침</button>
   <button id="reset" class="danger">전체 초기화</button>
@@ -98,7 +111,7 @@ pre { margin: 4px 0 10px; padding: 8px 10px; background: var(--panel); border: 1
 <script>
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-let state = {dynamodb: [], s3: [], sqs: [], iam: {users: [], roles: [], policies: []}, vpc: []}, sel = null, count = 0;
+let state = {dynamodb: [], s3: [], sqs: [], iam: {users: [], roles: [], policies: []}, vpc: []}, sel = null, count = 0, viewMode = "resource";
 const reachForm = {from: "internet", to: "", protocol: "tcp", port: "443", result: null};
 // Services whose admin view is {name, count, sub, cols, rows} render with one generic table.
 const GENERIC = [["sns", "SNS 토픽"], ["secrets", "Secrets Manager"], ["ssm", "SSM 파라미터"], ["kms", "KMS 키"], ["logs", "CloudWatch 로그 그룹"], ["lambda", "Lambda 함수"], ["events", "EventBridge 규칙"], ["sfn", "Step Functions"], ["apigw", "API Gateway"], ["cognito", "Cognito 사용자 풀"], ["kinesis", "Kinesis 스트림"], ["ses", "SES 메일"], ["managed", "RDS · ElastiCache"], ["ecs", "ECS 클러스터"], ["elb", "로드 밸런서"], ["route53", "Route 53 존"], ["cfn", "CloudFormation 스택"]];
@@ -136,6 +149,7 @@ function table(cols, rows) {
 }
 
 function renderDetail() {
+  if (viewMode !== "resource") return;
   const r = sel && (lists()[sel.svc] || []).find(x => x.name === sel.name);
   if (!r) { $("detail").innerHTML = `<div class="hint">왼쪽에서 리소스를 고르세요.</div>`; return; }
   const more = r.count > 100 ? ` · 앞의 100개만 표시` : "";
@@ -203,6 +217,7 @@ es.onerror = () => { $("dot").className = "dot"; $("conn").textContent = "연결
 es.onmessage = m => {
   const e = JSON.parse(m.data);
   $("counter").textContent = `요청 ${++count}`;
+  if (e.service === "inspector") onInspectorEvent(e);
   loadSoon();
   if ($("pause").checked) return;
   events.unshift(e); if (events.length > MAX_LOG) events.pop();
@@ -213,7 +228,7 @@ es.onmessage = m => {
 const H = {"x-rocalcloud": "1", "content-type": "application/json"};
 const post = (url, body) => fetch(url, {method: "POST", headers: H, body: JSON.stringify(body)}).then(r => r.ok ? r.json() : r.text().then(t => ({error: t})));
 fetch("/_agent/status").then(r => r.json()).then(s => $("llm").textContent = s.available ? `LLM: ${s.model}` : "LLM 없음 · 규칙 해설만").catch(() => {});
-function showAgent(html) { sel = null; location.hash = ""; renderNav(); $("detail").innerHTML = html; }
+function showAgent(html) { viewMode = "agent"; sel = null; location.hash = ""; renderNav(); $("detail").innerHTML = html; }
 $("logbody").onclick = async ev => {
   const tr = ev.target.closest("tr[data-rid]");
   if (!tr) return;
@@ -241,7 +256,74 @@ $("askform").onsubmit = async ev => {
   renderAnswer(q, await post("/_agent/ask", {question: q}));
 };
 
+// ---------- verification agent (inspector) ----------
+const insp = {running: false, done: 0, total: 0, current: "", report: null, runs: [], kinds: ["security", "chaos", "incident", "perf", "fuzz", "regression"], useLlm: false, saveReg: false};
+function onInspectorEvent(e) {
+  if (e.op === "RunStarted") { insp.running = true; insp.done = 0; insp.total = e.total || 0; insp.current = "시작 중…"; }
+  else if (e.op === "ScenarioDone") { insp.done = e.index || insp.done + 1; insp.total = e.total || insp.total; insp.current = `${e.name} (${e.passed ? "PASS" : "FAIL"})`; }
+  else if (e.op === "RunFinished") { insp.running = false; insp.current = "완료"; loadInspector(); return; }
+  if (viewMode === "inspector") renderInspector();
+}
+async function loadInspector() {
+  try {
+    const d = await (await fetch("/_inspect/reports")).json();
+    insp.running = !!d.running; insp.runs = d.runs || []; if (d.latest) insp.report = d.latest;
+  } catch {}
+  if (viewMode === "inspector") renderInspector();
+}
+function renderInspector() {
+  const K = [["security", "보안"], ["chaos", "장애 주입"], ["incident", "사고"], ["perf", "성능"], ["fuzz", "퍼징"], ["regression", "회귀"]];
+  const pct = insp.total ? Math.round(insp.done * 100 / insp.total) : 0;
+  const rep = insp.report;
+  const trend = insp.runs.length > 1 ? `<h4>최근 실행 추세 (${insp.runs.length}회)</h4><div class="trend">` +
+    [...insp.runs].reverse().map(r => {
+      const t = r.summary.total || 1, ok = r.summary.passed || 0, h = Math.max(6, Math.round(ok * 38 / t));
+      const col = r.summary.failed ? "var(--bad)" : "var(--ok)";
+      return `<span style="height:${h}px;background:${col}" title="${esc(r.id)}: ${ok}/${t} 통과"></span>`;
+    }).join("") + `</div>` : "";
+  const cards = rep ? `<div class="insp-cards">
+    <div class="card"><span class="muted">전체</span><b>${rep.summary.total}</b></div>
+    <div class="card"><span class="muted">통과</span><b class="allow">${rep.summary.passed}</b></div>
+    <div class="card"><span class="muted">실패</span><b class="${rep.summary.failed ? "deny" : ""}">${rep.summary.failed}</b></div>
+    <div class="card"><span class="muted">소요</span><b>${rep.duration_ms}ms</b></div>
+  </div>
+  <div class="sub">리포트 ${esc(rep.id)} · ENFORCE_IAM=${rep.enforce_iam ? "1" : "0"}${rep.llm_generated ? ` · LLM 시나리오 ${rep.llm_generated}개` : ""}${rep.llm_note ? ` · LLM: ${esc(rep.llm_note)}` : ""}
+    · <a href="/_inspect/report/${esc(rep.id)}?format=md" target="_blank" style="color:inherit">Markdown</a>
+    · <a href="/_inspect/report/${esc(rep.id)}?format=html" target="_blank" style="color:inherit">HTML</a></div>` : "";
+  const rows = rep ? `<table><thead><tr><th>심각도</th><th>분류</th><th>시나리오</th><th>결과</th><th>ms</th><th>상세 / 재현</th></tr></thead><tbody>` +
+    rep.results.map((r, i) => `<tr>
+      <td><span class="badge sev-${esc(r.severity)}">${esc(r.severity)}</span></td>
+      <td>${esc(r.kind)}</td><td>${esc(r.name)}</td>
+      <td class="${r.passed ? "allow" : "deny"}"><b>${r.passed ? "PASS" : "FAIL"}</b></td>
+      <td>${r.elapsed_ms}</td>
+      <td class="v">${esc(r.detail)}${r.repro && r.repro.length ? `<details><summary class="muted">재현 요청 (${r.repro.length}건)</summary><pre>${esc(JSON.stringify(r.repro, null, 2))}</pre><button data-replay="${i}">재실행</button></details>` : ""}</td>
+    </tr>`).join("") + `</tbody></table>` : `<div class="hint">검사 실행 버튼을 눌러 보안·장애·사고·성능·퍼징 검사를 시작하세요.</div>`;
+  $("detail").innerHTML = `<h2>검증 에이전트</h2><div class="sub">로컬 에뮬레이터(127.0.0.1)를 대상으로 결정적 공격·장애·퍼징 시나리오를 실행합니다.</div>
+    <div class="insp-bar">${K.map(([k, l]) => `<label><input type="checkbox" data-kind="${k}" ${insp.kinds.includes(k) ? "checked" : ""}> ${l}</label>`).join("")}
+      <label><input type="checkbox" id="insp_llm" ${insp.useLlm ? "checked" : ""}> LLM 시나리오 추가</label>
+      <label><input type="checkbox" id="insp_reg" ${insp.saveReg ? "checked" : ""}> 실패 시 회귀 저장</label>
+      <span class="spacer"></span>
+      <button id="insp_run" ${insp.running ? "disabled" : ""}>${insp.running ? "실행 중…" : "검사 실행"}</button></div>
+    ${insp.running ? `<div class="muted">진행 중 (${insp.done}/${insp.total || "?"}): ${esc(insp.current)}</div><div class="prog"><div style="width:${pct}%"></div></div>` : ""}
+    ${cards}${trend}${rows}`;
+}
+$("inspectbtn").onclick = () => { viewMode = "inspector"; sel = null; location.hash = ""; renderNav(); loadInspector(); renderInspector(); };
+
 $("detail").onclick = async ev => {
+  if (ev.target.id === "insp_run") {
+    insp.running = true; insp.done = 0; insp.total = 0; insp.current = "요청 전송 중…"; renderInspector();
+    const r = await post("/_inspect/run", {kinds: insp.kinds, use_llm: insp.useLlm, save_regressions: insp.saveReg});
+    insp.running = false; if (r.results) insp.report = r;
+    loadInspector(); return;
+  }
+  if (ev.target.dataset && ev.target.dataset.replay != null && insp.report) {
+    const sc = insp.report.results[+ev.target.dataset.replay];
+    if (!sc) return;
+    ev.target.disabled = true; ev.target.textContent = "실행 중…";
+    const r = await post("/_inspect/replay", sc);
+    alert(`${sc.name}: ${r.passed ? "PASS" : "FAIL"} — ${r.detail}`);
+    ev.target.disabled = false; ev.target.textContent = "재실행"; return;
+  }
   if (ev.target.id === "doconfirm") {
     if (!confirm("되돌릴 수 없는 작업입니다. 실행할까요?")) return;
     renderAnswer("(확인 후 실행)", await post("/_agent/ask", {confirm: ev.target.dataset.token}));
@@ -254,12 +336,19 @@ $("detail").onclick = async ev => {
   renderDetail();
 };
 $("detail").oninput = ev => {
+  if (ev.target.dataset && ev.target.dataset.kind) {
+    const k = ev.target.dataset.kind;
+    insp.kinds = ev.target.checked ? [...new Set([...insp.kinds, k])] : insp.kinds.filter(x => x !== k);
+    return;
+  }
+  if (ev.target.id === "insp_llm") { insp.useLlm = ev.target.checked; return; }
+  if (ev.target.id === "insp_reg") { insp.saveReg = ev.target.checked; return; }
   const m = {rf: "from", rt: "to", rp: "protocol", rport: "port"}[ev.target.id];
   if (m) reachForm[m] = ev.target.value;
 };
-$("nav").onclick = ev => { const a = ev.target.closest("a"); if (!a) return; location.hash = a.dataset.svc + "/" + a.dataset.name; };
+$("nav").onclick = ev => { const a = ev.target.closest("a"); if (!a) return; viewMode = "resource"; location.hash = a.dataset.svc + "/" + a.dataset.name; };
 // Deep link: #<svc>/<name> selects a resource.
-const fromHash = () => { const [svc, ...n] = decodeURIComponent(location.hash.slice(1)).split("/"); sel = svc ? {svc, name: n.join("/")} : null; renderNav(); renderDetail(); };
+const fromHash = () => { const [svc, ...n] = decodeURIComponent(location.hash.slice(1)).split("/"); if (svc) viewMode = "resource"; sel = svc ? {svc, name: n.join("/")} : null; renderNav(); renderDetail(); };
 window.onhashchange = fromHash;
 fromHash();
 $("filter").oninput = renderLog;

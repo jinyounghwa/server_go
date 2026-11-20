@@ -7,6 +7,7 @@ mod ecs;
 mod elb;
 mod events;
 mod iam;
+mod inspector;
 mod kinesis;
 mod kms;
 mod lambda;
@@ -54,7 +55,7 @@ pub fn endpoint() -> String {
 }
 
 // ENFORCE_IAM=1 rejects denied requests; otherwise decisions are only reported in events.
-static ENFORCE: LazyLock<bool> = LazyLock::new(|| std::env::var("ENFORCE_IAM").is_ok_and(|v| v == "1"));
+pub(crate) static ENFORCE: LazyLock<bool> = LazyLock::new(|| std::env::var("ENFORCE_IAM").is_ok_and(|v| v == "1"));
 
 #[derive(Debug)]
 pub struct ApiErr {
@@ -114,7 +115,8 @@ pub struct App {
     pub elb: Mutex<elb::Elb>,
     pub route53: Mutex<route53::Route53>,
     pub cfn: Mutex<cfn::Cfn>,
-    chaos: Mutex<Vec<Value>>,
+    pub inspector: Mutex<inspector::Inspector>,
+    pub(crate) chaos: Mutex<Vec<Value>>,
     events: broadcast::Sender<String>,
     pub recent: Mutex<std::collections::VecDeque<Value>>,
 }
@@ -212,7 +214,7 @@ pub fn emit(app: &App, ev: Value) {
 }
 
 // Error code and message from a failed response body (JSON or XML), for events and explanations.
-fn error_of(body: &[u8]) -> Option<Value> {
+pub(crate) fn error_of(body: &[u8]) -> Option<Value> {
     let text = String::from_utf8_lossy(body);
     if let Ok(j) = serde_json::from_str::<Value>(&text) {
         let code = j["__type"].as_str().or(j["code"].as_str()).map(|c| c.rsplit('#').next().unwrap_or(c).to_string());
@@ -857,12 +859,59 @@ async fn agent_template(State(app): State<Arc<App>>) -> Response {
     Response::builder().header("content-type", "text/yaml; charset=utf-8").body(Body::from(agent::template(&app))).unwrap()
 }
 
+// Verification agent (inspector). POSTs require x-rocalcloud header.
+async fn inspect_run(State(app): State<Arc<App>>, h: HeaderMap, body: Bytes) -> Response {
+    if !h.contains_key("x-rocalcloud") {
+        return Response::builder().status(403).body(Body::empty()).unwrap();
+    }
+    let req: Value = if body.is_empty() { json!({}) } else { serde_json::from_slice(&body).unwrap_or(json!({})) };
+    match inspector::run(&app, &req).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => Response::builder().status(e.status).body(Body::from(e.msg)).unwrap(),
+    }
+}
+
+async fn inspect_reports(State(app): State<Arc<App>>) -> Json<Value> {
+    Json(inspector::reports_summary(&app))
+}
+
+async fn inspect_report(
+    State(app): State<Arc<App>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let Some(rep) = inspector::get_report(&app, &id) else {
+        return Response::builder().status(404).body(Body::from("리포트를 찾을 수 없습니다.")).unwrap();
+    };
+    match q.get("format").map(String::as_str) {
+        Some("md") => Response::builder().header("content-type", "text/markdown; charset=utf-8").body(Body::from(inspector::to_markdown(&rep))).unwrap(),
+        Some("html") => Response::builder().header("content-type", "text/html; charset=utf-8").body(Body::from(inspector::to_html(&rep))).unwrap(),
+        _ => Json(rep).into_response(),
+    }
+}
+
+async fn inspect_replay(h: HeaderMap, Json(sc): Json<Value>) -> Response {
+    if !h.contains_key("x-rocalcloud") {
+        return Response::builder().status(403).body(Body::empty()).unwrap();
+    }
+    Json(inspector::run_custom_scenario(&sc).await).into_response()
+}
+
 async fn town() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("town.html"))
 }
 
 async fn ui() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("ui.html"))
+}
+
+const MAX_BODY: usize = 256 << 20;
+
+async fn reject_oversize(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if req.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<usize>().ok()).is_some_and(|n| n > MAX_BODY) {
+        return Response::builder().status(413).body(Body::from("Payload Too Large")).unwrap();
+    }
+    next.run(req).await
 }
 
 #[tokio::main]
@@ -891,6 +940,7 @@ async fn main() {
         elb: Default::default(),
         route53: Default::default(),
         cfn: Default::default(),
+        inspector: Default::default(),
         chaos: Default::default(),
         events: broadcast::channel(1024).0,
         recent: Default::default(),
@@ -903,6 +953,10 @@ async fn main() {
         .route("/_agent/explain", post(agent_explain))
         .route("/_agent/ask", post(agent_ask))
         .route("/_agent/template", get(agent_template))
+        .route("/_inspect/run", post(inspect_run))
+        .route("/_inspect/reports", get(inspect_reports))
+        .route("/_inspect/report/{id}", get(inspect_report))
+        .route("/_inspect/replay", post(inspect_replay))
         .route("/favicon.ico", get(|| async { axum::http::StatusCode::NO_CONTENT })) // keep browsers out of the S3 log
         .route("/_admin/state", get(state))
         .route("/_admin/reset", post(reset))
@@ -911,7 +965,8 @@ async fn main() {
         .route("/_cognito/{pool}/.well-known/{doc}", get(cognito_wellknown))
         .route("/_admin/chaos", get(get_chaos).post(set_chaos))
         .fallback(handle)
-        .layer(DefaultBodyLimit::max(256 << 20)) // ponytail: 256 MiB per request, bodies are held in memory
+        .layer(DefaultBodyLimit::max(MAX_BODY)) // ponytail: 256 MiB per request, bodies are held in memory
+        .layer(axum::middleware::from_fn(reject_oversize))
         .with_state(app.clone());
     tokio::spawn(managed::cleanup());
     route53::serve_dns(app.clone());
