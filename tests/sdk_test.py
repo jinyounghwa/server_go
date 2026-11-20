@@ -1042,7 +1042,8 @@ def test_agent():
         assert t in ddb.list_tables()["TableNames"], "nothing deleted before confirmation"
         done = post("/_agent/ask", {"confirm": r["confirm"]["needs_confirmation"]})
         assert t not in ddb.list_tables()["TableNames"], done
-        print("   llm:", full["llm"][:120].replace("\n", " "))
+        print("   explain:", full["llm"][:160].replace("\n", " "))
+        print("   ask steps:", [(x["action"], x["args"].get("service"), x["args"].get("operation")) for x in r["steps"]])
     else:
         ddb.delete_table(TableName=t)
         assert "규칙 기반" in post("/_agent/ask", {"question": "최근 오류?"})["answer"]

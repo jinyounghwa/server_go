@@ -193,7 +193,8 @@ async fn run_tool(app: &Arc<App>, action: &str, a: &Value) -> Result<Value, Valu
     Ok(match action {
         "list_resources" => summarize_state(app, a["service"].as_str().filter(|s| !s.is_empty())),
         "recent_events" => {
-            let n = a["n"].as_u64().unwrap_or(10).min(20) as usize;
+            // The schema makes `n` required, so a model often sends 0 meaning "default".
+            let n = a["n"].as_u64().filter(|n| *n > 0).unwrap_or(10).min(20) as usize;
             let only_err = a["only_errors"] == true;
             let svc = a["service"].as_str().filter(|s| !s.is_empty());
             let r = app.recent.lock().unwrap();
@@ -208,6 +209,9 @@ async fn run_tool(app: &Arc<App>, action: &str, a: &Value) -> Result<Value, Valu
         }
         "call_api" => {
             let (svc, op) = (a["service"].as_str().unwrap_or(""), a["operation"].as_str().unwrap_or(""));
+            if svc.is_empty() || op.is_empty() {
+                return Ok(json!({"error": "service와 operation을 모두 채워라. 예: service=dynamodb, operation=DeleteTable, params={\"TableName\":\"orders\"}"}));
+            }
             let params = if a["params"].is_object() { a["params"].clone() } else { json!({}) };
             if DESTRUCTIVE.iter().any(|d| op.starts_with(d)) {
                 let token = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
@@ -220,14 +224,20 @@ async fn run_tool(app: &Arc<App>, action: &str, a: &Value) -> Result<Value, Valu
     })
 }
 
-// The model must answer with exactly this shape (Ollama structured output).
+// The model must answer with exactly this shape (Ollama structured output). Flat and fully required so a 7B
+// model can't drop a field; the enum and PascalCase pattern stop it from merging service and operation.
 fn step_schema() -> Value {
-    json!({"type": "object", "required": ["action", "args", "answer"], "properties": {
-        "action": {"type": "string", "enum": ["list_resources", "recent_events", "explain_event", "call_api", "answer"]},
-        "args": {"type": "object", "properties": {
-            "service": {"type": "string"}, "n": {"type": "integer"}, "only_errors": {"type": "boolean"}, "request_id": {"type": "string"},
-            "operation": {"type": "string"}, "params": {"type": "object"}}},
-        "answer": {"type": "string"}}})
+    json!({"type": "object",
+        "required": ["action", "service", "operation", "params", "request_id", "n", "only_errors", "answer"],
+        "properties": {
+            "action": {"type": "string", "enum": ["list_resources", "recent_events", "explain_event", "call_api", "answer"]},
+            "service": {"type": "string", "enum": ["", "dynamodb", "sqs", "ssm", "secretsmanager", "kms", "logs", "kinesis", "states"]},
+            "operation": {"type": "string", "pattern": "^([A-Z][A-Za-z0-9]+)?$"},
+            "params": {"type": "object"},
+            "request_id": {"type": "string"},
+            "n": {"type": "integer"},
+            "only_errors": {"type": "boolean"},
+            "answer": {"type": "string"}}})
 }
 
 const TOOLS: &str = "도구:\n\
@@ -236,7 +246,10 @@ const TOOLS: &str = "도구:\n\
 - explain_event {request_id}: 요청 하나의 결과 해설\n\
 - call_api {service, operation, params}: dynamodb·sqs·ssm·secretsmanager·kms·logs·kinesis·states의 API를 AWS 형식 파라미터로 호출 (예: dynamodb Scan {\"TableName\":\"t\"})\n\
 - answer: 최종 답. answer 필드에 한국어로 쓴다.\n\
-한 번에 하나의 action만 고른다. 정보가 충분하면 바로 answer를 고른다.";
+한 번에 하나의 action만 고른다. 정보가 충분하면 바로 answer를 고른다.\n\
+예시) 질문: orders 테이블 지워줘 → {\"action\":\"call_api\",\"service\":\"dynamodb\",\"operation\":\"DeleteTable\",\"params\":{\"TableName\":\"orders\"},\"request_id\":\"\",\"n\":0,\"only_errors\":false,\"answer\":\"\"}\n\
+예시) 질문: 큐 목록 → {\"action\":\"call_api\",\"service\":\"sqs\",\"operation\":\"ListQueues\",\"params\":{},\"request_id\":\"\",\"n\":0,\"only_errors\":false,\"answer\":\"\"}\n\
+삭제 같은 작업도 call_api로 요청하면 된다. 실행 전 확인은 시스템이 대신 받는다.";
 
 // Rule-based answer when the LLM is unavailable: summarize recent problems.
 fn fallback(app: &App, why: &str) -> Value {
@@ -274,12 +287,16 @@ pub async fn ask(app: &Arc<App>, question: &str, confirm: Option<&str>) -> Value
         if action == "answer" {
             return json!({"answer": step["answer"], "steps": steps, "llm": true, "model": *LLM_MODEL});
         }
-        let result = run_tool(app, action, &step["args"]).await;
+        let result = run_tool(app, action, &step).await;
         let (shown, stop) = match &result {
             Ok(v) => (v.clone(), None),
             Err(confirm) => (confirm.clone(), Some(confirm.clone())),
         };
-        steps.push(json!({"action": action, "args": step["args"], "result": clip(&shown, 600)}));
+        let mut args = step.clone();
+        if let Some(o) = args.as_object_mut() {
+            o.retain(|k, v| k != "action" && k != "answer" && !(v == "" || v == 0 || v == false || v.as_object().is_some_and(|m| m.is_empty())));
+        }
+        steps.push(json!({"action": action, "args": args, "result": clip(&shown, 600)}));
         if let Some(c) = stop {
             return json!({"answer": format!("{} {}는 되돌릴 수 없는 작업이라 실행 전에 확인이 필요합니다.", c["service"].as_str().unwrap_or(""), c["operation"].as_str().unwrap_or("")),
                           "confirm": c, "steps": steps, "llm": true});
