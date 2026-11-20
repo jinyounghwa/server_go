@@ -903,6 +903,121 @@ def test_route53():
     assert code(r53.get_hosted_zone, Id=z) == "NoSuchHostedZone"
 
 
+CFN_TEMPLATE = """
+Parameters:
+  Env: {Type: String, Default: dev, AllowedValues: [dev, prod]}
+Conditions:
+  IsProd: !Equals [!Ref Env, prod]
+Mappings:
+  Sizes: {dev: {Timeout: "5"}, prod: {Timeout: "30"}}
+Resources:
+  Table:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      KeySchema: [{AttributeName: id, KeyType: HASH}]
+      AttributeDefinitions: [{AttributeName: id, AttributeType: S}]
+  Dlq:
+    Type: AWS::SQS::Queue
+  Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: !FindInMap [Sizes, !Ref Env, Timeout]
+      RedrivePolicy: {deadLetterTargetArn: !GetAtt Dlq.Arn, maxReceiveCount: 3}
+  Topic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription: [{Protocol: sqs, Endpoint: !GetAtt Queue.Arn}]
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]
+      Policies:
+        - PolicyName: ddb
+          PolicyDocument:
+            Statement: [{Effect: Allow, Action: dynamodb:PutItem, Resource: !GetAtt Table.Arn}]
+  Fn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt Role.Arn
+      Environment: {Variables: {TABLE: !Ref Table, ENV: !Ref Env}}
+      Code:
+        ZipFile: |
+          import os
+          def handler(event, ctx):
+              return {"table": os.environ["TABLE"], "env": os.environ["ENV"]}
+  Param:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/queue"
+      Type: String
+      Value: !Ref Queue
+  Secret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      GenerateSecretString: {SecretStringTemplate: '{"user": "app"}', GenerateStringKey: password, PasswordLength: 20}
+  ProdOnly:
+    Type: AWS::S3::Bucket
+    Condition: IsProd
+Outputs:
+  QueueUrl: {Value: !Ref Queue}
+  FnArn: {Value: !GetAtt Fn.Arn}
+  TableName: {Value: !Ref Table}
+  Label: {Value: !Join ["-", [!Ref "AWS::StackName", !Ref Env]]}
+"""
+
+
+def test_cloudformation():
+    cf, lam, sns, ssm, sm = (boto3.client(n, **kw) for n in ("cloudformation", "lambda", "sns", "ssm", "secretsmanager"))
+    name = f"app{run}"
+
+    def wait(target, stack=name):
+        for _ in range(200):
+            st = cf.describe_stacks(StackName=stack)["Stacks"][0]
+            if not st["StackStatus"].endswith("_IN_PROGRESS"):
+                assert st["StackStatus"] == target, (st["StackStatus"], st.get("StackStatusReason"))
+                return st
+            time.sleep(0.1)
+        raise AssertionError("stack never settled")
+
+    cf.create_stack(StackName=name, TemplateBody=CFN_TEMPLATE)
+    st = wait("CREATE_COMPLETE")
+    out = {o["OutputKey"]: o["OutputValue"] for o in st["Outputs"]}
+    assert out["Label"] == f"{name}-dev"
+    res = {r["LogicalResourceId"]: r for r in cf.describe_stack_resources(StackName=name)["StackResources"]}
+    assert set(res) == {"Table", "Dlq", "Queue", "Topic", "Role", "Fn", "Param", "Secret"}, set(res)  # ProdOnly skipped by condition
+    assert sqs.get_queue_attributes(QueueUrl=out["QueueUrl"], AttributeNames=["VisibilityTimeout"])["Attributes"]["VisibilityTimeout"] == "5"
+    sns.publish(TopicArn=res["Topic"]["PhysicalResourceId"], Message="via-stack")
+    assert "via-stack" in sqs.receive_message(QueueUrl=out["QueueUrl"])["Messages"][0]["Body"]
+    assert json.loads(lam.invoke(FunctionName=out["FnArn"])["Payload"].read()) == {"table": out["TableName"], "env": "dev"}
+    assert ssm.get_parameter(Name=f"/{name}/queue")["Parameter"]["Value"] == out["QueueUrl"]
+    secret = json.loads(sm.get_secret_value(SecretId=res["Secret"]["PhysicalResourceId"])["SecretString"])
+    assert secret["user"] == "app" and len(secret["password"]) == 20
+
+    cf.update_stack(StackName=name, UsePreviousTemplate=True, Parameters=[{"ParameterKey": "Env", "ParameterValue": "prod"}])
+    st = wait("UPDATE_COMPLETE")
+    res2 = {r["LogicalResourceId"]: r for r in cf.describe_stack_resources(StackName=name)["StackResources"]}
+    assert "ProdOnly" in res2 and res2["Table"]["PhysicalResourceId"] == res["Table"]["PhysicalResourceId"]  # unchanged → kept
+    q2 = {o["OutputKey"]: o["OutputValue"] for o in st["Outputs"]}["QueueUrl"]
+    assert sqs.get_queue_attributes(QueueUrl=q2, AttributeNames=["VisibilityTimeout"])["Attributes"]["VisibilityTimeout"] == "30"
+    assert code(cf.update_stack, StackName=name, UsePreviousTemplate=True, Parameters=[{"ParameterKey": "Env", "ParameterValue": "prod"}]) == "ValidationError"
+
+    bad = f"bad{run}"
+    cf.create_stack(StackName=bad, TemplateBody="Resources:\n  Q: {Type: AWS::SQS::Queue}\n  X: {Type: AWS::Nope::Thing, DependsOn: Q}\n")
+    st = wait("ROLLBACK_COMPLETE", bad)
+    assert "not supported" in st["StackStatusReason"]
+    assert not [u for u in sqs.list_queues().get("QueueUrls", []) if f"{bad}-Q-" in u], "rollback removes created resources"
+    cf.delete_stack(StackName=bad)
+
+    cf.delete_stack(StackName=name)
+    cf.get_waiter("stack_delete_complete").wait(StackName=name, WaiterConfig={"Delay": 1})
+    assert code(ddb.describe_table, TableName=out["TableName"]) == "ResourceNotFoundException"
+    assert code(cf.describe_stacks, StackName=name) == "ValidationError"
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

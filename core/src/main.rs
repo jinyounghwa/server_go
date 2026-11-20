@@ -1,5 +1,6 @@
 mod apigw;
 mod cognito;
+mod cfn;
 mod ddb;
 mod ecs;
 mod elb;
@@ -53,6 +54,7 @@ pub fn endpoint() -> String {
 // ENFORCE_IAM=1 rejects denied requests; otherwise decisions are only reported in events.
 static ENFORCE: LazyLock<bool> = LazyLock::new(|| std::env::var("ENFORCE_IAM").is_ok_and(|v| v == "1"));
 
+#[derive(Debug)]
 pub struct ApiErr {
     pub status: u16,
     pub code: String,
@@ -109,6 +111,7 @@ pub struct App {
     pub ecs: Mutex<ecs::Ecs>,
     pub elb: Mutex<elb::Elb>,
     pub route53: Mutex<route53::Route53>,
+    pub cfn: Mutex<cfn::Cfn>,
     chaos: Mutex<Vec<Value>>,
     events: broadcast::Sender<String>,
 }
@@ -162,6 +165,7 @@ const SNS_NS: &str = "http://sns.amazonaws.com/doc/2010-03-31/";
 const SES_NS: &str = "http://ses.amazonaws.com/doc/2010-12-01/";
 const RDS_NS: &str = "http://rds.amazonaws.com/doc/2014-10-31/";
 const CACHE_NS: &str = "http://elasticache.amazonaws.com/doc/2015-02-02/";
+const CFN_NS: &str = "http://cloudformation.amazonaws.com/doc/2010-05-15/";
 const ELB_NS: &str = "http://elasticloadbalancing.amazonaws.com/doc/2015-12-01/";
 
 fn query_reply(ns: &str, action: &str, rid: &str, r: Result<Value, ApiErr>) -> Response {
@@ -202,6 +206,7 @@ const COGNITO_PUBLIC: &[&str] = &["SignUp", "ConfirmSignUp", "InitiateAuth", "Re
     "ConfirmForgotPassword", "GetUser", "ChangePassword", "GlobalSignOut"];
 
 enum Svc {
+    Cfn(HashMap<String, String>),
     R53(String, String), // method, path after /2013-04-01/
     Elb(HashMap<String, String>),
     Rds(HashMap<String, String>),
@@ -227,6 +232,7 @@ fn arn(svc: &str, rest: &str) -> String {
 fn checks(app: &App, svc: &Svc, body: &[u8]) -> Vec<(String, String)> {
     let j: Value = serde_json::from_slice(body).unwrap_or_default();
     match svc {
+        Svc::Cfn(q) => vec![(format!("cloudformation:{}", q.get("Action").map_or("", String::as_str)), "*".into())],
         Svc::R53(m, path) => vec![(format!("route53:{m} {}", path.split('/').next().unwrap_or("")), "*".into())],
         Svc::Elb(q) => vec![(format!("elasticloadbalancing:{}", q.get("Action").map_or("", String::as_str)), "*".into())],
         Svc::Rds(q) => vec![(format!("rds:{}", q.get("Action").map_or("", String::as_str)),
@@ -330,6 +336,8 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
         let version = q.get("Version").cloned().unwrap_or_default();
         if scope == "ec2" || version == "2016-11-15" {
             Svc::Ec2(q)
+        } else if scope == "cloudformation" || version == "2010-05-15" {
+            Svc::Cfn(q)
         } else if scope == "elasticloadbalancing" || version == "2015-12-01" {
             Svc::Elb(q)
         } else if scope == "rds" || version == "2014-10-31" {
@@ -347,6 +355,7 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
         Svc::S3(s3::classify(&method, &uri, &headers))
     };
     let (service, op) = match &svc {
+        Svc::Cfn(q) => ("cloudformation", q.get("Action").cloned().unwrap_or_default()),
         Svc::R53(m, path) => ("route53", format!("{m} /{}", path.split('/').filter(|p| !p.starts_with('Z') && !p.starts_with('C')).collect::<Vec<_>>().join("/"))),
         Svc::Elb(q) => ("elbv2", q.get("Action").cloned().unwrap_or_default()),
         Svc::Rds(q) => ("rds", q.get("Action").cloned().unwrap_or_default()),
@@ -396,6 +405,17 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
     let fault = denied.or(chaos.as_ref().and_then(|(_, e)| e.as_ref().map(|e| ApiErr { status: e.status, code: e.code.clone(), msg: e.msg.clone(), extra: None })));
 
     let mut resp = match (svc, fault) {
+        (Svc::Cfn(_), Some(e)) => query_reply(CFN_NS, &op, &rid, Err(e)),
+        (Svc::Cfn(q), None) => {
+            let r = app.cfn.lock().unwrap().handle(&q);
+            let r = r.map(|(v, job)| {
+                if let Some(j) = job {
+                    tokio::spawn(cfn::run(app.clone(), j));
+                }
+                v
+            });
+            query_reply(CFN_NS, &op, &rid, r)
+        }
         (Svc::R53(m, path), fault) => {
             let r = match fault {
                 Some(e) => Err(e),
@@ -715,6 +735,7 @@ async fn state(State(app): State<Arc<App>>) -> Json<Value> {
         "ecs": app.ecs.lock().unwrap().admin(),
         "elb": app.elb.lock().unwrap().admin(),
         "route53": app.route53.lock().unwrap().admin(),
+        "cfn": app.cfn.lock().unwrap().admin(),
         "secrets": app.secrets.lock().unwrap().admin(),
         "ssm": app.ssm.lock().unwrap().admin(),
         "kms": app.kms.lock().unwrap().admin(),
@@ -749,6 +770,7 @@ async fn reset(State(app): State<Arc<App>>, h: HeaderMap) -> axum::http::StatusC
     elb::close_all(&app);
     *app.elb.lock().unwrap() = Default::default();
     *app.route53.lock().unwrap() = Default::default();
+    *app.cfn.lock().unwrap() = Default::default();
     tokio::spawn(managed::cleanup());
     route53::serve_dns(app.clone());
     let _ = app.events.send(json!({"ts": chrono::Utc::now().to_rfc3339(), "service": "admin", "op": "Reset", "status": 200}).to_string());
@@ -811,6 +833,7 @@ async fn main() {
         ecs: Default::default(),
         elb: Default::default(),
         route53: Default::default(),
+        cfn: Default::default(),
         chaos: Default::default(),
         events: broadcast::channel(1024).0,
     });

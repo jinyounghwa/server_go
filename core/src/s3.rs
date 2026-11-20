@@ -506,6 +506,9 @@ fn notify(st: &mut Store, b: &str, event: &str, key: &str, size: usize, etag: &s
 }
 
 impl Store {
+    pub fn object(&self, b: &str, k: &str) -> Option<Bytes> {
+        self.buckets.get(b)?.objs.get(k).map(|o| o.data.clone())
+    }
     pub fn take_notes(&mut self) -> Vec<Note> {
         std::mem::take(&mut self.pending)
     }

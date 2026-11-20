@@ -36,6 +36,7 @@ ENFORCE_IAM=1 cargo run --release & uv run --with boto3 --with "pyjwt[crypto]" -
 | ECS | Clusters, task definitions (revisions), RunTask/StopTask as Docker containers with port mappings, env, overrides, task-role credentials, awslogs → CloudWatch Logs; services keep desiredCount and register with ALB target groups |
 | ELB v2 (ALB) | Load balancers, target groups, listeners that really listen on 127.0.0.1:{Port} (>= 1024) and round-robin connections to healthy targets, fixed responses, target health |
 | Route 53 | Hosted zones, record sets (CREATE/UPSERT/DELETE, aliases, wildcards), plus a DNS server on 127.0.0.1:10053/udp (`RC_DNS_PORT`) answering A/AAAA/CNAME/TXT |
+| CloudFormation | JSON/YAML templates (short tags), Parameters, Conditions, Mappings, Ref/GetAtt/Sub/Join/Select/Split/If/FindInMap/GetAZs/Base64, dependency order, Outputs, create/update (unchanged resources kept, changed ones replaced)/delete with rollback; resources: S3 bucket, SQS queue, SNS topic/subscription, DynamoDB table, IAM role/policy/managed policy, Lambda function (inline or S3 code)/permission/event source mapping, Logs group, SSM parameter, Secrets Manager secret, KMS key/alias, EventBridge rule, Step Functions state machine |
 | EC2 (network) | VPCs, subnets, internet gateways, route tables, security groups, instances (records only), DescribeAvailabilityZones |
 
 ## IAM enforcement
