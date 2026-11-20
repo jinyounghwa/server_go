@@ -8,8 +8,35 @@ A local, in-memory emulator for the cloud APIs your app actually uses. Point an 
 ```sh
 cd core && cargo run --release        # emulator on 127.0.0.1:4566 (BIND, REGION env vars)
 cd gui && cargo run                   # desktop window (Tauri), or open http://127.0.0.1:4566/_ui
-ENFORCE_IAM=1 cargo run --release & uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with redis --with dnspython tests/sdk_test.py
 ```
+
+### Docker
+
+```sh
+docker build -t rocalcloud .
+docker run --rm -p 127.0.0.1:4566:4566 -e ENFORCE_IAM=1 rocalcloud
+```
+
+### Compatibility test suites (Python · JS · Rust)
+
+Start the server with `ENFORCE_IAM=1`, then run any of the official SDK suites:
+
+```sh
+# Python (boto3) — full 24-suite integration test
+uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with redis --with dnspython tests/sdk_test.py
+
+# JavaScript (@aws-sdk v3)
+cd tests/js && npm install && npm test
+
+# Rust (aws-sdk-rust)
+cd tests/rust && cargo run
+```
+
+### Packaging
+
+- **GitHub Releases**: Pushing a `v*` tag builds macOS (arm64/x86_64) and Linux (x86_64) release binaries via `.github/workflows/release.yml`.
+- **Homebrew**: Formula template is in [packaging/homebrew/rocalcloud.rb](packaging/homebrew/rocalcloud.rb).
+- **Contributing**: See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Supported
 
@@ -85,13 +112,27 @@ resources. In the GUI, click a log row to explain it, or use the question box.
 LLM calls are serialized, spaced at least 1.5 s apart and kept short. If Ollama runs on another machine, tunnel it:
 `ssh -f -N -L 11434:127.0.0.1:11434 <host>`.
 
+## Verification agent (inspector)
+
+`POST /_inspect/run` (header `x-rocalcloud`) runs deterministic security, chaos, incident, performance, fuzzing, and
+regression scenarios against `127.0.0.1` only: IAM implicit/explicit deny, CSRF header enforcement, S3 path traversal,
+missing/malformed SigV4, >256 MiB payload rejection (413), injection payloads, chaos throttle/5xx recovery, SQS DLQ
+buildup, Lambda repeated failures, 40-request concurrent burst, and 15 malformed fuzz inputs.
+
+Set `{"use_llm": true}` to let the local LLM propose additional non-destructive scenarios (executed and judged by
+deterministic code). Reports can be exported via `GET /_inspect/report/{id}?format=md` or `?format=html`, failed cases
+can be saved to `tests/regressions/*.json`, and single scenarios can be replayed with `POST /_inspect/replay`. In the
+GUI click **검사**; in `/_town` an inspector character patrols the town and shows guard-block (`🛡`) or breach (`⚠`)
+animations.
+
 ## Built-in endpoints
 
 - `GET /_events` — Server-Sent Events, one JSON event per request
-- `GET /_ui` — GUI page
+- `GET /_ui` — GUI page (resource explorer, live log, explanation agent, inspector)
 - `GET /_town` — character town
 - `GET /_agent/status`, `POST /_agent/explain`, `POST /_agent/ask`, `GET /_agent/template` — explanation agent
-- `GET /_admin/state`, `POST /_admin/reset` (needs header `x-rocalcloud`)
+- `POST /_inspect/run`, `GET /_inspect/reports`, `GET /_inspect/report/{id}`, `POST /_inspect/replay` — verification agent
+- `GET /_admin/state`, `POST /_admin/reset`, `GET/POST /_admin/chaos` (POSTs need header `x-rocalcloud`)
 - `GET /_admin/reach?from=internet|<instance-id>&to=...&protocol=tcp&port=443` — step-by-step reachability
   (route table → internet gateway, public IP, security group rules). NACLs, peering and NAT are not modeled yet.
 

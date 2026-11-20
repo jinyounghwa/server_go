@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      - name: Unit tests & release build
+        working-directory: core
+        run: |
+          cargo test
+          cargo build --release
+
+      - name: Setup uv & Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Run Python (boto3) + JS (@aws-sdk v3) compatibility suites
+        run: |
+          ENFORCE_IAM=1 ./core/target/release/rocalcloud >/tmp/rocalcloud.log 2>&1 &
+          PID=$!
+          trap 'kill $PID 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:4566/_admin/state >/dev/null && break
+            sleep 0.2
+          done
+          uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with redis --with dnspython tests/sdk_test.py
+          (cd tests/js && npm install --no-audit --no-fund && npm test)
