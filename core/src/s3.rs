@@ -20,6 +20,23 @@ pub struct Obj {
 pub struct Bucket {
     created: DateTime<Utc>,
     objs: BTreeMap<String, Obj>,
+    notif: Vec<Notif>,
+    notif_xml: String,
+}
+// One bucket notification target (QueueConfiguration / TopicConfiguration / CloudFunctionConfiguration).
+struct Notif {
+    id: String,
+    kind: &'static str,
+    target: String,
+    events: Vec<String>,
+    prefix: String,
+    suffix: String,
+}
+// A notification waiting to be delivered by main (which owns the other services).
+pub struct Note {
+    pub kind: &'static str, // sqs | sns | lambda
+    pub target: String,
+    pub body: String,
 }
 struct Upload {
     bucket: String,
@@ -32,12 +49,13 @@ struct Upload {
 pub struct Store {
     buckets: BTreeMap<String, Bucket>,
     uploads: HashMap<String, Upload>,
+    pending: Vec<Note>,
 }
 
 const NS: &str = r#" xmlns="http://s3.amazonaws.com/doc/2006-03-01/""#;
 // Sub-resources we don't emulate yet: answer 501 instead of pretending.
 const UNSUPPORTED: &[&str] = &[
-    "acl", "policy", "tagging", "versioning", "versions", "cors", "lifecycle", "website", "notification",
+    "acl", "policy", "tagging", "versioning", "versions", "cors", "lifecycle", "website",
     "encryption", "logging", "replication", "location", "ownershipControls", "publicAccessBlock",
     "object-lock", "legal-hold", "retention", "attributes", "accelerate", "requestPayment", "torrent",
 ];
@@ -63,7 +81,7 @@ fn no_bucket() -> Response {
 fn no_key() -> Response {
     fail(404, "NoSuchKey", "The specified key does not exist.")
 }
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 fn unesc(s: &str) -> String {
@@ -145,7 +163,39 @@ fn obj_headers(o: &Obj, status: u16, len: usize) -> Builder {
     r
 }
 
-pub fn handle(app: &App, m: &Method, uri: &Uri, h: &HeaderMap, body: Bytes) -> (&'static str, Response) {
+pub struct Req {
+    pub op: &'static str,
+    pub bucket: String,
+    pub key: String,
+    q: HashMap<String, String>,
+}
+
+impl Req {
+    // IAM action and resource ARN this request is checked against.
+    pub fn iam(&self) -> (&'static str, String) {
+        let action = match self.op {
+            "ListBuckets" => "s3:ListAllMyBuckets",
+            "HeadBucket" | "ListObjects" | "ListObjectsV2" => "s3:ListBucket",
+            "HeadObject" | "GetObject" => "s3:GetObject",
+            "DeleteObjects" | "DeleteObject" => "s3:DeleteObject",
+            "CopyObject" | "CreateMultipartUpload" | "UploadPart" | "CompleteMultipartUpload" | "PutObject" => "s3:PutObject",
+            "AbortMultipartUpload" => "s3:AbortMultipartUpload",
+            "CreateBucket" => "s3:CreateBucket",
+            "PutBucketNotificationConfiguration" => "s3:PutBucketNotification",
+            "GetBucketNotificationConfiguration" => "s3:GetBucketNotification",
+            "DeleteBucket" => "s3:DeleteBucket",
+            _ => "s3:Unsupported",
+        };
+        let res = match (self.bucket.is_empty(), self.key.is_empty() || action == "s3:ListBucket") {
+            (true, _) => "*".to_string(),
+            (false, true) => format!("arn:aws:s3:::{}", self.bucket),
+            (false, false) => format!("arn:aws:s3:::{}/{}", self.bucket, self.key),
+        };
+        (action, res)
+    }
+}
+
+pub fn classify(m: &Method, uri: &Uri, h: &HeaderMap) -> Req {
     let q: HashMap<String, String> = uri
         .query()
         .unwrap_or("")
@@ -171,6 +221,8 @@ pub fn handle(app: &App, m: &Method, uri: &Uri, h: &HeaderMap, body: Bytes) -> (
         _ if UNSUPPORTED.iter().any(|k| has(k)) => "Unsupported",
         ("GET", true, _) => "ListBuckets",
         (_, true, _) => "Unsupported",
+        ("PUT", _, true) if has("notification") => "PutBucketNotificationConfiguration",
+        ("GET", _, true) if has("notification") => "GetBucketNotificationConfiguration",
         ("PUT", _, true) => "CreateBucket",
         ("HEAD", _, true) => "HeadBucket",
         ("DELETE", _, true) => "DeleteBucket",
@@ -188,10 +240,17 @@ pub fn handle(app: &App, m: &Method, uri: &Uri, h: &HeaderMap, body: Bytes) -> (
         ("DELETE", _, false) => "DeleteObject",
         _ => "Unsupported",
     };
+    Req { op, bucket, key, q }
+}
+
+pub fn handle(app: &App, r: &Req, h: &HeaderMap, body: Bytes) -> Response {
     let body = dechunk(h, body);
     let mut st = app.s3.lock().unwrap();
-    let r = exec(&mut st, op, &bucket, &key, &q, h, body).unwrap_or_else(|e| e);
-    (op, r)
+    exec(&mut st, r.op, &r.bucket, &r.key, &r.q, h, body).unwrap_or_else(|e| e)
+}
+
+pub fn error(e: &crate::ApiErr) -> Response {
+    fail(e.status, &e.code, &e.msg)
 }
 
 fn exec(
@@ -217,7 +276,7 @@ fn exec(
             if st.buckets.contains_key(b) {
                 return Err(fail(409, "BucketAlreadyOwnedByYou", "Your previous request to create the named bucket succeeded and you already own it."));
             }
-            st.buckets.insert(b.into(), Bucket { created: Utc::now(), objs: BTreeMap::new() });
+            st.buckets.insert(b.into(), Bucket { created: Utc::now(), objs: BTreeMap::new(), notif: vec![], notif_xml: String::new() });
             resp(200).header("location", format!("/{b}")).body(Body::empty()).unwrap()
         }
         "HeadBucket" => {
@@ -287,17 +346,22 @@ fn exec(
         "DeleteObjects" => {
             let bk = st.buckets.get_mut(b).ok_or_else(no_bucket)?;
             let mut out = String::new();
-            for key in tags(&String::from_utf8_lossy(&body), "Key") {
-                bk.objs.remove(&key);
-                out += &format!("<Deleted><Key>{}</Key></Deleted>", esc(&key));
+            let keys = tags(&String::from_utf8_lossy(&body), "Key");
+            for key in &keys {
+                bk.objs.remove(key);
+                out += &format!("<Deleted><Key>{}</Key></Deleted>", esc(key));
+            }
+            for key in &keys {
+                notify(st, b, "ObjectRemoved:Delete", key, 0, "");
             }
             xml(200, format!("<DeleteResult{NS}>{out}</DeleteResult>"))
         }
         "PutObject" => {
             let bk = st.buckets.get_mut(b).ok_or_else(no_bucket)?;
             let o = Obj { etag: etag_of(&body), data: body, ctype: ctype(), modified: Utc::now(), meta: meta_from(h) };
-            let etag = o.etag.clone();
+            let (etag, size) = (o.etag.clone(), o.data.len());
             bk.objs.insert(k.into(), o);
+            notify(st, b, "ObjectCreated:Put", k, size, &etag);
             resp(200).header("etag", etag).body(Body::empty()).unwrap()
         }
         "CopyObject" => {
@@ -311,7 +375,9 @@ fn exec(
             }
             let bk = st.buckets.get_mut(b).ok_or_else(no_bucket)?;
             let x = format!("<CopyObjectResult><ETag>{}</ETag><LastModified>{}</LastModified></CopyObjectResult>", esc(&o.etag), iso(&o.modified));
+            let (etag, size) = (o.etag.clone(), o.data.len());
             bk.objs.insert(k.into(), o);
+            notify(st, b, "ObjectCreated:Copy", k, size, &etag);
             xml(200, x)
         }
         "GetObject" | "HeadObject" => {
@@ -341,6 +407,7 @@ fn exec(
         }
         "DeleteObject" => {
             st.buckets.get_mut(b).ok_or_else(no_bucket)?.objs.remove(k);
+            notify(st, b, "ObjectRemoved:Delete", k, 0, "");
             empty(204)
         }
         "CreateMultipartUpload" => {
@@ -372,8 +439,22 @@ fn exec(
             let up = st.uploads.remove(id).unwrap();
             let etag = format!("\"{:x}-{}\"", Md5::digest(&digests), nums.len());
             let bk = st.buckets.get_mut(&up.bucket).ok_or_else(no_bucket)?;
+            let size = data.len();
             bk.objs.insert(up.key.clone(), Obj { data: data.into(), etag: etag.clone(), ctype: up.ctype, modified: Utc::now(), meta: up.meta });
+            notify(st, &up.bucket, "ObjectCreated:CompleteMultipartUpload", &up.key, size, &etag);
             xml(200, format!("<CompleteMultipartUploadResult{NS}><Location>/{0}/{1}</Location><Bucket>{0}</Bucket><Key>{1}</Key><ETag>{2}</ETag></CompleteMultipartUploadResult>", esc(&up.bucket), esc(&up.key), esc(&etag)))
+        }
+        "PutBucketNotificationConfiguration" => {
+            let bk = st.buckets.get_mut(b).ok_or_else(no_bucket)?;
+            let x = String::from_utf8_lossy(&body).to_string();
+            bk.notif = parse_notif(&x);
+            bk.notif_xml = x;
+            empty(200)
+        }
+        "GetBucketNotificationConfiguration" => {
+            let bk = st.buckets.get(b).ok_or_else(no_bucket)?;
+            let x = if bk.notif_xml.is_empty() { format!("<NotificationConfiguration{NS}/>") } else { bk.notif_xml.clone() };
+            resp(200).header("content-type", "application/xml").body(Body::from(x)).unwrap()
         }
         "AbortMultipartUpload" => {
             st.uploads.remove(&q["uploadId"]).ok_or_else(no_upload)?;
@@ -381,6 +462,53 @@ fn exec(
         }
         _ => fail(501, "NotImplemented", "This S3 operation is not supported yet"),
     })
+}
+
+// ponytail: destinations are not validated when the configuration is saved.
+fn parse_notif(x: &str) -> Vec<Notif> {
+    let mut out = vec![];
+    for (block, tgt, kind) in [("QueueConfiguration", "Queue", "sqs"), ("TopicConfiguration", "Topic", "sns"), ("CloudFunctionConfiguration", "CloudFunction", "lambda")] {
+        for c in tags(x, block) {
+            let rules: Vec<(String, String)> = tags(&c, "FilterRule").iter()
+                .map(|r| (tags(r, "Name").concat().to_lowercase(), tags(r, "Value").concat())).collect();
+            let rule = |n: &str| rules.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone()).unwrap_or_default();
+            out.push(Notif {
+                id: tags(&c, "Id").pop().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                kind,
+                target: tags(&c, tgt).concat(),
+                events: tags(&c, "Event"),
+                prefix: rule("prefix"),
+                suffix: rule("suffix"),
+            });
+        }
+    }
+    out
+}
+
+// Queue an S3 event record for every matching notification on the bucket.
+fn notify(st: &mut Store, b: &str, event: &str, key: &str, size: usize, etag: &str) {
+    let Some(bk) = st.buckets.get(b) else { return };
+    for n in &bk.notif {
+        let hit = n.events.iter().any(|e| crate::iam::glob(e, &format!("s3:{event}"), false));
+        if !hit || !key.starts_with(&n.prefix) || !key.ends_with(&n.suffix) {
+            continue;
+        }
+        let enc_key = crate::iam::pct_encode(key).replace("%2F", "/").replace("%20", "+");
+        let rec = serde_json::json!({"Records": [{
+            "eventVersion": "2.1", "eventSource": "aws:s3", "awsRegion": crate::REGION.as_str(), "eventTime": iso(&Utc::now()),
+            "eventName": event, "userIdentity": {"principalId": "local"}, "requestParameters": {"sourceIPAddress": "127.0.0.1"},
+            "responseElements": {"x-amz-request-id": "local"},
+            "s3": {"s3SchemaVersion": "1.0", "configurationId": n.id,
+                   "bucket": {"name": b, "ownerIdentity": {"principalId": "local"}, "arn": format!("arn:aws:s3:::{b}")},
+                   "object": {"key": enc_key, "size": size, "eTag": etag.trim_matches('"'), "sequencer": format!("{:016X}", crate::now_ms())}}}]});
+        st.pending.push(Note { kind: n.kind, target: n.target.clone(), body: rec.to_string() });
+    }
+}
+
+impl Store {
+    pub fn take_notes(&mut self) -> Vec<Note> {
+        std::mem::take(&mut self.pending)
+    }
 }
 
 fn no_upload() -> Response {

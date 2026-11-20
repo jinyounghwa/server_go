@@ -242,6 +242,23 @@ fn call(qs: &mut Queues, op: &str, r: &Value, host: &str) -> Result<Value, ApiEr
 }
 
 impl Queues {
+    // Delivery from another service (SNS, S3 notifications). False if the queue is gone.
+    // Receive for an event source mapping, shaped as Lambda SQS records.
+    pub fn receive_batch(&mut self, name: &str, max: u64) -> Vec<Value> {
+        let r = call(self, "ReceiveMessage", &json!({"QueueUrl": name, "MaxNumberOfMessages": max, "AttributeNames": ["All"]}), "local");
+        r.ok().and_then(|v| v["Messages"].as_array().cloned()).unwrap_or_default().into_iter().map(|m| json!({
+            "messageId": m["MessageId"], "receiptHandle": m["ReceiptHandle"], "body": m["Body"], "md5OfBody": m["MD5OfBody"],
+            "attributes": m["Attributes"], "messageAttributes": {}})).collect()
+    }
+    pub fn delete_receipt(&mut self, name: &str, receipt: &str) {
+        if let Some(q) = self.q.get_mut(name) {
+            q.msgs.retain(|m| m.receipt.as_deref() != Some(receipt));
+        }
+    }
+    pub fn deliver(&mut self, name: &str, body: String) -> bool {
+        self.q.get_mut(name).is_some_and(|q| send(q, &json!({ "MessageBody": body })).is_ok())
+    }
+
     // GUI view: every queue with counts and up to 100 messages (peek, no receive).
     pub fn admin(&self) -> Value {
         let now = Instant::now();

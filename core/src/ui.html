@@ -40,7 +40,7 @@ nav .empty { padding: 2px 16px; color: var(--muted); font-size: 12px; }
 table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
 th, td { text-align: left; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
 th { font-weight: 600; color: var(--muted); font-size: 12px; position: sticky; top: 0; background: var(--bg); }
-td.v { font-family: ui-monospace, Menlo, monospace; font-size: 12px; max-width: 420px; overflow-wrap: anywhere; }
+td.v { font-family: ui-monospace, Menlo, monospace; font-size: 12px; max-width: 420px; overflow-wrap: anywhere; white-space: pre-line; }
 section#log { border-top: 1px solid var(--line); display: grid; grid-template-rows: 36px 1fr; min-height: 0; background: var(--panel); }
 .logbar { display: flex; align-items: center; gap: 12px; padding: 0 16px; border-bottom: 1px solid var(--line); }
 .logbar input[type=search] { font: inherit; padding: 3px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); width: 220px; }
@@ -50,6 +50,17 @@ section#log { border-top: 1px solid var(--line); display: grid; grid-template-ro
 .svc.dynamodb { color: var(--ddb); } .svc.s3 { color: var(--s3); } .svc.sqs { color: var(--sqs); } .svc.admin { color: var(--admin); }
 .st2 { color: var(--ok); } .st4 { color: var(--warn); } .st5 { color: var(--bad); }
 .hint { color: var(--muted); padding: 40px 0; text-align: center; }
+h4 { margin: 20px 0 6px; font-size: 13px; }
+pre { margin: 4px 0 10px; padding: 8px 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; font-size: 12px; overflow: auto; }
+.reach { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0 10px; }
+.reach select, .reach input { font: inherit; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); }
+.reach input { width: 80px; }
+.hop { padding: 3px 0; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+.hop.ok::before { content: "✓ "; color: var(--ok); } .hop.no::before { content: "✗ "; color: var(--bad); }
+.verdict { font-weight: 600; margin: 6px 0; } .verdict.ok { color: var(--ok); } .verdict.no { color: var(--bad); }
+.deny { color: var(--bad); } .allow { color: var(--ok); }
+.svc.iam, .svc.sts, .svc.kms, .svc.secretsmanager { color: var(--warn); } .svc.ec2, .svc.ssm { color: var(--accent); }
+.svc.sns, .svc.logs { color: var(--sqs); } .svc.lambda { color: var(--ddb); }
 </style>
 </head>
 <body>
@@ -73,12 +84,18 @@ section#log { border-top: 1px solid var(--line); display: grid; grid-template-ro
     <span class="spacer"></span>
     <button id="clear">지우기</button>
   </div>
-  <div id="logwrap"><table><thead><tr><th>시각</th><th>서비스</th><th>작업</th><th>상태</th><th>ms</th><th>요청 ID</th></tr></thead><tbody id="logbody"></tbody></table></div>
+  <div id="logwrap"><table><thead><tr><th>시각</th><th>서비스</th><th>작업</th><th>상태</th><th>권한</th><th>ms</th><th>주체</th></tr></thead><tbody id="logbody"></tbody></table></div>
 </section>
 <script>
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-let state = {dynamodb: [], s3: [], sqs: []}, sel = null, count = 0;
+let state = {dynamodb: [], s3: [], sqs: [], iam: {users: [], roles: [], policies: []}, vpc: []}, sel = null, count = 0;
+const reachForm = {from: "internet", to: "", protocol: "tcp", port: "443", result: null};
+// Services whose admin view is {name, count, sub, cols, rows} render with one generic table.
+const GENERIC = [["sns", "SNS 토픽"], ["secrets", "Secrets Manager"], ["ssm", "SSM 파라미터"], ["kms", "KMS 키"], ["logs", "CloudWatch 로그 그룹"], ["lambda", "Lambda 함수"], ["events", "EventBridge 규칙"]];
+const lists = () => Object.assign({dynamodb: state.dynamodb, s3: state.s3, sqs: state.sqs, iamuser: state.iam.users, iamrole: state.iam.roles, vpc: state.vpc},
+  Object.fromEntries(GENERIC.map(([k]) => [k, state[k] || []])));
+const policyCount = r => r.attached.length + Object.keys(r.inline).length;
 const events = [];
 const MAX_LOG = 500;
 
@@ -93,11 +110,14 @@ function av(v) {
 }
 
 function renderNav() {
-  const sec = (svc, title, list) => `<h3>${title}</h3>` + (list.length
-    ? list.map(r => `<a data-svc="${svc}" data-name="${esc(r.name)}" class="${sel && sel.svc === svc && sel.name === r.name ? "sel" : ""}">
-        <span>${esc(r.name)}</span><span class="muted">${r.count}</span></a>`).join("")
+  const L = lists();
+  const sec = (svc, title) => `<h3>${title}</h3>` + (L[svc].length
+    ? L[svc].map(r => `<a data-svc="${svc}" data-name="${esc(r.name)}" class="${sel && sel.svc === svc && sel.name === r.name ? "sel" : ""}">
+        <span>${esc(r.name)}</span><span class="muted">${r.count ?? policyCount(r)}</span></a>`).join("")
     : `<div class="empty">없음</div>`);
-  $("nav").innerHTML = sec("dynamodb", "DynamoDB 테이블", state.dynamodb) + sec("s3", "S3 버킷", state.s3) + sec("sqs", "SQS 큐", state.sqs);
+  $("nav").innerHTML = sec("dynamodb", "DynamoDB 테이블") + sec("s3", "S3 버킷") + sec("sqs", "SQS 큐")
+    + GENERIC.map(([k, t]) => sec(k, t)).join("")
+    + sec("iamuser", "IAM 사용자") + sec("iamrole", "IAM 역할") + sec("vpc", "VPC");
 }
 
 function table(cols, rows) {
@@ -107,7 +127,7 @@ function table(cols, rows) {
 }
 
 function renderDetail() {
-  const r = sel && (state[sel.svc] || []).find(x => x.name === sel.name);
+  const r = sel && (lists()[sel.svc] || []).find(x => x.name === sel.name);
   if (!r) { $("detail").innerHTML = `<div class="hint">왼쪽에서 리소스를 고르세요.</div>`; return; }
   const more = r.count > 100 ? ` · 앞의 100개만 표시` : "";
   let body;
@@ -117,6 +137,29 @@ function renderDetail() {
     body = `<div class="sub">키: ${esc(r.keys.join(", "))} · 항목 ${r.count}개${more}</div>` + table(cols, r.items.map(i => cols.map(c => av(i[c]))));
   } else if (sel.svc === "s3") {
     body = `<div class="sub">객체 ${r.count}개${more}</div>` + table(["키", "크기", "타입", "수정 시각"], r.objects.map(o => [o.key, o.size, o.type, o.modified]));
+  } else if (r.cols) {
+    body = (r.sub ? `<div class="sub">${esc(r.sub)}</div>` : "") + table(r.cols, r.rows);
+  } else if (sel.svc === "iamuser" || sel.svc === "iamrole") {
+    const doc = d => `<pre>${esc(JSON.stringify(d, null, 2))}</pre>`;
+    const pol = a => (state.iam.policies.find(p => p.arn === a) || {}).document;
+    body = `<div class="sub">${esc(r.arn)}</div>`
+      + (sel.svc === "iamuser" ? `<h4>액세스 키</h4>${r.keys.length ? r.keys.map(k => `<div class="hop">${esc(k)}</div>`).join("") : `<div class="muted">없음</div>`}` : `<h4>신뢰 정책 (누가 이 역할을 맡을 수 있나)</h4>${doc(r.trust)}`)
+      + `<h4>연결된 관리형 정책</h4>` + (r.attached.length ? r.attached.map(a => `<div class="muted">${esc(a)}</div>${doc(pol(a))}`).join("") : `<div class="muted">없음</div>`)
+      + `<h4>인라인 정책</h4>` + (Object.keys(r.inline).length ? Object.entries(r.inline).map(([n, d]) => `<div class="muted">${esc(n)}</div>${doc(d)}`).join("") : `<div class="muted">없음</div>`);
+  } else if (sel.svc === "vpc") {
+    const ends = ["internet", ...r.instances.filter(i => i.state === "running").map(i => i.id)];
+    if (!ends.includes(reachForm.to)) reachForm.to = ends[1] || "";
+    const opt = v => ends.map(e => `<option ${e === v ? "selected" : ""}>${esc(e)}</option>`).join("");
+    const res = reachForm.result;
+    body = `<div class="sub">CIDR ${esc(r.cidr)} · 실행 중 인스턴스 ${r.count}개 · NACL·피어링·NAT는 아직 모델링하지 않습니다</div>`
+      + `<h4>도달성 판정</h4><div class="reach"><select id="rf">${opt(reachForm.from)}</select> → <select id="rt">${opt(reachForm.to)}</select>
+         <select id="rp">${["tcp", "udp"].map(p => `<option ${p === reachForm.protocol ? "selected" : ""}>${p}</option>`).join("")}</select>
+         <input id="rport" value="${esc(reachForm.port)}" inputmode="numeric" aria-label="포트"><button id="rgo">판정</button></div>`
+      + (res ? `<div class="verdict ${res.reachable ? "ok" : "no"}">${res.reachable ? "도달 가능" : "차단됨"}: ${esc(res.from)} → ${esc(res.to)} ${esc(res.protocol)}/${esc(res.port)}</div>`
+          + res.hops.map(h => `<div class="hop ${h.ok ? "ok" : "no"}"><b>${esc(h.step)}</b> · ${esc(h.detail)}</div>`).join("") : "")
+      + `<h4>서브넷</h4>` + table(["ID", "CIDR", "AZ", "라우팅 테이블", "인터넷 경로", "공인 IP 자동"], r.subnets.map(x => [x.id, x.cidr, x.az, x.route_table, x.internet ? "있음" : "없음", x.public_ip ? "켜짐" : "꺼짐"]))
+      + `<h4>보안 그룹</h4>` + table(["ID", "이름", "인바운드", "아웃바운드"], r.security_groups.map(g => [g.id, g.name, g.ingress.join("\n") || "없음", g.egress.join("\n") || "없음"]))
+      + `<h4>인스턴스</h4>` + table(["ID", "사설 IP", "공인 IP", "서브넷", "보안 그룹", "상태"], r.instances.map(i => [i.id, i.ip, i.public || "", i.subnet, i.sgs.join(", "), i.state]));
   } else {
     body = `<div class="sub">메시지 ${r.count}개${more} · 엿보기만 하며 수신 횟수는 바뀌지 않습니다</div>` + table(["ID", "본문", "상태", "수신 횟수"], r.messages.map(m => [m.id, m.body, m.state, m.receives]));
   }
@@ -132,12 +175,17 @@ const loadSoon = () => { if (!pending) pending = setTimeout(() => { pending = nu
 
 const clock = ts => { const d = new Date(ts); return isNaN(d) ? "" : d.toTimeString().slice(0, 8) + "." + String(d.getMilliseconds()).padStart(3, "0"); };
 
+const authCell = a => !a ? `<span class="muted">루트</span>`
+  : a.decision === "allowed" ? `<span class="allow">허용</span>`
+  : `<span class="deny">${a.decision === "explicitDeny" ? "명시적 거부" : "암묵적 거부"}${a.enforced ? "" : " (보고만)"}</span>`;
+
 function renderLog() {
   const f = $("filter").value.trim().toLowerCase();
   const rows = events.filter(e => !f || `${e.service} ${e.op} ${e.status}`.toLowerCase().includes(f));
   $("logbody").innerHTML = rows.map(e => `<tr><td>${esc(clock(e.ts))}</td><td class="svc ${esc(e.service)}">${esc(e.service)}</td>
-    <td>${esc(e.op)}</td><td class="st${String(e.status)[0]}">${esc(e.status)}</td><td>${e.ms != null ? e.ms.toFixed(1) : ""}</td>
-    <td class="muted">${esc(e.request_id || "")}</td></tr>`).join("");
+    <td>${esc(e.op)}</td><td class="st${String(e.status)[0]}">${esc(e.status)}</td>
+    <td title="${esc(e.auth ? e.auth.reason : "")}">${authCell(e.auth)}</td><td>${e.ms != null ? e.ms.toFixed(1) : ""}</td>
+    <td class="muted">${esc((e.principal || "").replace(/^arn:aws:(iam|sts)::\d+:/, ""))}</td></tr>`).join("");
 }
 
 const es = new EventSource("/_events");
@@ -152,7 +200,22 @@ es.onmessage = m => {
   renderLog();
 };
 
-$("nav").onclick = ev => { const a = ev.target.closest("a"); if (!a) return; sel = {svc: a.dataset.svc, name: a.dataset.name}; renderNav(); renderDetail(); };
+$("detail").onclick = async ev => {
+  if (ev.target.id !== "rgo") return;
+  Object.assign(reachForm, {from: $("rf").value, to: $("rt").value, protocol: $("rp").value, port: $("rport").value});
+  const qs = new URLSearchParams({from: reachForm.from, to: reachForm.to, protocol: reachForm.protocol, port: reachForm.port});
+  reachForm.result = await (await fetch("/_admin/reach?" + qs)).json();
+  renderDetail();
+};
+$("detail").oninput = ev => {
+  const m = {rf: "from", rt: "to", rp: "protocol", rport: "port"}[ev.target.id];
+  if (m) reachForm[m] = ev.target.value;
+};
+$("nav").onclick = ev => { const a = ev.target.closest("a"); if (!a) return; location.hash = a.dataset.svc + "/" + a.dataset.name; };
+// Deep link: #<svc>/<name> selects a resource.
+const fromHash = () => { const [svc, ...n] = decodeURIComponent(location.hash.slice(1)).split("/"); sel = svc ? {svc, name: n.join("/")} : null; renderNav(); renderDetail(); };
+window.onhashchange = fromHash;
+fromHash();
 $("filter").oninput = renderLog;
 $("clear").onclick = () => { events.length = 0; renderLog(); };
 $("refresh").onclick = load;

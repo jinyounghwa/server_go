@@ -1,5 +1,5 @@
 """Official-SDK (boto3) compatibility check. Run: uv run --with boto3 tests/sdk_test.py
-Expects the emulator on ENDPOINT (default http://127.0.0.1:4566)."""
+Expects the emulator on ENDPOINT (default http://127.0.0.1:4566) started with ENFORCE_IAM=1."""
 import json, os, time, uuid
 import boto3
 from botocore.config import Config
@@ -149,6 +149,380 @@ def test_sqs():
     assert a["ApproximateNumberOfMessages"] == "0", a
     sqs.delete_queue(QueueUrl=q); sqs.delete_queue(QueueUrl=dlq)
     assert q not in sqs.list_queues().get("QueueUrls", [])
+
+
+def test_iam():
+    iam = boto3.client("iam", **kw)
+    u, b = f"alice{run}", f"iamb{run}"
+    s3.create_bucket(Bucket=b)
+    s3.put_object(Bucket=b, Key="public/a.txt", Body=b"ok")
+    s3.put_object(Bucket=b, Key="secret/k.txt", Body=b"no")
+    doc = {"Version": "2012-10-17", "Statement": [
+        {"Sid": "Read", "Effect": "Allow", "Action": ["s3:GetObject", "sts:AssumeRole"], "Resource": [f"arn:aws:s3:::{b}/*", "arn:aws:iam::*:role/*"]},
+        {"Sid": "NoSecrets", "Effect": "Deny", "Action": "s3:*", "Resource": f"arn:aws:s3:::{b}/secret/*"}]}
+    pol = iam.create_policy(PolicyName=f"p{run}", PolicyDocument=json.dumps(doc))["Policy"]["Arn"]
+    iam.create_user(UserName=u)
+    assert code(iam.create_user, UserName=u) == "EntityAlreadyExists"
+    iam.attach_user_policy(UserName=u, PolicyArn=pol)
+    assert iam.get_policy_version(PolicyArn=pol, VersionId="v1")["PolicyVersion"]["Document"] == doc  # boto3 url-decodes
+    key = iam.create_access_key(UserName=u)["AccessKey"]
+    akw = dict(kw, aws_access_key_id=key["AccessKeyId"], aws_secret_access_key=key["SecretAccessKey"])
+    s3a = boto3.client("s3", config=Config(s3={"addressing_style": "path"}), **akw)
+    assert boto3.client("sts", **akw).get_caller_identity()["Arn"].endswith(f":user/{u}")
+
+    assert s3a.get_object(Bucket=b, Key="public/a.txt")["Body"].read() == b"ok"
+    assert code(s3a.get_object, Bucket=b, Key="secret/k.txt") == "AccessDenied"  # explicit deny
+    assert code(s3a.put_object, Bucket=b, Key="public/x", Body=b"x") == "AccessDenied"  # implicit deny
+    assert code(boto3.client("dynamodb", **akw).list_tables) == "AccessDeniedException"
+
+    sim = iam.simulate_principal_policy(PolicySourceArn=f"arn:aws:iam::000000000000:user/{u}", ActionNames=["s3:GetObject"],
+                                        ResourceArns=[f"arn:aws:s3:::{b}/public/a", f"arn:aws:s3:::{b}/secret/a", "arn:aws:s3:::other/x"])
+    assert [r["EvalDecision"] for r in sim["EvaluationResults"]] == ["allowed", "explicitDeny", "implicitDeny"], sim
+
+    # Role assumption: trust policy names alice, role grants SQS only.
+    trust = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::000000000000:user/{u}"}, "Action": "sts:AssumeRole"}]}
+    r = f"worker{run}"
+    iam.create_role(RoleName=r, AssumeRolePolicyDocument=json.dumps(trust))
+    assert iam.get_role(RoleName=r)["Role"]["AssumeRolePolicyDocument"] == trust
+    iam.put_role_policy(RoleName=r, PolicyName="sqs", PolicyDocument=json.dumps({"Statement": [{"Effect": "Allow", "Action": "sqs:*", "Resource": "*"}]}))
+    c = boto3.client("sts", **akw).assume_role(RoleArn=f"arn:aws:iam::000000000000:role/{r}", RoleSessionName="job1")["Credentials"]
+    rkw = dict(kw, aws_access_key_id=c["AccessKeyId"], aws_secret_access_key=c["SecretAccessKey"], aws_session_token=c["SessionToken"])
+    assert boto3.client("sts", **rkw).get_caller_identity()["Arn"] == f"arn:aws:sts::000000000000:assumed-role/{r}/job1"
+    rq = boto3.client("sqs", **rkw)
+    rq.delete_queue(QueueUrl=rq.create_queue(QueueName=f"rq{run}")["QueueUrl"])
+    assert code(boto3.client("s3", **rkw).list_buckets) == "AccessDenied"
+
+    iam.create_role(RoleName=f"lambda{run}", AssumeRolePolicyDocument=json.dumps(
+        {"Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]}))
+    assert code(boto3.client("sts", **akw).assume_role, RoleArn=f"arn:aws:iam::000000000000:role/lambda{run}", RoleSessionName="xx") == "AccessDenied"
+
+    # Cleanup, including delete conflicts.
+    assert code(iam.delete_user, UserName=u) == "DeleteConflict"
+    assert code(iam.delete_policy, PolicyArn=pol) == "DeleteConflict"
+    iam.detach_user_policy(UserName=u, PolicyArn=pol)
+    iam.delete_access_key(UserName=u, AccessKeyId=key["AccessKeyId"])
+    iam.delete_user(UserName=u)
+    iam.delete_policy(PolicyArn=pol)
+    iam.delete_role_policy(RoleName=r, PolicyName="sqs")
+    iam.delete_role(RoleName=r); iam.delete_role(RoleName=f"lambda{run}")
+    assert code(iam.get_user, UserName=u) == "NoSuchEntity"
+    s3.delete_objects(Bucket=b, Delete={"Objects": [{"Key": "public/a.txt"}, {"Key": "secret/k.txt"}]})
+    s3.delete_bucket(Bucket=b)
+
+
+def test_network():
+    import urllib.request
+    ec2 = boto3.client("ec2", **kw)
+    vpc = ec2.create_vpc(CidrBlock="10.0.0.0/16")["Vpc"]["VpcId"]
+    pub = ec2.create_subnet(VpcId=vpc, CidrBlock="10.0.1.0/24")["Subnet"]["SubnetId"]
+    priv = ec2.create_subnet(VpcId=vpc, CidrBlock="10.0.2.0/24")["Subnet"]["SubnetId"]
+    assert code(ec2.create_subnet, VpcId=vpc, CidrBlock="10.0.1.128/25") == "InvalidSubnet.Conflict"
+    assert code(ec2.create_subnet, VpcId=vpc, CidrBlock="10.1.0.0/24") == "InvalidSubnet.Range"
+    ec2.modify_subnet_attribute(SubnetId=pub, MapPublicIpOnLaunch={"Value": True})
+    igw = ec2.create_internet_gateway()["InternetGateway"]["InternetGatewayId"]
+    ec2.attach_internet_gateway(InternetGatewayId=igw, VpcId=vpc)
+    rt = ec2.create_route_table(VpcId=vpc)["RouteTable"]["RouteTableId"]
+    ec2.create_route(RouteTableId=rt, DestinationCidrBlock="0.0.0.0/0", GatewayId=igw)
+    ec2.associate_route_table(RouteTableId=rt, SubnetId=pub)
+
+    web = ec2.create_security_group(GroupName="web", Description="web", VpcId=vpc)["GroupId"]
+    db = ec2.create_security_group(GroupName="db", Description="db", VpcId=vpc)["GroupId"]
+    ec2.authorize_security_group_ingress(GroupId=web, IpPermissions=[{"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}])
+    ec2.authorize_security_group_ingress(GroupId=db, IpPermissions=[{"IpProtocol": "tcp", "FromPort": 5432, "ToPort": 5432, "UserIdGroupPairs": [{"GroupId": web}]}])
+    sg = ec2.describe_security_groups(GroupIds=[db])["SecurityGroups"][0]
+    assert sg["IpPermissions"][0]["UserIdGroupPairs"][0]["GroupId"] == web, sg
+    assert {x["GroupName"] for x in ec2.describe_security_groups(Filters=[{"Name": "vpc-id", "Values": [vpc]}])["SecurityGroups"]} == {"default", "web", "db"}
+
+    w = ec2.run_instances(ImageId="ami-local", MinCount=1, MaxCount=1, SubnetId=pub, SecurityGroupIds=[web])["Instances"][0]
+    d = ec2.run_instances(ImageId="ami-local", MinCount=1, MaxCount=1, SubnetId=priv, SecurityGroupIds=[db])["Instances"][0]
+    ec2.get_waiter("instance_running").wait(InstanceIds=[w["InstanceId"], d["InstanceId"]])
+    assert w["PrivateIpAddress"] == "10.0.1.4" and "PublicIpAddress" in w and "PublicIpAddress" not in d, (w, d)
+
+    def reach(a, b, port):
+        r = json.load(urllib.request.urlopen(f"{EP}/_admin/reach?from={a}&to={b}&protocol=tcp&port={port}"))
+        return r["reachable"], [h["step"] for h in r["hops"] if not h["ok"]]
+    W, D = w["InstanceId"], d["InstanceId"]
+    assert reach("internet", W, 443) == (True, [])
+    assert reach("internet", W, 22) == (False, ["security group (inbound)"])
+    assert reach("internet", D, 5432) == (False, ["route", "public IP", "security group (inbound)"])
+    assert reach(W, D, 5432) == (True, [])
+    assert reach(W, D, 22) == (False, ["security group (inbound)"])
+    assert reach(D, "internet", 443) == (False, ["route", "public IP"])
+
+    assert code(ec2.delete_vpc, VpcId=vpc) == "DependencyViolation"
+    ec2.terminate_instances(InstanceIds=[W, D])
+    for g in (web, db):
+        ec2.delete_security_group(GroupId=g)
+    for sn in (pub, priv):
+        ec2.delete_subnet(SubnetId=sn)
+    ec2.delete_route_table(RouteTableId=rt)
+    ec2.detach_internet_gateway(InternetGatewayId=igw, VpcId=vpc)
+    ec2.delete_internet_gateway(InternetGatewayId=igw)
+    ec2.delete_vpc(VpcId=vpc)
+    assert code(ec2.describe_vpcs, VpcIds=[vpc]) == "InvalidVpcID.NotFound"
+
+
+def test_sns_to_sqs():
+    sns = boto3.client("sns", **kw)
+    t = sns.create_topic(Name=f"orders{run}")["TopicArn"]
+    assert t in [x["TopicArn"] for x in sns.list_topics()["Topics"]]
+    all_q = sqs.create_queue(QueueName=f"all{run}")["QueueUrl"]
+    vip_q = sqs.create_queue(QueueName=f"vip{run}")["QueueUrl"]
+    arn = lambda u: sqs.get_queue_attributes(QueueUrl=u, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    sns.subscribe(TopicArn=t, Protocol="sqs", Endpoint=arn(all_q))
+    sns.subscribe(TopicArn=t, Protocol="sqs", Endpoint=arn(vip_q), ReturnSubscriptionArn=True,
+                  Attributes={"RawMessageDelivery": "true", "FilterPolicy": json.dumps({"tier": ["gold"]})})
+    assert len(sns.list_subscriptions_by_topic(TopicArn=t)["Subscriptions"]) == 2
+    assert sns.get_topic_attributes(TopicArn=t)["Attributes"]["SubscriptionsConfirmed"] == "2"
+    sns.publish(TopicArn=t, Message="plain", Subject="s1", MessageAttributes={"tier": {"DataType": "String", "StringValue": "silver"}})
+    sns.publish(TopicArn=t, Message="golden", MessageAttributes={"tier": {"DataType": "String", "StringValue": "gold"}})
+    got = [json.loads(m["Body"]) for m in sqs.receive_message(QueueUrl=all_q, MaxNumberOfMessages=10)["Messages"]]
+    assert [g["Message"] for g in got] == ["plain", "golden"] and got[0]["Subject"] == "s1" and got[0]["TopicArn"] == t
+    assert got[1]["MessageAttributes"]["tier"] == {"Type": "String", "Value": "gold"}
+    vip = sqs.receive_message(QueueUrl=vip_q, MaxNumberOfMessages=10)["Messages"]
+    assert [m["Body"] for m in vip] == ["golden"], vip  # filter + raw delivery
+    assert code(sns.publish, TopicArn=t + "x", Message="m") == "NotFound"
+    sns.delete_topic(TopicArn=t)
+    sqs.delete_queue(QueueUrl=all_q); sqs.delete_queue(QueueUrl=vip_q)
+
+
+def test_secrets_ssm_kms():
+    sm = boto3.client("secretsmanager", **kw)
+    n = f"db/{run}"
+    arn = sm.create_secret(Name=n, SecretString='{"pw":"one"}')["ARN"]
+    assert code(sm.create_secret, Name=n, SecretString="x") == "ResourceExistsException"
+    assert json.loads(sm.get_secret_value(SecretId=n)["SecretString"]) == {"pw": "one"}
+    sm.put_secret_value(SecretId=arn, SecretString='{"pw":"two"}')
+    assert json.loads(sm.get_secret_value(SecretId=arn)["SecretString"])["pw"] == "two"
+    assert json.loads(sm.get_secret_value(SecretId=n, VersionStage="AWSPREVIOUS")["SecretString"])["pw"] == "one"
+    assert n in [x["Name"] for x in sm.list_secrets()["SecretList"]]
+    sm.delete_secret(SecretId=n)
+    assert code(sm.get_secret_value, SecretId=n) == "InvalidRequestException"
+    sm.restore_secret(SecretId=n)
+    sm.delete_secret(SecretId=n, ForceDeleteWithoutRecovery=True)
+    assert code(sm.get_secret_value, SecretId=n) == "ResourceNotFoundException"
+
+    ssm = boto3.client("ssm", **kw)
+    base = f"/app{run}"
+    ssm.put_parameter(Name=f"{base}/db/url", Value="postgres://x", Type="String")
+    ssm.put_parameter(Name=f"{base}/db/pw", Value="hunter2", Type="SecureString")
+    ssm.put_parameter(Name=f"{base}/flag", Value="on", Type="String")
+    assert code(ssm.put_parameter, Name=f"{base}/flag", Value="off", Type="String") == "ParameterAlreadyExists"
+    assert ssm.put_parameter(Name=f"{base}/flag", Value="off", Overwrite=True)["Version"] == 2
+    assert ssm.get_parameter(Name=f"{base}/db/pw", WithDecryption=True)["Parameter"]["Value"] == "hunter2"
+    assert ssm.get_parameter(Name=f"{base}/db/pw")["Parameter"]["Value"] != "hunter2"
+    assert sorted(p["Name"] for p in ssm.get_parameters_by_path(Path=base)["Parameters"]) == [f"{base}/flag"]
+    assert len(ssm.get_parameters_by_path(Path=base, Recursive=True)["Parameters"]) == 3
+    r = ssm.get_parameters(Names=[f"{base}/flag", f"{base}/nope"])
+    assert [p["Value"] for p in r["Parameters"]] == ["off"] and r["InvalidParameters"] == [f"{base}/nope"]
+    ssm.delete_parameters(Names=[f"{base}/db/url", f"{base}/db/pw", f"{base}/flag"])
+    assert code(ssm.get_parameter, Name=f"{base}/flag") == "ParameterNotFound"
+
+    kms = boto3.client("kms", **kw)
+    k = kms.create_key(Description="test")["KeyMetadata"]["KeyId"]
+    kms.create_alias(AliasName=f"alias/app{run}", TargetKeyId=k)
+    ct = kms.encrypt(KeyId=f"alias/app{run}", Plaintext=b"secret data", EncryptionContext={"app": "x"})["CiphertextBlob"]
+    assert b"secret data" not in ct
+    assert kms.decrypt(CiphertextBlob=ct, EncryptionContext={"app": "x"})["Plaintext"] == b"secret data"
+    assert code(kms.decrypt, CiphertextBlob=ct, EncryptionContext={"app": "y"}) == "InvalidCiphertextException"
+    dk = kms.generate_data_key(KeyId=k, KeySpec="AES_256")
+    assert len(dk["Plaintext"]) == 32 and kms.decrypt(CiphertextBlob=dk["CiphertextBlob"])["Plaintext"] == dk["Plaintext"]
+    kms.disable_key(KeyId=k)
+    assert code(kms.encrypt, KeyId=k, Plaintext=b"x") == "DisabledException"
+    kms.schedule_key_deletion(KeyId=k, PendingWindowInDays=7)
+    assert kms.describe_key(KeyId=k)["KeyMetadata"]["KeyState"] == "PendingDeletion"
+
+
+def test_logs():
+    logs = boto3.client("logs", **kw)
+    g = f"/app/{run}"
+    logs.create_log_group(logGroupName=g)
+    assert code(logs.create_log_group, logGroupName=g) == "ResourceAlreadyExistsException"
+    logs.create_log_stream(logGroupName=g, logStreamName="s1")
+    now = int(time.time() * 1000)
+    logs.put_log_events(logGroupName=g, logStreamName="s1", logEvents=[
+        {"timestamp": now + i, "message": m} for i, m in enumerate(["start", "ERROR db timeout user 42", "done"])])
+    ev = logs.get_log_events(logGroupName=g, logStreamName="s1", startFromHead=True)
+    assert [e["message"] for e in ev["events"]] == ["start", "ERROR db timeout user 42", "done"]
+    again = logs.get_log_events(logGroupName=g, logStreamName="s1", nextToken=ev["nextForwardToken"])
+    assert again["events"] == [] and again["nextForwardToken"] == ev["nextForwardToken"]
+    f = logs.filter_log_events(logGroupName=g, filterPattern='ERROR "user 42"')
+    assert [e["message"] for e in f["events"]] == ["ERROR db timeout user 42"]
+    assert logs.describe_log_streams(logGroupName=g)["logStreams"][0]["logStreamName"] == "s1"
+    logs.put_retention_policy(logGroupName=g, retentionInDays=7)
+    assert logs.describe_log_groups(logGroupNamePrefix=g)["logGroups"][0]["retentionInDays"] == 7
+    logs.delete_log_group(logGroupName=g)
+    assert code(logs.get_log_events, logGroupName=g, logStreamName="s1") == "ResourceNotFoundException"
+
+
+PY_FN = r"""
+import json, os, time, urllib.request
+def handler(event, ctx):
+    print("hello log", ctx.function_name)
+    ep = os.environ["AWS_ENDPOINT_URL"]
+    auth = f"AWS4-HMAC-SHA256 Credential={os.environ['AWS_ACCESS_KEY_ID']}/20260101/us-east-1/sts/aws4_request, SignedHeaders=host, Signature=x"
+    req = urllib.request.Request(ep + "/", data=b"Action=GetCallerIdentity&Version=2011-06-15",
+                                 headers={"Authorization": auth, "Content-Type": "application/x-www-form-urlencoded"})
+    who = urllib.request.urlopen(req).read().decode()
+    for r in event.get("Records", []):
+        body = r.get("body") or r.get("Sns", {}).get("Message")
+        urllib.request.urlopen(urllib.request.Request(f"{ep}/{os.environ['BUCKET']}/{body}", data=b"x", method="PUT"))
+    return {"echo": event.get("x"), "who": who, "stage": os.environ.get("STAGE")}
+def boom(event, ctx):
+    raise ValueError("bad input")
+def slow(event, ctx):
+    time.sleep(3)
+"""
+NODE_FN = "exports.handler = async (event, ctx) => ({ doubled: event.n * 2, name: ctx.functionName });"
+
+
+def zipped(files):
+    import io, zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        for n, src in files.items():
+            z.writestr(n, src)
+    return buf.getvalue()
+
+
+def test_lambda():
+    lam, iam, logs, sns = (boto3.client(n, **kw) for n in ("lambda", "iam", "logs", "sns"))
+    role = iam.create_role(RoleName=f"exec{run}", AssumeRolePolicyDocument=json.dumps({"Statement": [
+        {"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]}))["Role"]["Arn"]
+    b = f"lam{run}"
+    s3.create_bucket(Bucket=b)
+    fn = f"fn{run}"
+    common = dict(Role=role, Code={"ZipFile": zipped({"app.py": PY_FN})}, Runtime="python3.12")
+    lam.create_function(FunctionName=fn, Handler="app.handler", Environment={"Variables": {"STAGE": "dev", "BUCKET": b}}, **common)
+    lam.get_waiter("function_active_v2").wait(FunctionName=fn)
+    assert code(lam.create_function, FunctionName=fn, Handler="app.handler", **common) == "ResourceConflictException"
+
+    r = lam.invoke(FunctionName=fn, Payload=json.dumps({"x": 7}), LogType="Tail")
+    out = json.loads(r["Payload"].read())
+    assert "FunctionError" not in r and out["echo"] == 7 and out["stage"] == "dev", out
+    assert f"assumed-role/exec{run}/{fn}" in out["who"], out["who"]  # code runs as its execution role
+    import base64
+    assert "hello log" in base64.b64decode(r["LogResult"]).decode()
+    time.sleep(0.2)
+    assert any("hello log" in e["message"] for e in logs.filter_log_events(logGroupName=f"/aws/lambda/{fn}")["events"])
+
+    lam.create_function(FunctionName=fn + "-boom", Handler="app.boom", **common)
+    r = lam.invoke(FunctionName=fn + "-boom")
+    err = json.loads(r["Payload"].read())
+    assert r["FunctionError"] == "Unhandled" and err["errorType"] == "ValueError" and err["errorMessage"] == "bad input", err
+    lam.create_function(FunctionName=fn + "-slow", Handler="app.slow", Timeout=1, **common)
+    r = lam.invoke(FunctionName=fn + "-slow")
+    assert r["FunctionError"] == "Unhandled" and "timed out" in json.loads(r["Payload"].read())["errorMessage"]
+
+    lam.create_function(FunctionName=fn + "-node", Handler="index.handler", Runtime="nodejs22.x", Role=role, Code={"ZipFile": zipped({"index.js": NODE_FN})})
+    assert json.loads(lam.invoke(FunctionName=fn + "-node", Payload='{"n": 21}')["Payload"].read()) == {"doubled": 42, "name": fn + "-node"}
+
+    # SQS -> Lambda: each message body becomes an S3 key written by the function.
+    q = sqs.create_queue(QueueName=f"jobs{run}")["QueueUrl"]
+    qarn = sqs.get_queue_attributes(QueueUrl=q, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    m = lam.create_event_source_mapping(EventSourceArn=qarn, FunctionName=fn, BatchSize=5)["UUID"]
+    sqs.send_message_batch(QueueUrl=q, Entries=[{"Id": str(i), "MessageBody": f"job-{i}"} for i in range(3)])
+    # SNS -> Lambda
+    t = sns.create_topic(Name=f"t{run}")["TopicArn"]
+    sns.subscribe(TopicArn=t, Protocol="lambda", Endpoint=lam.get_function(FunctionName=fn)["Configuration"]["FunctionArn"])
+    sns.publish(TopicArn=t, Message="from-sns")
+    want = {"job-0", "job-1", "job-2", "from-sns"}
+    for _ in range(50):
+        keys = {o["Key"] for o in s3.list_objects_v2(Bucket=b).get("Contents", [])}
+        if want <= keys:
+            break
+        time.sleep(0.2)
+    assert want <= keys, keys
+    time.sleep(0.3)
+    assert sqs.get_queue_attributes(QueueUrl=q, AttributeNames=["All"])["Attributes"]["ApproximateNumberOfMessages"] == "0"
+
+    lam.update_function_configuration(FunctionName=fn, Environment={"Variables": {"STAGE": "prod", "BUCKET": b}})
+    assert json.loads(lam.invoke(FunctionName=fn, Payload="{}")["Payload"].read())["stage"] == "prod"
+    assert {fn, fn + "-node"} <= {f["FunctionName"] for f in lam.list_functions()["Functions"]}
+    lam.delete_event_source_mapping(UUID=m)
+    for f in (fn, fn + "-boom", fn + "-slow", fn + "-node"):
+        lam.delete_function(FunctionName=f)
+    assert code(lam.get_function, FunctionName=fn) == "ResourceNotFoundException"
+    sns.delete_topic(TopicArn=t); sqs.delete_queue(QueueUrl=q)
+    s3.delete_objects(Bucket=b, Delete={"Objects": [{"Key": k} for k in keys]}); s3.delete_bucket(Bucket=b)
+
+
+def test_s3_notifications():
+    sns = boto3.client("sns", **kw)
+    b = f"evt{run}"
+    s3.create_bucket(Bucket=b)
+    q1 = sqs.create_queue(QueueName=f"created{run}")["QueueUrl"]
+    q2 = sqs.create_queue(QueueName=f"removed{run}")["QueueUrl"]
+    arn = lambda u: sqs.get_queue_attributes(QueueUrl=u, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    t = sns.create_topic(Name=f"removed{run}")["TopicArn"]
+    sns.subscribe(TopicArn=t, Protocol="sqs", Endpoint=arn(q2), Attributes={"RawMessageDelivery": "true"})
+    cfg = {"QueueConfigurations": [{"Id": "csv-in", "QueueArn": arn(q1), "Events": ["s3:ObjectCreated:*"],
+                                    "Filter": {"Key": {"FilterRules": [{"Name": "prefix", "Value": "in/"}, {"Name": "suffix", "Value": ".csv"}]}}}],
+           "TopicConfigurations": [{"Id": "gone", "TopicArn": t, "Events": ["s3:ObjectRemoved:*"]}]}
+    s3.put_bucket_notification_configuration(Bucket=b, NotificationConfiguration=cfg)
+    got = s3.get_bucket_notification_configuration(Bucket=b)
+    assert got["QueueConfigurations"][0]["QueueArn"] == arn(q1) and got["TopicConfigurations"][0]["TopicArn"] == t, got
+    for k in ("in/a.csv", "in/b.txt", "other/c.csv"):
+        s3.put_object(Bucket=b, Key=k, Body=b"1,2")
+    s3.delete_object(Bucket=b, Key="in/a.csv")
+    created = [json.loads(m["Body"])["Records"][0] for m in sqs.receive_message(QueueUrl=q1, MaxNumberOfMessages=10)["Messages"]]
+    assert [(r["eventName"], r["s3"]["object"]["key"], r["s3"]["object"]["size"]) for r in created] == [("ObjectCreated:Put", "in/a.csv", 3)], created
+    removed = json.loads(sqs.receive_message(QueueUrl=q2)["Messages"][0]["Body"])["Records"][0]
+    assert removed["eventName"] == "ObjectRemoved:Delete" and removed["s3"]["bucket"]["name"] == b
+    s3.delete_objects(Bucket=b, Delete={"Objects": [{"Key": "in/b.txt"}, {"Key": "other/c.csv"}]})
+    s3.delete_bucket(Bucket=b)
+    sns.delete_topic(TopicArn=t); sqs.delete_queue(QueueUrl=q1); sqs.delete_queue(QueueUrl=q2)
+
+
+def test_chaos():
+    import urllib.request
+    def set_rules(rules):
+        urllib.request.urlopen(urllib.request.Request(f"{EP}/_admin/chaos", data=json.dumps({"rules": rules}).encode(),
+                                                      headers={"x-rocalcloud": "1"}, method="POST"))
+    once = Config(retries={"max_attempts": 1, "mode": "standard"})
+    d1 = boto3.client("dynamodb", config=once, **kw)
+    q1 = boto3.client("sqs", config=once, **kw)
+    try:
+        set_rules([{"service": "dynamodb", "op": "List*", "throttle_rate": 1.0},
+                   {"service": "sqs", "error_rate": 1.0},
+                   {"service": "s3", "op": "ListBuckets", "latency_ms": 300}])
+        assert code(d1.list_tables) == "ProvisionedThroughputExceededException"
+        assert code(q1.list_queues) == "InternalFailure"
+        t0 = time.time(); s3.list_buckets(); assert time.time() - t0 >= 0.3
+        assert json.load(urllib.request.urlopen(f"{EP}/_admin/chaos"))["rules"][0]["service"] == "dynamodb"
+    finally:
+        set_rules([])
+    d1.list_tables(); q1.list_queues()
+
+
+def test_eventbridge():
+    eb = boto3.client("events", **kw)
+    big = sqs.create_queue(QueueName=f"bigorders{run}")["QueueUrl"]
+    tick = sqs.create_queue(QueueName=f"tick{run}")["QueueUrl"]
+    arn = lambda u: sqs.get_queue_attributes(QueueUrl=u, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.create_event_bus(Name=f"shop{run}")
+    bus = f"shop{run}"
+    eb.put_rule(Name="big", EventBusName=bus, EventPattern=json.dumps({"source": ["shop"], "detail": {"total": [{"numeric": [">=", 100]}]}}))
+    eb.put_targets(Rule="big", EventBusName=bus, Targets=[{"Id": "q", "Arn": arn(big), "InputPath": "$.detail"}])
+    assert eb.list_targets_by_rule(Rule="big", EventBusName=bus)["Targets"][0]["Arn"] == arn(big)
+    r = eb.put_events(Entries=[{"EventBusName": bus, "Source": "shop", "DetailType": "Order", "Detail": json.dumps({"id": i, "total": t})}
+                               for i, t in [(1, 50), (2, 150), (3, 300)]])
+    assert r["FailedEntryCount"] == 0 and len(r["Entries"]) == 3
+    got = sorted(json.loads(m["Body"])["id"] for m in sqs.receive_message(QueueUrl=big, MaxNumberOfMessages=10)["Messages"])
+    assert got == [2, 3], got
+
+    eb.put_rule(Name=f"every{run}", ScheduleExpression="rate(1 second)")
+    eb.put_targets(Rule=f"every{run}", Targets=[{"Id": "t", "Arn": arn(tick)}])
+    time.sleep(2.5)
+    ticks = sqs.receive_message(QueueUrl=tick, MaxNumberOfMessages=10).get("Messages", [])
+    assert ticks and json.loads(ticks[0]["Body"])["detail-type"] == "Scheduled Event", ticks
+    eb.disable_rule(Name=f"every{run}")
+    assert eb.describe_rule(Name=f"every{run}")["State"] == "DISABLED"
+    assert code(eb.delete_rule, Name=f"every{run}") == "ValidationException"  # still has targets
+    eb.remove_targets(Rule=f"every{run}", Ids=["t"]); eb.delete_rule(Name=f"every{run}")
+    eb.remove_targets(Rule="big", EventBusName=bus, Ids=["q"]); eb.delete_rule(Name="big", EventBusName=bus)
+    eb.delete_event_bus(Name=bus)
+    sqs.delete_queue(QueueUrl=big); sqs.delete_queue(QueueUrl=tick)
 
 
 if __name__ == "__main__":
