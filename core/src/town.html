@@ -3,85 +3,80 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🏘️</text></svg>">
-<title>rocalcloud 3D 마을</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🏙️</text></svg>">
+<title>rocalcloud — 3D 클라우드 시티</title>
 <style>
 :root {
-  --bg: #0f172a; --ink: #f1f5f9; --muted: #94a3b8;
-  --panel: rgba(15, 23, 42, 0.78); --line: rgba(148, 163, 184, 0.22);
-  --ok: #34d399; --warn: #fbbf24; --bad: #f87171; --zap: #facc15; --accent: #38bdf8;
+  --ink: #f8fafc; --muted: #94a3b8;
+  --glass: rgba(10, 15, 28, 0.66); --glass-hi: rgba(15, 23, 42, 0.84);
+  --line: rgba(255, 255, 255, 0.14); --accent: #38bdf8;
+  --ok: #34d399; --warn: #fbbf24; --bad: #f87171; --zap: #fde047;
   font: 13px/1.45 ui-sans-serif, -apple-system, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
 }
-* { box-sizing: border-box; }
-html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--ink); }
-body { display: grid; grid-template-columns: 1fr 330px; grid-template-rows: 50px 1fr; }
-header {
-  grid-column: 1 / -1; display: flex; align-items: center; gap: 10px; padding: 0 16px;
-  background: rgba(15, 23, 42, 0.92); backdrop-filter: blur(12px);
-  border-bottom: 1px solid var(--line); white-space: nowrap; overflow-x: auto; z-index: 20;
-}
-header b { font-size: 15px; letter-spacing: .01em; display: flex; align-items: center; gap: 6px; }
-.badge3d { font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 999px; background: linear-gradient(135deg, #38bdf8, #818cf8); color: #0f172a; }
-.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; background: var(--bad); }
-.dot.live { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
-.dot.demo { background: var(--zap); box-shadow: 0 0 8px var(--zap); }
-.spacer { flex: 1; }
-header a, header button, header label { font: inherit; color: var(--ink); }
-header button {
-  border: 1px solid var(--line); background: rgba(30, 41, 59, 0.85); color: var(--ink);
-  border-radius: 7px; padding: 4px 10px; cursor: pointer; transition: background .15s, border-color .15s;
-}
-header button:hover { background: rgba(51, 65, 85, 0.95); border-color: var(--accent); }
-header button.active { background: rgba(56, 189, 248, 0.22); border-color: var(--accent); color: #e0f2fe; }
-header a { text-decoration: none; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--line); }
-header a:hover { border-color: var(--accent); }
-#stage { position: relative; min-width: 0; min-height: 0; overflow: hidden; }
+* { box-sizing: border-box; user-select: none; }
+html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #070b14; color: var(--ink); }
+#stage { position: fixed; inset: 0; }
 canvas#c { display: block; width: 100%; height: 100%; cursor: grab; }
 canvas#c:active { cursor: grabbing; }
-#labels, #fx { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+#labels, #fx { position: fixed; inset: 0; pointer-events: none; overflow: hidden; }
+
+/* Floating 3D world labels */
 .blabel {
-  position: absolute; transform: translate(-50%, -100%); padding: 3px 8px; border-radius: 999px;
-  background: rgba(15, 23, 42, 0.78); backdrop-filter: blur(6px); border: 1px solid rgba(255,255,255,0.16);
-  color: #fff; font-size: 11px; font-weight: 600; white-space: nowrap; display: flex; align-items: center; gap: 5px;
-  box-shadow: 0 4px 12px rgba(0,0,0,.35); transition: transform .15s, border-color .15s;
+  position: absolute; transform: translate(-50%, -100%); padding: 4px 10px; border-radius: 999px;
+  background: rgba(8, 12, 24, 0.72); backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.18); color: #fff; font-size: 11px; font-weight: 600;
+  white-space: nowrap; display: flex; align-items: center; gap: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45); transition: transform .18s, border-color .18s, background .18s;
 }
-.blabel .cnt { background: rgba(56,189,248,.25); color: #bae6fd; padding: 0 5px; border-radius: 999px; font-variant-numeric: tabular-nums; font-size: 10px; }
-.blabel.hot { border-color: #38bdf8; transform: translate(-50%, -112%) scale(1.06); }
+.blabel .dotc { width: 8px; height: 8px; border-radius: 50%; box-shadow: 0 0 8px currentColor; }
+.blabel .cnt { background: rgba(56, 189, 248, 0.24); color: #bae6fd; padding: 0 6px; border-radius: 999px; font-size: 10px; font-variant-numeric: tabular-nums; }
+.blabel.hot { border-color: #38bdf8; background: rgba(14, 24, 46, 0.92); transform: translate(-50%, -115%) scale(1.08); }
 .pop {
-  position: absolute; transform: translate(-50%, -50%); font-size: 18px; font-weight: 700;
-  padding: 2px 8px; border-radius: 999px; background: rgba(15,23,42,.88); border: 1px solid rgba(255,255,255,.25);
-  box-shadow: 0 6px 16px rgba(0,0,0,.45); will-change: transform, opacity;
+  position: absolute; transform: translate(-50%, -50%); font-size: 17px; font-weight: 700;
+  padding: 3px 10px; border-radius: 999px; background: rgba(8, 12, 24, 0.88);
+  border: 1px solid rgba(255, 255, 255, 0.28); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+  will-change: transform, opacity;
 }
-#tip {
-  position: absolute; pointer-events: none; display: none; z-index: 15; max-width: 260px;
-  background: rgba(15, 23, 42, 0.94); border: 1px solid rgba(56, 189, 248, 0.45);
-  color: #f8fafc; padding: 8px 11px; border-radius: 8px; font-size: 12px; box-shadow: 0 8px 24px rgba(0,0,0,.5);
+
+/* Game HUD: Top-left title & telemetry */
+#hud-tl {
+  position: fixed; top: 16px; left: 16px; z-index: 20; display: flex; flex-direction: column; gap: 8px;
 }
-#hud {
-  position: absolute; left: 14px; bottom: 14px; display: flex; gap: 6px; flex-wrap: wrap; z-index: 10;
+.hud-card {
+  background: var(--glass); backdrop-filter: blur(14px); border: 1px solid var(--line);
+  border-radius: 14px; padding: 10px 14px; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.42);
 }
-#hud button {
-  font: inherit; font-size: 12px; padding: 5px 10px; border-radius: 8px;
-  border: 1px solid var(--line); background: var(--panel); backdrop-filter: blur(8px);
-  color: var(--ink); cursor: pointer;
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand b { font-size: 15px; letter-spacing: .02em; }
+.tag3d { font-size: 10px; font-weight: 800; padding: 2px 7px; border-radius: 999px; background: linear-gradient(135deg, #38bdf8, #a78bfa); color: #090d16; }
+.status-row { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--muted); margin-top: 4px; }
+.sdot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
+.sdot.live { background: var(--ok); box-shadow: 0 0 10px var(--ok); }
+.sdot.demo { background: var(--zap); box-shadow: 0 0 10px var(--zap); }
+.stats-row { display: flex; gap: 14px; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+.stat { display: flex; flex-direction: column; }
+.stat span { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+.stat b { font-size: 15px; color: #fff; }
+.stat b.ok { color: var(--ok); } .stat b.bad { color: var(--bad); }
+
+/* Game HUD: Top-right collapsible live event feed */
+#hud-tr {
+  position: fixed; top: 16px; right: 16px; width: 320px; max-height: calc(100vh - 110px);
+  z-index: 20; display: flex; flex-direction: column;
+  background: var(--glass); backdrop-filter: blur(14px); border: 1px solid var(--line);
+  border-radius: 14px; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.42); overflow: hidden;
+  transition: max-height .25s ease;
 }
-#hud button:hover { border-color: var(--accent); }
-#hud button.active { border-color: var(--accent); background: rgba(56, 189, 248, 0.25); }
-#hint3d {
-  position: absolute; right: 14px; bottom: 14px; font-size: 11px; color: rgba(241,245,249,.72);
-  background: var(--panel); backdrop-filter: blur(6px); padding: 4px 10px; border-radius: 999px;
-  border: 1px solid var(--line); pointer-events: none;
+#hud-tr.collapsed { max-height: 42px; }
+.feed-head {
+  display: flex; align-items: center; justify-content: space-between; padding: 10px 14px;
+  border-bottom: 1px solid var(--line); cursor: pointer;
 }
-aside {
-  border-left: 1px solid var(--line); background: rgba(15, 23, 42, 0.94);
-  display: grid; grid-template-rows: auto 1fr; min-height: 0; z-index: 10;
-}
-aside h2 { margin: 12px 16px 6px; font-size: 13px; color: #e2e8f0; }
-.legend { padding: 0 16px 10px; color: var(--muted); font-size: 12px; display: grid; gap: 3px; }
-.legend span { display: inline-block; width: 16px; text-align: center; font-weight: 700; }
-#log { list-style: none; margin: 0; padding: 0 16px 16px; overflow: auto; border-top: 1px solid var(--line); }
-#log li { padding: 7px 0; border-bottom: 1px dashed var(--line); font-size: 12px; color: #e2e8f0; }
-#log li .t { color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 6px; }
+.feed-head b { font-size: 12px; letter-spacing: .03em; text-transform: uppercase; color: #e2e8f0; }
+.legend { padding: 7px 14px; font-size: 11px; color: var(--muted); border-bottom: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 6px 10px; }
+#log { list-style: none; margin: 0; padding: 6px 12px 12px; overflow: auto; flex: 1; }
+#log li { padding: 6px 4px; border-bottom: 1px dashed rgba(255, 255, 255, 0.09); font-size: 11.5px; color: #e2e8f0; }
+#log li .t { color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 5px; font-size: 10.5px; }
 #log li.ok::before { content: "✓ "; color: var(--ok); font-weight: 700; }
 #log li.warn::before { content: "! "; color: var(--warn); font-weight: 700; }
 #log li.bad::before { content: "✗ "; color: var(--bad); font-weight: 700; }
@@ -89,50 +84,98 @@ aside h2 { margin: 12px 16px 6px; font-size: 13px; color: #e2e8f0; }
 #log li.zap::before { content: "⚡ "; }
 #log li.defend::before { content: "🛡 "; }
 #log li.breach::before { content: "⚠ "; color: var(--bad); font-weight: 700; }
-@media (max-width: 900px) {
-  body { grid-template-columns: 1fr; grid-template-rows: 50px 58vh 1fr; }
-  header label span, #mode, #hint3d { display: none; }
-  aside { border-left: 0; border-top: 1px solid var(--line); }
+
+/* Game HUD: Bottom center control dock */
+#dock {
+  position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); z-index: 20;
+  display: flex; align-items: center; gap: 6px; padding: 7px 12px; border-radius: 16px;
+  background: var(--glass-hi); backdrop-filter: blur(16px); border: 1px solid var(--line);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.55); max-width: calc(100vw - 24px); overflow-x: auto; white-space: nowrap;
+}
+#dock .sep { width: 1px; height: 22px; background: var(--line); margin: 0 3px; }
+#dock button, #dock a {
+  font: inherit; font-size: 12px; color: var(--ink); text-decoration: none;
+  background: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 9px; padding: 5px 10px; cursor: pointer; transition: all .15s;
+}
+#dock button:hover, #dock a:hover { background: rgba(56, 189, 248, 0.22); border-color: var(--accent); }
+#dock button.active { background: rgba(56, 189, 248, 0.32); border-color: var(--accent); color: #e0f2fe; box-shadow: 0 0 12px rgba(56, 189, 248, 0.28); }
+#dock input[type=range] { width: 68px; accent-color: var(--accent); vertical-align: middle; }
+
+/* Hover tooltip & selected building card */
+#tip {
+  position: fixed; pointer-events: none; display: none; z-index: 25; max-width: 250px;
+  background: rgba(8, 12, 24, 0.94); border: 1px solid rgba(56, 189, 248, 0.5);
+  color: #f8fafc; padding: 9px 12px; border-radius: 10px; font-size: 12px;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.55);
+}
+#hint3d {
+  position: fixed; left: 16px; bottom: 18px; z-index: 15; font-size: 11px; color: rgba(241, 245, 249, 0.72);
+  background: var(--glass); backdrop-filter: blur(8px); padding: 5px 11px; border-radius: 999px;
+  border: 1px solid var(--line); pointer-events: none;
+}
+@media (max-width: 960px) {
+  #hud-tr { width: 260px; max-height: 40vh; }
+  #hint3d { display: none; }
 }
 </style>
 </head>
 <body>
-<header>
-  <b>rocalcloud 마을 <span class="badge3d">3D</span></b>
-  <span><span id="dot" class="dot"></span><span id="mode">연결 중</span></span>
-  <span class="spacer"></span>
-  <label><span>속도 </span><input id="speed" type="range" min="0.5" max="3" step="0.5" value="1" aria-label="애니메이션 속도"></label>
-  <button id="pause">일시정지</button>
-  <button id="demo">데모 보기</button>
-  <a href="/_ui" id="gui">관리 화면</a>
-</header>
 <div id="stage">
-  <canvas id="c" aria-label="3D 서비스 마을 지도. 요청이 3D 택배원과 검사관으로 표시됩니다. 같은 내용이 오른쪽 목록에 글로 나옵니다."></canvas>
+  <canvas id="c" aria-label="실사풍 3D 클라우드 시티. 요청이 배달 차량, 드론, 검사관으로 시각화됩니다."></canvas>
   <div id="labels"></div>
   <div id="fx"></div>
-  <div id="tip"></div>
-  <div id="hud">
-    <button id="theme_day" class="active">☀️ 낮</button>
-    <button id="theme_sunset">🌅 황혼</button>
-    <button id="theme_night">🌙 밤</button>
-    <button id="cam_overview">🗺 전체 뷰</button>
-    <button id="cam_gate">🛡 정문 뷰</button>
-    <button id="cam_orbit">🔄 자동 회전</button>
-  </div>
-  <div id="hint3d">드래그: 회전 · 휠: 줌 · 우클릭: 이동</div>
 </div>
-<aside>
-  <div>
-    <h2>무슨 일이 일어나고 있나</h2>
-    <div class="legend">
-      <div><span style="color:var(--ok)">✓</span> 성공 · <span style="color:var(--warn)">!</span> 요청 오류(4xx) · <span style="color:var(--bad)">✗</span> 서버 오류(5xx)</div>
-      <div><span>✋</span> 정문 경비가 막음(IAM 거부) · <span>⚡</span> 장애 주입(chaos)</div>
-      <div><span>🛡</span> 검사관 공격 방어 성공 · <span>⚠</span> 검증 실패(경고)</div>
-      <div>빛나는 구체 = 서비스 간 배달 · 보라색 모자 = 검사관</div>
+
+<div id="hud-tl">
+  <div class="hud-card">
+    <div class="brand">
+      <b>rocalcloud 시티</b>
+      <span class="tag3d">REALTIME 3D</span>
     </div>
+    <div class="status-row"><span id="dot" class="sdot"></span><span id="mode">연결 중…</span></div>
+    <div class="stats-row">
+      <div class="stat"><span>요청</span><b id="st_total">0</b></div>
+      <div class="stat"><span>성공</span><b id="st_ok" class="ok">0</b></div>
+      <div class="stat"><span>차단·오류</span><b id="st_err" class="bad">0</b></div>
+    </div>
+  </div>
+</div>
+
+<aside id="hud-tr">
+  <div class="feed-head" id="feed_toggle">
+    <b>실시간 활동 피드</b>
+    <span id="feed_arrow" style="color:var(--muted);font-size:11px">▾</span>
+  </div>
+  <div class="legend">
+    <span><b style="color:var(--ok)">✓</b> 성공</span>
+    <span><b style="color:var(--warn)">!</b> 4xx</span>
+    <span><b style="color:var(--bad)">✗</b> 5xx</span>
+    <span>✋ IAM차단</span>
+    <span>⚡ 장애</span>
+    <span>🛡 방어성공</span>
   </div>
   <ul id="log" aria-live="polite"></ul>
 </aside>
+
+<div id="dock">
+  <button id="t_day" class="active">☀️ 한낮</button>
+  <button id="t_golden">🌅 골든아워</button>
+  <button id="t_night">🌙 야경</button>
+  <span class="sep"></span>
+  <button id="c_city" class="active">🗺 시티 뷰</button>
+  <button id="c_street">🚶 거리 뷰</button>
+  <button id="c_gate">🛡 정문</button>
+  <button id="c_harbor">⚓ 항구</button>
+  <button id="c_orbit">🎬 시네마틱</button>
+  <span class="sep"></span>
+  <label style="font-size:11px;color:var(--muted)">속도 <input id="speed" type="range" min="0.5" max="3" step="0.5" value="1"></label>
+  <button id="pause">일시정지</button>
+  <button id="demo">데모</button>
+  <a href="/_ui" id="gui">관리 GUI</a>
+</div>
+<div id="hint3d">드래그: 360° 회전 · 휠: 줌 · 건물 클릭: 포커스</div>
+<div id="tip"></div>
 
 <script type="importmap">
 {
@@ -145,470 +188,544 @@ aside h2 { margin: 12px 16px 6px; font-size: 13px; color: #e2e8f0; }
 <script type="module">
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { Sky } from "three/addons/objects/Sky.js";
+import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
+import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
 
 const $ = id => document.getElementById(id);
 const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-// ---------- building catalog (3D layout on island) ----------
-const B = [
-  {id: "s3",     name: "창고",         sub: "S3",                               kind: "warehouse", color: 0xc97b36, hex: "#c97b36", svc: ["s3"],                                x: -16, z: -8.5},
-  {id: "ddb",    name: "기록보관소",   sub: "DynamoDB · Kinesis",               kind: "archive",   color: 0x3b82f6, hex: "#3b82f6", svc: ["dynamodb", "kinesis"],               x: -8,  z: -8.5},
-  {id: "sqs",    name: "우체국",       sub: "SQS",                              kind: "post",      color: 0xe05d38, hex: "#e05d38", svc: ["sqs"],                               x: 0,   z: -8.5},
-  {id: "sns",    name: "방송탑",       sub: "SNS · SES · EventBridge",          kind: "tower",     color: 0x9333ea, hex: "#9333ea", svc: ["sns", "ses", "events"],              x: 8,   z: -8.5},
-  {id: "lambda", name: "공방",         sub: "Lambda · API Gateway",             kind: "workshop",  color: 0xeab308, hex: "#eab308", svc: ["lambda", "apigateway"],              x: 16,  z: -8.5},
-  {id: "sfn",    name: "조립 라인",    sub: "Step Functions",                   kind: "factory",   color: 0xec4899, hex: "#ec4899", svc: ["states"],                            x: 24,  z: -8.5},
-  {id: "id",     name: "신분증 발급소", sub: "IAM · STS · Cognito",              kind: "office",    color: 0x14b8a6, hex: "#14b8a6", svc: ["iam", "sts", "cognito-idp"],         x: -12, z: 8.5},
-  {id: "vault",  name: "금고",         sub: "KMS · Secrets · SSM",              kind: "vault",     color: 0x64748b, hex: "#64748b", svc: ["kms", "secretsmanager", "ssm"],      x: -4,  z: 8.5},
-  {id: "harbor", name: "항구",         sub: "ECS · RDS · ElastiCache · ALB",    kind: "harbor",    color: 0x0284c7, hex: "#0284c7", svc: ["ecs", "rds", "elasticache", "elbv2"], x: 4,  z: 8.5},
-  {id: "radar",  name: "관제탑",       sub: "VPC · Route 53 · Logs",            kind: "radar",     color: 0x65a30d, hex: "#65a30d", svc: ["ec2", "route53", "logs"],            x: 12,  z: 8.5},
-  {id: "crane",  name: "공사장",       sub: "CloudFormation",                   kind: "crane",     color: 0xd97706, hex: "#d97706", svc: ["cloudformation"],                    x: 20,  z: 8.5},
-];
-const byService = {};
-B.forEach(b => {
-  b.count = 0; b.bounce = 0; b.act = 0; b.step = 0;
-  b.door = new THREE.Vector3(b.x, 0, b.z < 0 ? b.z + 3.0 : b.z - 3.0);
-  b.svc.forEach(s => byService[s] = b);
-});
-const GATE_X = -24.5;
+// ============================================================
+// 1. PROCEDURAL PBR TEXTURES (albedo + bump/roughness maps)
+// ============================================================
+function makeTex(size, draw, repeatX = 1, repeatY = 1, isColor = true) {
+  const cv = document.createElement("canvas");
+  cv.width = cv.height = size;
+  draw(cv.getContext("2d"), size);
+  const t = new THREE.CanvasTexture(cv);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(repeatX, repeatY);
+  if (isColor) t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = 8;
+  return t;
+}
 
-// ---------- Three.js scene setup ----------
+function noiseDots(ctx, s, count, alpha = 0.08, r = 2) {
+  for (let i = 0; i < count; i++) {
+    const v = Math.random() > 0.5 ? 255 : 0;
+    ctx.fillStyle = `rgba(${v},${v},${v},${Math.random() * alpha})`;
+    ctx.fillRect(Math.random() * s, Math.random() * s, r, r);
+  }
+}
+
+const TEX = {
+  grass: makeTex(512, (c, s) => {
+    c.fillStyle = "#4d7c3f"; c.fillRect(0, 0, s, s);
+    for (let i = 0; i < 6500; i++) {
+      const g = 95 + Math.floor(Math.random() * 55);
+      c.fillStyle = `rgb(${55 + Math.floor(Math.random() * 35)},${g},${42 + Math.floor(Math.random() * 28)})`;
+      c.fillRect(Math.random() * s, Math.random() * s, 2 + Math.random() * 4, 2 + Math.random() * 5);
+    }
+  }, 16, 16),
+
+  asphalt: makeTex(512, (c, s) => {
+    c.fillStyle = "#2b303a"; c.fillRect(0, 0, s, s);
+    noiseDots(c, s, 14000, 0.12, 2);
+    // Subtle wheel tracks
+    c.fillStyle = "rgba(0,0,0,0.12)";
+    c.fillRect(0, s * 0.22, s, s * 0.14);
+    c.fillRect(0, s * 0.64, s, s * 0.14);
+    // Dashed center line
+    c.fillStyle = "#e6c656";
+    for (let x = 20; x < s; x += 128) c.fillRect(x, s / 2 - 5, 70, 10);
+    // Side edge lines
+    c.fillStyle = "rgba(255,255,255,0.55)";
+    c.fillRect(0, 14, s, 6); c.fillRect(0, s - 20, s, 6);
+  }, 10, 1),
+
+  cobble: makeTex(256, (c, s) => {
+    c.fillStyle = "#5c636e"; c.fillRect(0, 0, s, s);
+    const cols = 8, rows = 8, cw = s / cols, ch = s / rows;
+    for (let r = 0; r < rows; r++) {
+      for (let col = 0; col < cols; col++) {
+        const off = (r % 2) * (cw / 2);
+        const shade = 128 + Math.floor(Math.random() * 34);
+        c.fillStyle = `rgb(${shade},${shade - 2},${shade - 6})`;
+        c.fillRect((col * cw + off) % s + 2, r * ch + 2, cw - 4, ch - 4);
+      }
+    }
+    noiseDots(c, s, 1600, 0.08, 2);
+  }, 6, 6),
+
+  brick: (hexA, hexB) => makeTex(256, (c, s) => {
+    c.fillStyle = "#b8b0a4"; c.fillRect(0, 0, s, s);
+    const rows = 12, cols = 6, rh = s / rows, cw = s / cols;
+    for (let r = 0; r < rows; r++) {
+      for (let col = -1; col <= cols; col++) {
+        c.fillStyle = Math.random() > 0.35 ? hexA : hexB;
+        const x = col * cw + (r % 2 ? cw / 2 : 0);
+        c.fillRect(x + 2, r * rh + 2, cw - 3, rh - 3);
+      }
+    }
+    noiseDots(c, s, 2000, 0.09, 2);
+  }, 2, 2),
+
+  stone: makeTex(256, (c, s) => {
+    c.fillStyle = "#949aa3"; c.fillRect(0, 0, s, s);
+    for (let r = 0; r < 6; r++) {
+      for (let col = 0; col < 4; col++) {
+        const v = 162 + Math.floor(Math.random() * 28);
+        c.fillStyle = `rgb(${v},${v - 2},${v - 6})`;
+        c.fillRect(col * 64 + (r % 2 ? 32 : 0) % 256 + 2, r * 42 + 2, 60, 38);
+      }
+    }
+    noiseDots(c, s, 2500, 0.07, 2);
+  }, 2, 2),
+
+  corrugated: (hex) => makeTex(256, (c, s) => {
+    c.fillStyle = hex; c.fillRect(0, 0, s, s);
+    for (let x = 0; x < s; x += 12) {
+      c.fillStyle = "rgba(0,0,0,0.22)"; c.fillRect(x, 0, 5, s);
+      c.fillStyle = "rgba(255,255,255,0.12)"; c.fillRect(x + 5, 0, 3, s);
+    }
+    noiseDots(c, s, 1200, 0.06, 2);
+  }, 2, 1),
+
+  roofTile: (hex) => makeTex(256, (c, s) => {
+    c.fillStyle = hex; c.fillRect(0, 0, s, s);
+    for (let y = 0; y < s; y += 20) {
+      c.fillStyle = "rgba(0,0,0,0.22)"; c.fillRect(0, y, s, 4);
+      for (let x = 0; x < s; x += 24) {
+        c.fillStyle = "rgba(255,255,255,0.08)"; c.fillRect(x + (y % 40 ? 12 : 0), y + 4, 18, 12);
+      }
+    }
+  }, 3, 2),
+
+  concrete: makeTex(256, (c, s) => {
+    c.fillStyle = "#8a929c"; c.fillRect(0, 0, s, s);
+    noiseDots(c, s, 5000, 0.1, 3);
+    c.strokeStyle = "rgba(0,0,0,0.14)"; c.lineWidth = 2;
+    for (let i = 0; i <= s; i += 64) { c.beginPath(); c.moveTo(0, i); c.lineTo(s, i); c.stroke(); }
+  }, 2, 2),
+
+  woodPlank: makeTex(256, (c, s) => {
+    c.fillStyle = "#7c5a3c"; c.fillRect(0, 0, s, s);
+    for (let y = 0; y < s; y += 24) {
+      c.fillStyle = `rgba(${100 + Math.random()*30},${70 + Math.random()*20},${45 + Math.random()*15},0.6)`;
+      c.fillRect(0, y, s, 22);
+      c.fillStyle = "rgba(0,0,0,0.35)"; c.fillRect(0, y + 22, s, 2);
+    }
+    noiseDots(c, s, 2000, 0.08, 2);
+  }, 3, 3),
+
+  windows: makeTex(256, (c, s) => {
+    c.fillStyle = "#1e293b"; c.fillRect(0, 0, s, s);
+    const cols = 4, rows = 3, cw = s / cols, rh = s / rows;
+    for (let r = 0; r < rows; r++) {
+      for (let col = 0; col < cols; col++) {
+        const lit = Math.random() > 0.25;
+        const grad = c.createLinearGradient(0, r * rh, 0, (r + 1) * rh);
+        if (lit) { grad.addColorStop(0, "#fef3c7"); grad.addColorStop(1, "#f59e0b"); }
+        else { grad.addColorStop(0, "#38bdf8"); grad.addColorStop(1, "#1e3a5f"); }
+        c.fillStyle = grad;
+        c.fillRect(col * cw + 8, r * rh + 10, cw - 16, rh - 20);
+        c.strokeStyle = "#0f172a"; c.lineWidth = 3;
+        c.strokeRect(col * cw + 8, r * rh + 10, cw - 16, rh - 20);
+      }
+    }
+  }, 1, 1),
+};
+
+// ============================================================
+// 2. RENDERER, SCENE, PHYSICAL SKY + IBL, BLOOM POST-PROCESSING
+// ============================================================
 const canvas = $("c");
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.12;
+renderer.toneMappingExposure = 1.05;
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x87ceeb);
-scene.fog = new THREE.FogExp2(0x87ceeb, 0.0065);
+scene.fog = new THREE.FogExp2(0x9ec5e8, 0.0042);
 
-const camera = new THREE.PerspectiveCamera(42, 1, 0.5, 300);
-camera.position.set(-28, 30, 44);
+const camera = new THREE.PerspectiveCamera(40, 1, 0.5, 450);
+camera.position.set(-34, 28, 46);
 
 const controls = new OrbitControls(camera, canvas);
 controls.enableDamping = true;
-controls.dampingFactor = 0.06;
-controls.target.set(-1, 1, 0);
-controls.maxPolarAngle = Math.PI * 0.46;
-controls.minDistance = 12;
-controls.maxDistance = 85;
+controls.dampingFactor = 0.055;
+controls.target.set(0, 2, 0);
+controls.maxPolarAngle = Math.PI * 0.475;
+controls.minDistance = 10;
+controls.maxDistance = 105;
+
+// Post-processing with UnrealBloomPass
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.32, 0.55, 0.85);
+composer.addPass(bloomPass);
+composer.addPass(new OutputPass());
+
+// Physical Sky + PMREM environment lighting
+const sky = new Sky();
+sky.scale.setScalar(450);
+scene.add(sky);
+const pmrem = new THREE.PMREMGenerator(renderer);
+let envRT = null;
 
 // Lights
-const hemi = new THREE.HemisphereLight(0xdff6ff, 0x4d7c4f, 0.85);
+const hemi = new THREE.HemisphereLight(0xdff2ff, 0x4b6344, 0.75);
 scene.add(hemi);
 
-const sun = new THREE.DirectionalLight(0xfff5e4, 1.9);
-sun.position.set(28, 42, 24);
+const sun = new THREE.DirectionalLight(0xfff4e0, 2.6);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
-sun.shadow.camera.left = -42; sun.shadow.camera.right = 42;
-sun.shadow.camera.top = 30; sun.shadow.camera.bottom = -30;
-sun.shadow.camera.near = 5; sun.shadow.camera.far = 120;
-sun.shadow.bias = -0.0005;
+sun.shadow.camera.left = -52; sun.shadow.camera.right = 52;
+sun.shadow.camera.top = 38; sun.shadow.camera.bottom = -38;
+sun.shadow.camera.near = 5; sun.shadow.camera.far = 160;
+sun.shadow.bias = -0.0004;
+sun.shadow.normalBias = 0.03;
 scene.add(sun);
 
-const rimLight = new THREE.DirectionalLight(0x93c5fd, 0.45);
-rimLight.position.set(-30, 18, -22);
-scene.add(rimLight);
+const fillLight = new THREE.DirectionalLight(0x7dd3fc, 0.45);
+fillLight.position.set(-35, 22, -28);
+scene.add(fillLight);
 
-// ---------- helpers ----------
-const mat = (color, rough = 0.65, metal = 0.08, extra = {}) =>
-  new THREE.MeshStandardMaterial({ color, roughness: rough, metalness: metal, ...extra });
-
-function box(w, h, d, m, x = 0, y = 0, z = 0) {
-  const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m);
-  mesh.position.set(x, y, z);
-  mesh.castShadow = true; mesh.receiveShadow = true;
-  return mesh;
-}
-function cyl(rt, rb, h, seg, m, x = 0, y = 0, z = 0) {
-  const mesh = new THREE.Mesh(new THREE.CylinderGeometry(rt, rb, h, seg), m);
-  mesh.position.set(x, y, z);
-  mesh.castShadow = true; mesh.receiveShadow = true;
-  return mesh;
-}
-
-// ---------- ocean, island, road, trees, clouds, street lamps ----------
-const waterGeo = new THREE.PlaneGeometry(360, 360, 48, 48);
+// ============================================================
+// 3. ORGANIC COASTAL ISLAND, OCEAN, HILLS, ROAD, PLAZA & FOLIAGE
+// ============================================================
+// Reflective ocean
+const waterGeo = new THREE.PlaneGeometry(520, 520, 72, 72);
 waterGeo.rotateX(-Math.PI / 2);
-const waterMat = new THREE.MeshStandardMaterial({ color: 0x0ea5e9, roughness: 0.22, metalness: 0.35, flatShading: true });
+const waterMat = new THREE.MeshStandardMaterial({
+  color: 0x0369a1, roughness: 0.14, metalness: 0.65, flatShading: false,
+});
 const water = new THREE.Mesh(waterGeo, waterMat);
-water.position.y = -1.6;
+water.position.y = -1.75;
 water.receiveShadow = true;
 scene.add(water);
-const waterBaseY = Float32Array.from(waterGeo.attributes.position.array);
+const waterOrig = Float32Array.from(waterGeo.attributes.position.array);
 
-// Island base (layered stone + lush grass)
-scene.add(box(66, 2.2, 34, mat(0x78716c, 0.9, 0.02), 0, -1.35, 0));
-scene.add(box(64.5, 0.6, 32.5, mat(0x65a30d, 0.85, 0.0), 0, -0.2, 0));
+// Organic rounded island with gentle coastal cliffs and hills
+function islandHeight(x, z) {
+  const rx = x / 38, rz = z / 22;
+  const dist = Math.sqrt(rx * rx + rz * rz);
+  if (dist > 1.06) return -3.2;
+  // Flat town plateau in the middle, rolling hills along the north edge, smooth slope into sea
+  const edge = Math.max(0, Math.min(1, (1.04 - dist) / 0.18));
+  const smooth = edge * edge * (3 - 2 * edge);
+  const hill = z < -12 ? Math.max(0, (-12 - z) * 0.24) * (0.7 + 0.3 * Math.sin(x * 0.14)) : 0;
+  const micro = (Math.sin(x * 0.2) * Math.cos(z * 0.25)) * 0.12 * (Math.abs(z) > 11 ? 1 : 0);
+  return -2.4 + smooth * (2.4 + hill + micro);
+}
+const terrGeo = new THREE.PlaneGeometry(92, 56, 110, 72);
+terrGeo.rotateX(-Math.PI / 2);
+const tPos = terrGeo.attributes.position;
+const tCol = new Float32Array(tPos.count * 3);
+const cGrass = new THREE.Color(0x6b9b4f), cSand = new THREE.Color(0xd6c39c), cRock = new THREE.Color(0x6e737b);
+for (let i = 0; i < tPos.count; i++) {
+  const x = tPos.getX(i), z = tPos.getZ(i);
+  const y = islandHeight(x, z);
+  tPos.setY(i, y);
+  const col = y < -0.55 ? cSand : y > 1.3 ? cRock.clone().lerp(cGrass, 0.55) : cGrass;
+  tCol[i * 3] = col.r; tCol[i * 3 + 1] = col.g; tCol[i * 3 + 2] = col.b;
+}
+terrGeo.setAttribute("color", new THREE.BufferAttribute(tCol, 3));
+terrGeo.computeVertexNormals();
+const terrain = new THREE.Mesh(terrGeo, new THREE.MeshStandardMaterial({
+  map: TEX.grass, vertexColors: true, roughness: 0.92, metalness: 0.02,
+}));
+terrain.receiveShadow = true;
+scene.add(terrain);
 
-// Main avenue + curbs + lane dashes
-scene.add(box(64, 0.14, 5.2, mat(0x334155, 0.85, 0.05), 0, 0.12, 0));
-scene.add(box(64, 0.18, 0.45, mat(0xcbd5e1, 0.7), 0, 0.15, -2.75));
-scene.add(box(64, 0.18, 0.45, mat(0xcbd5e1, 0.7), 0, 0.15, 2.75));
-const dashMat = mat(0xfef08a, 0.5);
-for (let x = -29; x <= 29; x += 3.2) {
-  scene.add(box(1.6, 0.04, 0.18, dashMat, x, 0.21, 0));
+// Helper mesh builders
+const mStd = (o) => new THREE.MeshStandardMaterial({ roughness: 0.65, metalness: 0.08, ...o });
+function mkBox(w, h, d, mat, x = 0, y = 0, z = 0) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+  m.position.set(x, y, z); m.castShadow = true; m.receiveShadow = true; return m;
+}
+function mkCyl(rt, rb, h, seg, mat, x = 0, y = 0, z = 0) {
+  const m = new THREE.Mesh(new THREE.CylinderGeometry(rt, rb, h, seg), mat);
+  m.position.set(x, y, z); m.castShadow = true; m.receiveShadow = true; return m;
 }
 
-// Sidewalks to every building
-const walkMat = mat(0x94a3b8, 0.8);
-B.forEach(b => {
-  const len = Math.abs(b.door.z) - 2.6;
-  scene.add(box(1.8, 0.1, len, walkMat, b.x, 0.12, b.z < 0 ? -2.6 - len / 2 : 2.6 + len / 2));
-});
+// Main asphalt boulevard + granite curbs + central stone plaza with fountain
+const roadMesh = mkBox(68, 0.14, 5.2, mStd({ map: TEX.asphalt, roughness: 0.85, metalness: 0.05 }), -1, 0.06, 0);
+roadMesh.castShadow = false;
+scene.add(roadMesh);
+const curbMat = mStd({ map: TEX.concrete, color: 0xd1d5db, roughness: 0.8 });
+scene.add(mkBox(68, 0.2, 0.45, curbMat, -1, 0.1, -2.8));
+scene.add(mkBox(68, 0.2, 0.45, curbMat, -1, 0.1, 2.8));
 
-// Street lamps (glow in sunset/night)
-const lampBulbs = [];
-const lampLights = [];
-const poleMat = mat(0x1e293b, 0.4, 0.7);
-for (const lx of [-20, -10, 0, 10, 20]) {
-  for (const lz of [-3.3, 3.3]) {
-    const g = new THREE.Group();
-    g.position.set(lx, 0.1, lz);
-    g.add(cyl(0.08, 0.12, 3.4, 8, poleMat, 0, 1.7, 0));
-    g.add(box(0.55, 0.1, 0.12, poleMat, 0, 3.4, lz < 0 ? 0.25 : -0.25));
-    const bm = new THREE.MeshStandardMaterial({ color: 0xfffbeb, emissive: 0xfde68a, emissiveIntensity: 0.1, roughness: 0.2 });
-    const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.2, 10, 10), bm);
-    bulb.position.set(0, 3.28, lz < 0 ? 0.45 : -0.45);
-    g.add(bulb);
-    lampBulbs.push(bm);
-    if (lx % 20 === 0) {
-      const pl = new THREE.PointLight(0xfde68a, 0, 14, 1.5);
-      pl.position.set(lx, 3.1, lz < 0 ? lz + 0.5 : lz - 0.5);
-      scene.add(pl);
-      lampLights.push(pl);
-    }
-    scene.add(g);
+// Central cobblestone roundabout / plaza at x=0, z=0? Keep road straight for crisp flow, add a cozy plaza alcove at x=-12, z=0 north/south
+const plazaMat = mStd({ map: TEX.cobble, roughness: 0.88 });
+const plaza = mkCyl(4.2, 4.4, 0.16, 24, plazaMat, 0, 0.05, 0);
+plaza.castShadow = false;
+scene.add(plaza);
+
+// Harbor wooden pier extending into the southern ocean!
+const pierMat = mStd({ map: TEX.woodPlank, roughness: 0.85 });
+scene.add(mkBox(11, 0.4, 9.5, pierMat, 5, -0.05, 16.5));
+for (const px of [0.2, 3.4, 6.6, 9.8]) {
+  for (const pz of [13.0, 17.0, 20.6]) {
+    scene.add(mkCyl(0.24, 0.28, 3.2, 8, mStd({ color: 0x4b382a, roughness: 0.9 }), px, -1.5, pz));
   }
 }
+// Moored cargo ship at the pier!
+const ship = new THREE.Group();
+ship.position.set(5, -1.2, 23.6);
+ship.add(mkBox(10.5, 1.8, 3.4, mStd({ color: 0x991b1b, roughness: 0.5, metalness: 0.2 }), 0, 0.5, 0));
+ship.add(mkBox(11.0, 0.5, 3.6, mStd({ color: 0x1e293b, roughness: 0.45, metalness: 0.3 }), 0, 1.5, 0));
+ship.add(mkBox(2.4, 2.6, 2.8, mStd({ color: 0xf8fafc, roughness: 0.4 }), 3.2, 2.9, 0));
+ship.add(mkBox(2.5, 0.6, 2.9, mStd({ color: 0x0f172a, roughness: 0.2, metalness: 0.5 }), 3.2, 3.5, 0));
+ship.add(mkBox(2.4, 1.1, 1.3, mStd({ map: TEX.corrugated("#f59e0b"), roughness: 0.5, metalness: 0.3 }), -2.6, 2.3, -0.7));
+ship.add(mkBox(2.4, 1.1, 1.3, mStd({ map: TEX.corrugated("#0284c7"), roughness: 0.5, metalness: 0.3 }), -2.6, 2.3, 0.7));
+ship.add(mkBox(2.4, 1.1, 1.3, mStd({ map: TEX.corrugated("#16a34a"), roughness: 0.5, metalness: 0.3 }), 0.1, 2.3, 0));
+scene.add(ship);
 
-// 3D Trees around the island perimeter
-const trunkMat = mat(0x7c4a2d, 0.9);
-const leafMats = [mat(0x15803d, 0.8), mat(0x16a34a, 0.8), mat(0x22c55e, 0.8)];
-const treeCoords = [
-  [-28,-13],[-24,-13.5],[-19,-13.5],[-11,-13.8],[-3,-13.5],[5,-13.8],[13,-13.5],[21,-13.8],[28,-13],
-  [-28,13],[-22,13.5],[-16,13.2],[-8,13.8],[0,13.5],[8,13.8],[16,13.2],[25,13.5],[29,12],
-  [-29,-5],[-29,5],[29,-4],[29,5]
+// ============================================================
+// 4. SERVICE BUILDINGS — MULTI-LAYERED ARCHITECTURAL 3D MODELS
+// ============================================================
+const B = [
+  {id: "s3",     name: "물류 창고",     sub: "S3",                               kind: "warehouse", color: 0xc26d35, hex: "#e08748", svc: ["s3"],                                x: -17, z: -9.5},
+  {id: "ddb",    name: "기록보관소",    sub: "DynamoDB · Kinesis",               kind: "archive",   color: 0x3b82f6, hex: "#60a5fa", svc: ["dynamodb", "kinesis"],               x: -8.5, z: -9.5},
+  {id: "sqs",    name: "중앙 우체국",   sub: "SQS",                              kind: "post",      color: 0xc84b31, hex: "#f87171", svc: ["sqs"],                               x: 0,   z: -9.5},
+  {id: "sns",    name: "방송 송신탑",   sub: "SNS · SES · EventBridge",          kind: "tower",     color: 0x8b5cf6, hex: "#c084fc", svc: ["sns", "ses", "events"],              x: 8.5, z: -9.5},
+  {id: "lambda", name: "자동화 공방",   sub: "Lambda · API Gateway",             kind: "workshop",  color: 0xd97706, hex: "#fbbf24", svc: ["lambda", "apigateway"],              x: 17,  z: -9.5},
+  {id: "sfn",    name: "조립 공장",     sub: "Step Functions",                   kind: "factory",   color: 0xdb2777, hex: "#f472b6", svc: ["states"],                            x: 25,  z: -9.5},
+  {id: "id",     name: "신분증 청사",   sub: "IAM · STS · Cognito",              kind: "office",    color: 0x0d9488, hex: "#2dd4bf", svc: ["iam", "sts", "cognito-idp"],         x: -13, z: 9.5},
+  {id: "vault",  name: "중앙 금고",     sub: "KMS · Secrets · SSM",              kind: "vault",     color: 0x475569, hex: "#94a3b8", svc: ["kms", "secretsmanager", "ssm"],      x: -4.5, z: 9.5},
+  {id: "harbor", name: "컨테이너 항구", sub: "ECS · RDS · ElastiCache · ALB",    kind: "harbor",    color: 0x0284c7, hex: "#38bdf8", svc: ["ecs", "rds", "elasticache", "elbv2"], x: 5,   z: 9.8},
+  {id: "radar",  name: "항공 관제탑",   sub: "VPC · Route 53 · Logs",            kind: "radar",     color: 0x4d7c0f, hex: "#a3e635", svc: ["ec2", "route53", "logs"],            x: 14,  z: 9.5},
+  {id: "crane",  name: "인프라 공사장", sub: "CloudFormation",                   kind: "crane",     color: 0xca8a04, hex: "#facc15", svc: ["cloudformation"],                    x: 22.5, z: 9.5},
 ];
-treeCoords.forEach(([tx, tz], i) => {
-  const tg = new THREE.Group();
-  tg.position.set(tx, 0.1, tz);
-  const sc = 0.85 + (i % 4) * 0.18;
-  tg.scale.setScalar(sc);
-  tg.add(cyl(0.18, 0.26, 1.4, 6, trunkMat, 0, 0.7, 0));
-  const lm = leafMats[i % leafMats.length];
-  if (i % 2 === 0) {
-    // Pine tree
-    const c1 = new THREE.Mesh(new THREE.ConeGeometry(1.15, 2.2, 7), lm);
-    c1.position.y = 2.1; c1.castShadow = true; tg.add(c1);
-    const c2 = new THREE.Mesh(new THREE.ConeGeometry(0.85, 1.8, 7), lm);
-    c2.position.y = 3.2; c2.castShadow = true; tg.add(c2);
-  } else {
-    // Broadleaf tree
-    const s1 = new THREE.Mesh(new THREE.DodecahedronGeometry(1.1, 0), lm);
-    s1.position.y = 2.2; s1.castShadow = true; tg.add(s1);
-  }
-  scene.add(tg);
+const byService = {};
+B.forEach(b => {
+  b.count = 0; b.bounce = 0; b.act = 0; b.step = 0;
+  b.door = new THREE.Vector3(b.x, 0.12, b.z < 0 ? b.z + 3.4 : b.z - 3.4);
+  b.svc.forEach(s => byService[s] = b);
+  // Cobblestone walkway to main boulevard
+  const len = Math.abs(b.door.z) - 2.6;
+  const walk = mkBox(2.2, 0.08, len, plazaMat, b.x, 0.08, b.z < 0 ? -2.6 - len / 2 : 2.6 + len / 2);
+  walk.castShadow = false;
+  scene.add(walk);
 });
+const GATE_X = -26.5;
 
-// Fluffy drifting clouds (high in the background sky so they never block buildings)
-const clouds = [];
-const cloudMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9, metalness: 0.0, transparent: true, opacity: 0.85 });
-for (let i = 0; i < 8; i++) {
-  const cg = new THREE.Group();
-  for (let j = 0; j < 4; j++) {
-    const p = new THREE.Mesh(new THREE.DodecahedronGeometry(1.1 + (j % 2) * 0.45, 1), cloudMat);
-    p.position.set((j - 1.5) * 1.0, (j % 2) * 0.35, (j % 3 - 1) * 0.4);
-    cg.add(p);
-  }
-  cg.position.set(-48 + i * 14, 24 + (i % 3) * 3.0, -28 - (i % 3) * 7);
-  scene.add(cg);
-  clouds.push(cg);
-}
-
-// Starfield (visible at night)
-const starPos = new Float32Array(300 * 3);
-for (let i = 0; i < 300; i++) {
-  starPos[i * 3] = (Math.random() - 0.5) * 200;
-  starPos[i * 3 + 1] = 28 + Math.random() * 55;
-  starPos[i * 3 + 2] = -30 - Math.random() * 90;
-}
-const starGeo = new THREE.BufferGeometry();
-starGeo.setAttribute("position", new THREE.BufferAttribute(starPos, 3));
-const starMat = new THREE.PointsMaterial({ color: 0xfef9c3, size: 0.55, transparent: true, opacity: 0.0 });
-scene.add(new THREE.Points(starGeo, starMat));
-
-// ---------- Gate (IAM) + Barrier + 3D Guard ----------
-const gateGroup = new THREE.Group();
-gateGroup.position.set(GATE_X, 0.1, 0);
-const stoneMat = mat(0x94a3b8, 0.8);
-const roofGateMat = mat(0x334155, 0.6);
-gateGroup.add(box(1.1, 4.4, 1.1, stoneMat, 0, 2.2, -3.4));
-gateGroup.add(box(1.1, 4.4, 1.1, stoneMat, 0, 2.2, 3.4));
-gateGroup.add(box(1.4, 1.0, 8.2, roofGateMat, 0, 4.7, 0));
-// Security booth next to gate
-gateGroup.add(box(2.0, 2.6, 1.8, mat(0x1e3a5f, 0.6), 1.4, 1.3, -4.4));
-gateGroup.add(box(2.3, 0.3, 2.1, mat(0x0f172a, 0.5), 1.4, 2.75, -4.4));
-// Barrier arm (pivots up/down)
-const barrierPivot = new THREE.Group();
-barrierPivot.position.set(0.6, 1.2, -2.7);
-const barMesh = box(0.18, 0.18, 5.2, mat(0xef4444, 0.4), 0, 0, 2.6);
-barrierPivot.add(barMesh);
-for (let k = 0; k < 5; k++) barrierPivot.add(box(0.2, 0.2, 0.45, mat(0xffffff, 0.4), 0, 0, 0.6 + k * 1.0));
-gateGroup.add(barrierPivot);
-// Beacon on gate
-const beaconMat = new THREE.MeshStandardMaterial({ color: 0x22c55e, emissive: 0x22c55e, emissiveIntensity: 0.6 });
-const beacon = new THREE.Mesh(new THREE.SphereGeometry(0.28, 12, 12), beaconMat);
-beacon.position.set(0, 5.4, 0);
-gateGroup.add(beacon);
-scene.add(gateGroup);
-
-// 3D Guard character
-function buildCharacter(coatColor, isGuard = false, isInspector = false) {
-  const g = new THREE.Group();
-  const coat = mat(coatColor, 0.55);
-  const skin = mat(0xf3c69f, 0.6);
-  const dark = mat(0x1e293b, 0.7);
-  // Legs
-  const legL = box(0.26, 0.65, 0.26, dark, -0.17, 0.32, 0);
-  const legR = box(0.26, 0.65, 0.26, dark, 0.17, 0.32, 0);
-  g.add(legL, legR);
-  // Torso
-  const body = box(0.72, 0.9, 0.46, coat, 0, 1.08, 0);
-  g.add(body);
-  // Head
-  const head = new THREE.Mesh(new THREE.SphereGeometry(0.34, 14, 14), skin);
-  head.position.set(0, 1.84, 0); head.castShadow = true; g.add(head);
-  // Arms (pivots at shoulder)
-  const armL = new THREE.Group(); armL.position.set(-0.48, 1.42, 0);
-  armL.add(box(0.22, 0.72, 0.22, coat, 0, -0.32, 0));
-  const armR = new THREE.Group(); armR.position.set(0.48, 1.42, 0);
-  armR.add(box(0.22, 0.72, 0.22, coat, 0, -0.32, 0));
-  g.add(armL, armR);
-  if (isGuard) {
-    g.add(cyl(0.38, 0.38, 0.14, 12, mat(0x0f172a, 0.5), 0, 2.1, 0));
-    g.add(box(0.42, 0.07, 0.35, mat(0x0f172a, 0.5), 0, 2.04, 0.26));
-    g.add(box(0.22, 0.22, 0.06, mat(0xfacc15, 0.3, 0.7), 0.16, 1.25, 0.25)); // gold badge
-  } else if (isInspector) {
-    // Detective fedora hat + golden magnifying glass
-    const hatMat = mat(0x3b0764, 0.6);
-    g.add(cyl(0.56, 0.56, 0.07, 16, hatMat, 0, 2.08, 0));
-    g.add(cyl(0.32, 0.36, 0.32, 16, hatMat, 0, 2.26, 0));
-    const mag = new THREE.Group();
-    mag.position.set(0, -0.6, 0.3);
-    const ring = new THREE.Mesh(new THREE.TorusGeometry(0.22, 0.05, 8, 16), mat(0xfacc15, 0.25, 0.8));
-    const lens = new THREE.Mesh(new THREE.CircleGeometry(0.2, 14), new THREE.MeshStandardMaterial({ color: 0x7dd3fc, transparent: true, opacity: 0.55, roughness: 0.1 }));
-    mag.add(ring, lens, cyl(0.04, 0.04, 0.28, 8, mat(0x78350f, 0.7), 0, -0.32, 0));
-    armR.add(mag);
-  } else {
-    // Delivery parcel in hands
-    const parcel = box(0.46, 0.38, 0.42, mat(0xd99b52, 0.7), 0, 1.05, 0.44);
-    parcel.name = "parcel";
-    g.add(parcel);
-  }
-  g.userData = { legL, legR, armL, armR };
-  return g;
-}
-
-const guardMesh = buildCharacter(0x1e3a8a, true, false);
-guardMesh.position.set(GATE_X + 1.2, 0.12, -2.5);
-guardMesh.rotation.y = Math.PI * 0.25;
-scene.add(guardMesh);
-const guardState = { block: 0, pass: 0, defend: 0 };
-
-// ---------- 11 unique 3D service buildings ----------
-const windowMats = [];
-const buildingMeshes = [];
+const litWindowMats = [];
 const clickTargets = [];
 
-function addWindows(g, w, h, d, rows, cols, zSide) {
-  const wm = new THREE.MeshStandardMaterial({ color: 0xbae6fd, emissive: 0xfef08a, emissiveIntensity: 0.08, roughness: 0.15, metalness: 0.3 });
-  windowMats.push(wm);
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      const wx = -w * 0.34 + (cols === 1 ? 0 : (c / (cols - 1)) * w * 0.68);
-      const wy = 1.25 + r * 1.1;
-      g.add(box(0.58, 0.62, 0.1, wm, wx, wy, zSide * (d / 2 + 0.02)));
-    }
-  }
+function makeLitWindowMat() {
+  const m = new THREE.MeshStandardMaterial({
+    map: TEX.windows, emissiveMap: TEX.windows,
+    emissive: new THREE.Color(0xffdfa0), emissiveIntensity: 0.15,
+    roughness: 0.15, metalness: 0.55,
+  });
+  litWindowMats.push(m);
+  return m;
 }
 
-function buildServiceBuilding(b) {
+function buildArchitecture(b) {
   const root = new THREE.Group();
-  root.position.set(b.x, 0.1, b.z);
-  const face = b.z < 0 ? 1 : -1; // faces toward main avenue (z=0)
-  const mainMat = mat(b.color, 0.58, 0.12);
-  const trimMat = mat(0xf8fafc, 0.6, 0.05);
-  const darkMat = mat(0x1e293b, 0.65, 0.2);
+  root.position.set(b.x, 0.08, b.z);
+  const face = b.z < 0 ? 1 : -1;
+  const stoneM = mStd({ map: TEX.stone, roughness: 0.8 });
+  const concM = mStd({ map: TEX.concrete, roughness: 0.85 });
+  const darkMetal = mStd({ color: 0x1e293b, roughness: 0.35, metalness: 0.78 });
+  const glassM = mStd({ color: 0x7dd3fc, roughness: 0.08, metalness: 0.85, transparent: true, opacity: 0.82 });
+  const winM = makeLitWindowMat();
 
-  // Foundation plinth
-  root.add(box(5.6, 0.35, 5.2, mat(0x475569, 0.8), 0, 0.17, 0));
+  // Stone foundation & entry steps
+  root.add(mkBox(6.4, 0.36, 5.8, stoneM, 0, 0.18, 0));
+  root.add(mkBox(2.4, 0.18, 0.9, concM, 0, 0.1, face * 3.15));
 
-  // Glow ring around base (lights up on request)
+  // Neon base pulse ring (triggers on request arrival)
   const glowMat = new THREE.MeshBasicMaterial({ color: 0x34d399, transparent: true, opacity: 0.0, side: THREE.DoubleSide });
-  const glowRing = new THREE.Mesh(new THREE.RingGeometry(3.1, 3.65, 32), glowMat);
-  glowRing.rotation.x = -Math.PI / 2;
-  glowRing.position.y = 0.06;
+  const glowRing = new THREE.Mesh(new THREE.RingGeometry(3.4, 4.0, 36), glowMat);
+  glowRing.rotation.x = -Math.PI / 2; glowRing.position.y = 0.05;
   root.add(glowRing);
 
   const anim = {};
   switch (b.kind) {
     case "warehouse": {
-      // S3: Gable-roof warehouse + roll-up door + cargo crates outside
-      root.add(box(4.8, 3.0, 4.2, mainMat, 0, 1.85, 0));
-      const roof = new THREE.Mesh(new THREE.CylinderGeometry(0, 3.5, 1.6, 4), mat(0x7c2d12, 0.7));
-      roof.position.y = 4.15; roof.rotation.y = Math.PI / 4; roof.castShadow = true; root.add(roof);
-      root.add(box(2.0, 2.0, 0.14, mat(0xe2e8f0, 0.5, 0.3), 0, 1.35, face * 2.1));
-      // Stacked boxes outside
-      const cr1 = box(0.75, 0.75, 0.75, mat(0xd97706, 0.7), -1.7, 0.72, face * 2.35);
-      const cr2 = box(0.65, 0.65, 0.65, mat(0xf59e0b, 0.7), -1.65, 1.42, face * 2.35);
-      root.add(cr1, cr2);
-      anim.lift = cr2;
+      const wallM = mStd({ map: TEX.corrugated("#9a5b32"), roughness: 0.55, metalness: 0.35 });
+      const roofM = mStd({ map: TEX.roofTile("#5c2614"), roughness: 0.7 });
+      root.add(mkBox(5.4, 3.2, 4.6, wallM, 0, 1.95, 0));
+      // Pitched gable roof (2 angled planes)
+      for (const s of [-1, 1]) {
+        const rp = mkBox(5.8, 0.18, 2.85, roofM, 0, 4.25, s * 1.18);
+        rp.rotation.x = s * 0.46; root.add(rp);
+      }
+      // Loading bay shutter + canopy + stacked wooden crates
+      root.add(mkBox(2.4, 2.1, 0.15, mStd({ map: TEX.corrugated("#cbd5e1"), roughness: 0.4, metalness: 0.6 }), 0, 1.4, face * 2.32));
+      root.add(mkBox(3.0, 0.14, 0.9, darkMetal, 0, 2.65, face * 2.65));
+      const c1 = mkBox(0.85, 0.85, 0.85, mStd({ map: TEX.woodPlank, roughness: 0.8 }), -1.9, 0.78, face * 2.55);
+      const c2 = mkBox(0.72, 0.72, 0.72, mStd({ map: TEX.woodPlank, color: 0xf59e0b, roughness: 0.75 }), -1.85, 1.56, face * 2.55);
+      root.add(c1, c2);
+      anim.lift = c2;
       break;
     }
     case "archive": {
-      // DynamoDB / Kinesis: Classical columns + spinning data cylinders on top
-      root.add(box(4.6, 3.4, 4.0, mainMat, 0, 2.05, 0));
-      for (const px of [-1.8, -0.6, 0.6, 1.8]) root.add(cyl(0.18, 0.2, 3.2, 10, trimMat, px, 1.95, face * 2.1));
-      root.add(box(5.0, 0.4, 4.6, trimMat, 0, 3.9, 0));
-      const disc = new THREE.Group(); disc.position.set(0, 4.6, 0);
-      for (let i = 0; i < 3; i++) disc.add(cyl(1.1, 1.1, 0.28, 18, mat(0x60a5fa, 0.3, 0.5), 0, i * 0.42, 0));
+      const marbleM = mStd({ map: TEX.stone, color: 0xdbeafe, roughness: 0.45, metalness: 0.1 });
+      const navyM = mStd({ color: 0x1e3a8a, roughness: 0.5, metalness: 0.35 });
+      root.add(mkBox(5.2, 3.8, 4.4, navyM, 0, 2.25, 0));
+      root.add(mkBox(4.8, 2.8, 0.1, winM, 0, 2.3, face * 2.22));
+      for (const px of [-2.1, -0.7, 0.7, 2.1]) root.add(mkCyl(0.2, 0.24, 3.6, 12, marbleM, px, 2.15, face * 2.45));
+      root.add(mkBox(5.8, 0.45, 5.2, marbleM, 0, 4.35, 0));
+      // Holographic rotating database platters on roof
+      const disc = new THREE.Group(); disc.position.set(0, 5.1, 0);
+      for (let i = 0; i < 3; i++) {
+        disc.add(mkCyl(1.15, 1.15, 0.24, 24, mStd({ color: 0x38bdf8, emissive: 0x0284c7, emissiveIntensity: 0.65, roughness: 0.2, metalness: 0.7 }), 0, i * 0.4, 0));
+      }
       root.add(disc);
       anim.spin = disc;
       break;
     }
     case "post": {
-      // SQS: Post office + pitched roof + red mailbox + letter sign
-      root.add(box(4.6, 2.9, 4.0, mainMat, 0, 1.8, 0));
-      root.add(box(5.0, 0.35, 4.4, trimMat, 0, 3.4, 0));
-      addWindows(root, 4.4, 2.6, 4.0, 1, 3, face);
-      // Mailbox
-      const mb = new THREE.Group(); mb.position.set(2.1, 0.35, face * 2.2);
-      mb.add(cyl(0.08, 0.08, 0.9, 8, darkMat, 0, 0.45, 0));
-      mb.add(box(0.5, 0.45, 0.7, mat(0xdc2626, 0.4), 0, 1.05, 0));
+      const brickM = mStd({ map: TEX.brick("#b94a34", "#9e3b28"), roughness: 0.82 });
+      const roofM = mStd({ map: TEX.roofTile("#334155"), roughness: 0.65 });
+      root.add(mkBox(5.2, 3.3, 4.4, brickM, 0, 2.0, 0));
+      root.add(mkBox(4.2, 2.2, 0.1, winM, 0, 2.1, face * 2.22));
+      root.add(mkBox(5.6, 0.35, 4.8, stoneM, 0, 3.8, 0));
+      const hip = new THREE.Mesh(new THREE.ConeGeometry(3.8, 1.5, 4), roofM);
+      hip.position.y = 4.7; hip.rotation.y = Math.PI / 4; hip.castShadow = true; root.add(hip);
+      // Iconic red postbox
+      const mb = new THREE.Group(); mb.position.set(2.3, 0.35, face * 2.45);
+      mb.add(mkCyl(0.08, 0.08, 0.85, 8, darkMetal, 0, 0.42, 0));
+      mb.add(mkBox(0.55, 0.5, 0.75, mStd({ color: 0xdc2626, roughness: 0.35, metalness: 0.3 }), 0, 1.0, 0));
       root.add(mb);
-      // Floating envelope emblem
-      const env = box(1.5, 0.95, 0.16, trimMat, 0, 4.35, 0);
+      // Neon mail emblem
+      const env = mkBox(1.5, 0.9, 0.16, mStd({ color: 0xffffff, emissive: 0xf97316, emissiveIntensity: 0.55 }), 0, 5.75, 0);
       root.add(env);
       anim.bob = env;
       break;
     }
     case "tower": {
-      // SNS / SES / EventBridge: Broadcast tower + pulsing radio rings
-      root.add(box(4.2, 2.2, 3.8, mainMat, 0, 1.45, 0));
-      addWindows(root, 3.8, 2.0, 3.8, 1, 2, face);
-      const spire = new THREE.Mesh(new THREE.ConeGeometry(0.9, 4.8, 4), mat(0xc084fc, 0.4, 0.5));
-      spire.position.y = 4.95; spire.castShadow = true; root.add(spire);
-      const tip = new THREE.Mesh(new THREE.SphereGeometry(0.26, 12, 12), new THREE.MeshStandardMaterial({ color: 0xf43f5e, emissive: 0xf43f5e, emissiveIntensity: 1.0 }));
-      tip.position.y = 7.4; root.add(tip);
-      const wave = new THREE.Mesh(new THREE.TorusGeometry(0.8, 0.06, 8, 24), new THREE.MeshBasicMaterial({ color: 0xe879f9, transparent: true, opacity: 0.8 }));
-      wave.rotation.x = Math.PI / 2; wave.position.y = 7.1; root.add(wave);
+      const baseM = mStd({ map: TEX.concrete, color: 0x4c1d95, roughness: 0.6, metalness: 0.3 });
+      root.add(mkBox(4.8, 2.5, 4.2, baseM, 0, 1.6, 0));
+      root.add(mkBox(3.8, 1.5, 0.1, winM, 0, 1.7, face * 2.12));
+      // Steel lattice mast
+      const mastMat = mStd({ color: 0xe2e8f0, roughness: 0.3, metalness: 0.85 });
+      for (const [cx, cz] of [[-0.7,-0.7],[0.7,-0.7],[-0.7,0.7],[0.7,0.7]]) {
+        const leg = mkCyl(0.06, 0.1, 6.2, 6, mastMat, cx * 0.65, 5.8, cz * 0.65);
+        leg.rotation.z = cx * 0.12; leg.rotation.x = -cz * 0.12; root.add(leg);
+      }
+      for (let h = 3.5; h <= 7.8; h += 1.4) {
+        const s = 1.3 - (h - 3.5) * 0.18;
+        root.add(mkBox(s, 0.08, s, mastMat, 0, h, 0));
+      }
+      const beacon = new THREE.Mesh(new THREE.SphereGeometry(0.28, 14, 14), mStd({ color: 0xf43f5e, emissive: 0xf43f5e, emissiveIntensity: 2.2 }));
+      beacon.position.y = 9.0; root.add(beacon);
+      const wave = new THREE.Mesh(new THREE.TorusGeometry(0.9, 0.07, 10, 28), new THREE.MeshBasicMaterial({ color: 0xd946ef, transparent: true, opacity: 0.85 }));
+      wave.rotation.x = Math.PI / 2; wave.position.y = 8.6; root.add(wave);
       anim.wave = wave;
       break;
     }
     case "workshop": {
-      // Lambda / API GW: Workshop + spinning golden gear + chimney
-      root.add(box(4.6, 3.1, 4.0, mainMat, 0, 1.9, 0));
-      addWindows(root, 4.2, 2.8, 4.0, 1, 2, face);
-      root.add(cyl(0.32, 0.42, 2.2, 10, darkMat, -1.5, 4.4, -1.0));
-      const gear = new THREE.Group(); gear.position.set(0.4, 4.3, 0);
-      gear.add(new THREE.Mesh(new THREE.TorusGeometry(0.95, 0.22, 8, 20), mat(0xfef08a, 0.3, 0.7)));
+      const brickM = mStd({ map: TEX.brick("#b4692e", "#945222"), roughness: 0.78 });
+      root.add(mkBox(5.2, 3.4, 4.4, brickM, 0, 2.05, 0));
+      root.add(mkBox(4.0, 2.1, 0.1, winM, 0, 2.1, face * 2.22));
+      root.add(mkBox(5.5, 0.3, 4.7, darkMetal, 0, 3.9, 0));
+      root.add(mkCyl(0.32, 0.42, 2.6, 12, darkMetal, -1.7, 5.1, -1.1));
+      // Glowing golden mechanical gear on rooftop
+      const gearM = mStd({ color: 0xfbbf24, emissive: 0xd97706, emissiveIntensity: 0.45, roughness: 0.25, metalness: 0.85 });
+      const gear = new THREE.Group(); gear.position.set(0.4, 5.15, 0);
+      gear.add(new THREE.Mesh(new THREE.TorusGeometry(0.95, 0.22, 10, 24), gearM));
       for (let i = 0; i < 8; i++) {
-        const tooth = box(0.32, 0.42, 0.28, mat(0xfef08a, 0.3, 0.7));
         const a = (i / 8) * Math.PI * 2;
-        tooth.position.set(Math.cos(a) * 1.15, Math.sin(a) * 1.15, 0);
-        tooth.rotation.z = a;
-        gear.add(tooth);
+        const t = mkBox(0.32, 0.42, 0.28, gearM, Math.cos(a) * 1.15, Math.sin(a) * 1.15, 0);
+        t.rotation.z = a; gear.add(t);
       }
       root.add(gear);
       anim.gear = gear;
       break;
     }
     case "factory": {
-      // Step Functions: Sawtooth factory + 4 glowing pipeline lamps
-      root.add(box(4.8, 2.8, 4.2, mainMat, 0, 1.75, 0));
+      const wallM = mStd({ map: TEX.corrugated("#9d174d"), roughness: 0.55, metalness: 0.4 });
+      root.add(mkBox(5.4, 3.1, 4.6, wallM, 0, 1.9, 0));
+      // Industrial sawtooth skylight roof
       for (let i = -1; i <= 1; i++) {
-        const saw = new THREE.Mesh(new THREE.ConeGeometry(1.1, 1.2, 3), mat(0xbe185d, 0.6));
-        saw.position.set(i * 1.4, 3.7, 0); saw.castShadow = true; root.add(saw);
+        const p = mkBox(1.5, 1.1, 4.4, glassM, i * 1.6, 3.9, 0);
+        p.rotation.z = 0.38; root.add(p);
       }
       anim.lamps = [];
       for (let i = 0; i < 4; i++) {
-        const lm = new THREE.MeshStandardMaterial({ color: 0xfef08a, emissive: 0xfef08a, emissiveIntensity: 0.15 });
-        const s = new THREE.Mesh(new THREE.SphereGeometry(0.26, 10, 10), lm);
-        s.position.set(-1.5 + i * 1.0, 2.2, face * 2.2);
-        root.add(s);
-        anim.lamps.push(lm);
+        const lm = mStd({ color: 0xfef08a, emissive: 0xf472b6, emissiveIntensity: 0.4 });
+        const s = new THREE.Mesh(new THREE.SphereGeometry(0.28, 12, 12), lm);
+        s.position.set(-1.65 + i * 1.1, 2.35, face * 2.4);
+        root.add(s); anim.lamps.push(lm);
       }
       break;
     }
     case "office": {
-      // IAM / STS / Cognito: Civic hall with dome + golden shield
-      root.add(box(4.8, 3.1, 4.0, mainMat, 0, 1.9, 0));
-      addWindows(root, 4.4, 2.8, 4.0, 2, 3, face);
-      const dome = new THREE.Mesh(new THREE.SphereGeometry(1.65, 18, 12, 0, Math.PI * 2, 0, Math.PI / 2), mat(0x2dd4bf, 0.35, 0.4));
-      dome.position.y = 3.45; dome.castShadow = true; root.add(dome);
-      const shield = new THREE.Mesh(new THREE.OctahedronGeometry(0.55, 0), mat(0xfacc15, 0.25, 0.8));
-      shield.position.set(0, 5.5, 0); root.add(shield);
-      anim.spin = shield;
+      const wallM = mStd({ map: TEX.stone, color: 0xccfbf1, roughness: 0.55 });
+      root.add(mkBox(5.4, 3.4, 4.4, wallM, 0, 2.05, 0));
+      root.add(mkBox(4.4, 2.4, 0.1, winM, 0, 2.15, face * 2.22));
+      root.add(mkBox(5.8, 0.35, 4.8, stoneM, 0, 3.9, 0));
+      const dome = new THREE.Mesh(new THREE.SphereGeometry(1.75, 24, 16, 0, Math.PI * 2, 0, Math.PI / 2), mStd({ color: 0x0d9488, roughness: 0.25, metalness: 0.65 }));
+      dome.position.y = 4.05; dome.castShadow = true; root.add(dome);
+      const crest = new THREE.Mesh(new THREE.OctahedronGeometry(0.55, 0), mStd({ color: 0xfacc15, emissive: 0xeab308, emissiveIntensity: 0.7, roughness: 0.2, metalness: 0.9 }));
+      crest.position.set(0, 6.2, 0); root.add(crest);
+      anim.spin = crest;
       break;
     }
     case "vault": {
-      // KMS / Secrets / SSM: Armored bank vault + spinning vault door wheel
-      root.add(box(4.6, 3.3, 4.2, mainMat, 0, 2.0, 0));
-      root.add(box(5.0, 0.45, 4.6, darkMat, 0, 3.85, 0));
-      const wheel = new THREE.Group(); wheel.position.set(0, 2.0, face * 2.22);
-      wheel.add(new THREE.Mesh(new THREE.TorusGeometry(0.95, 0.14, 10, 24), mat(0xe2e8f0, 0.25, 0.85)));
+      const steelM = mStd({ map: TEX.concrete, color: 0x475569, roughness: 0.38, metalness: 0.75 });
+      root.add(mkBox(5.0, 3.6, 4.6, steelM, 0, 2.15, 0));
+      root.add(mkBox(5.4, 0.45, 5.0, darkMetal, 0, 4.1, 0));
+      // Heavy circular vault door + spinning titanium wheel
+      root.add(mkCyl(1.45, 1.45, 0.22, 24, darkMetal, 0, 2.1, face * 2.32));
+      const wheel = new THREE.Group(); wheel.position.set(0, 2.1, face * 2.48);
+      const chromeM = mStd({ color: 0xf1f5f9, roughness: 0.18, metalness: 0.92 });
+      wheel.add(new THREE.Mesh(new THREE.TorusGeometry(0.95, 0.13, 12, 28), chromeM));
       for (let i = 0; i < 4; i++) {
-        const spoke = box(1.8, 0.12, 0.12, mat(0xe2e8f0, 0.25, 0.85));
-        spoke.rotation.z = (i * Math.PI) / 4;
-        wheel.add(spoke);
+        const sp = mkBox(1.85, 0.12, 0.12, chromeM); sp.rotation.z = (i * Math.PI) / 4; wheel.add(sp);
       }
       root.add(wheel);
       anim.wheel = wheel;
       break;
     }
     case "harbor": {
-      // ECS / RDS / ElastiCache / ALB: Shipping containers stack + gantry
-      const cols = [0xf59e0b, 0xef4444, 0x38bdf8, 0x22c55e];
-      root.add(box(2.1, 1.3, 3.6, mat(cols[0], 0.5), -1.15, 1.0, 0));
-      root.add(box(2.1, 1.3, 3.6, mat(cols[1], 0.5), 1.15, 1.0, 0));
-      root.add(box(2.1, 1.3, 3.6, mat(cols[2], 0.5), -1.15, 2.35, 0));
-      const topC = box(2.1, 1.3, 3.6, mat(cols[3], 0.5), 1.15, 2.35, 0);
-      root.add(topC);
-      root.add(box(0.25, 4.5, 0.25, darkMat, -2.3, 2.6, 1.6));
-      root.add(box(0.25, 4.5, 0.25, darkMat, 2.3, 2.6, 1.6));
-      root.add(box(5.0, 0.3, 0.3, mat(0xf97316, 0.5), 0, 4.8, 1.6));
-      anim.lift = topC;
+      const c1 = mkBox(2.3, 1.35, 3.9, mStd({ map: TEX.corrugated("#f59e0b"), roughness: 0.5, metalness: 0.35 }), -1.25, 1.05, 0);
+      const c2 = mkBox(2.3, 1.35, 3.9, mStd({ map: TEX.corrugated("#dc2626"), roughness: 0.5, metalness: 0.35 }), 1.25, 1.05, 0);
+      const c3 = mkBox(2.3, 1.35, 3.9, mStd({ map: TEX.corrugated("#0284c7"), roughness: 0.5, metalness: 0.35 }), -1.25, 2.42, 0);
+      const c4 = mkBox(2.3, 1.35, 3.9, mStd({ map: TEX.corrugated("#16a34a"), roughness: 0.5, metalness: 0.35 }), 1.25, 2.42, 0);
+      root.add(c1, c2, c3, c4);
+      // Gantry crane frame
+      const craneM = mStd({ color: 0xea580c, roughness: 0.4, metalness: 0.65 });
+      for (const gx of [-2.7, 2.7]) for (const gz of [-1.8, 1.8]) root.add(mkBox(0.28, 5.2, 0.28, craneM, gx, 2.9, gz));
+      root.add(mkBox(5.9, 0.35, 4.0, craneM, 0, 5.5, 0));
+      anim.lift = c4;
       break;
     }
     case "radar": {
-      // VPC / Route53 / Logs: Airport control tower + rotating 3D radar dish
-      root.add(cyl(0.95, 1.35, 3.6, 12, mainMat, 0, 2.15, 0));
-      const cab = cyl(1.75, 1.35, 1.2, 12, new THREE.MeshStandardMaterial({ color: 0x38bdf8, emissive: 0x0ea5e9, emissiveIntensity: 0.22, roughness: 0.1, metalness: 0.3 }), 0, 4.45, 0);
+      root.add(mkCyl(1.05, 1.5, 4.2, 16, concM, 0, 2.45, 0));
+      // Panoramic glass control cab
+      const cab = mkCyl(2.0, 1.5, 1.4, 16, mStd({ color: 0x38bdf8, emissive: 0x0284c7, emissiveIntensity: 0.35, roughness: 0.1, metalness: 0.85 }), 0, 5.2, 0);
       root.add(cab);
-      root.add(cyl(1.9, 1.9, 0.24, 12, trimMat, 0, 5.15, 0));
-      const dish = new THREE.Group(); dish.position.set(0, 5.85, 0);
-      dish.add(cyl(0.12, 0.12, 1.0, 8, darkMat, 0, -0.2, 0));
-      const panel = box(1.9, 0.65, 0.14, trimMat, 0, 0.3, 0);
-      dish.add(panel);
+      root.add(mkCyl(2.2, 2.2, 0.28, 16, darkMetal, 0, 6.0, 0));
+      const dish = new THREE.Group(); dish.position.set(0, 6.8, 0);
+      dish.add(mkCyl(0.12, 0.12, 1.1, 8, darkMetal, 0, -0.25, 0));
+      dish.add(mkBox(2.3, 0.72, 0.14, mStd({ color: 0xf8fafc, roughness: 0.3, metalness: 0.6 }), 0, 0.3, 0));
       root.add(dish);
       anim.spin = dish;
       break;
     }
     case "crane": {
-      // CloudFormation: Steel frame + yellow tower crane with moving hook
-      root.add(box(3.4, 2.2, 3.0, new THREE.MeshStandardMaterial({ color: 0x94a3b8, wireframe: true }), -0.7, 1.45, 0));
-      root.add(box(3.2, 0.3, 2.8, mat(0xfbbf24, 0.5), -0.7, 0.5, 0));
-      const mast = box(0.55, 6.2, 0.55, mat(0xeab308, 0.45), 1.5, 3.45, -1.0);
-      root.add(mast);
-      const jib = new THREE.Group(); jib.position.set(1.5, 6.4, -1.0);
-      jib.add(box(5.6, 0.38, 0.42, mat(0xfacc15, 0.45), -1.4, 0, 0));
-      const hook = new THREE.Group(); hook.position.set(-3.2, -1.4, 0);
-      hook.add(cyl(0.04, 0.04, 2.2, 6, darkMat, 0, 1.1, 0));
-      hook.add(box(0.75, 0.55, 0.75, mat(0xf97316, 0.5), 0, 0, 0));
+      const steelFrame = new THREE.Mesh(new THREE.BoxGeometry(3.6, 2.6, 3.2), new THREE.MeshStandardMaterial({ color: 0x94a3b8, wireframe: true }));
+      steelFrame.position.set(-0.8, 1.65, 0); root.add(steelFrame);
+      root.add(mkBox(3.5, 0.32, 3.0, concM, -0.8, 0.52, 0));
+      const craneY = mStd({ color: 0xfacc15, roughness: 0.38, metalness: 0.55 });
+      root.add(mkBox(0.58, 7.2, 0.58, craneY, 1.7, 3.9, -1.1));
+      const jib = new THREE.Group(); jib.position.set(1.7, 7.4, -1.1);
+      jib.add(mkBox(6.4, 0.4, 0.44, craneY, -1.6, 0, 0));
+      const hook = new THREE.Group(); hook.position.set(-3.6, -1.6, 0);
+      hook.add(mkCyl(0.04, 0.04, 2.4, 6, darkMetal, 0, 1.2, 0));
+      hook.add(mkBox(0.82, 0.62, 0.82, mStd({ map: TEX.corrugated("#ea580c"), roughness: 0.5 }), 0, 0, 0));
       jib.add(hook);
       root.add(jib);
       anim.jib = jib; anim.hook = hook;
@@ -619,55 +736,196 @@ function buildServiceBuilding(b) {
   root.userData = { building: b, glowMat, anim };
   scene.add(root);
   b.mesh = root;
-  buildingMeshes.push(root);
   root.traverse(o => { if (o.isMesh) { o.userData.building = b; clickTargets.push(o); } });
 
-  // HTML floating label
   const lbl = document.createElement("div");
   lbl.className = "blabel";
-  lbl.innerHTML = `<span style="width:8px;height:8px;border-radius:50%;background:${b.hex};display:inline-block"></span><span>${b.name}</span><span class="cnt">0</span>`;
+  lbl.innerHTML = `<span class="dotc" style="background:${b.hex};color:${b.hex}"></span><span>${b.name}</span><span class="cnt">0</span>`;
   $("labels").appendChild(lbl);
   b.labelEl = lbl;
   b.cntEl = lbl.querySelector(".cnt");
 }
-B.forEach(buildServiceBuilding);
+B.forEach(buildArchitecture);
 
-// Gate floating label
+// ============================================================
+// 5. IAM CHECKPOINT GATE, BARRIER, STREET LAMPS & FOREST
+// ============================================================
+const gateGroup = new THREE.Group();
+gateGroup.position.set(GATE_X, 0.08, 0);
+const gStone = mStd({ map: TEX.stone, roughness: 0.78 });
+const gDark = mStd({ color: 0x0f172a, roughness: 0.4, metalness: 0.75 });
+gateGroup.add(mkBox(1.4, 5.2, 1.4, gStone, 0, 2.6, -3.5));
+gateGroup.add(mkBox(1.4, 5.2, 1.4, gStone, 0, 2.6, 3.5));
+gateGroup.add(mkBox(1.8, 1.1, 8.8, gDark, 0, 5.4, 0));
+gateGroup.add(mkBox(2.2, 2.8, 2.0, mStd({ color: 0x1e3a5f, roughness: 0.5 }), 1.6, 1.4, -4.6));
+gateGroup.add(mkBox(2.6, 0.25, 2.4, gDark, 1.6, 2.9, -4.6));
+
+const barrierPivot = new THREE.Group();
+barrierPivot.position.set(0.7, 1.2, -2.7);
+barrierPivot.add(mkBox(0.16, 0.16, 5.2, mStd({ color: 0xef4444, roughness: 0.35 }), 0, 0, 2.6));
+for (let k = 0; k < 5; k++) barrierPivot.add(mkBox(0.18, 0.18, 0.42, mStd({ color: 0xffffff, roughness: 0.3 }), 0, 0, 0.6 + k * 1.0));
+gateGroup.add(barrierPivot);
+
+const beaconMat = mStd({ color: 0x22c55e, emissive: 0x22c55e, emissiveIntensity: 1.8 });
+const beaconMesh = new THREE.Mesh(new THREE.SphereGeometry(0.32, 14, 14), beaconMat);
+beaconMesh.position.set(0, 6.25, 0);
+gateGroup.add(beaconMesh);
+scene.add(gateGroup);
+
 const gateLabel = document.createElement("div");
 gateLabel.className = "blabel";
-gateLabel.innerHTML = `<span>🛡 정문 · IAM</span>`;
+gateLabel.innerHTML = `<span>🛡 정문 · IAM 검문소</span>`;
 $("labels").appendChild(gateLabel);
 
-// ---------- event → story & outcome ----------
+// Street lamps with warm bloom bulbs
+const lampBulbs = [], lampLights = [];
+const poleMat = mStd({ color: 0x1e293b, roughness: 0.35, metalness: 0.8 });
+for (const lx of [-21, -13, -5, 3, 11, 19, 26]) {
+  for (const lz of [-3.4, 3.4]) {
+    const g = new THREE.Group(); g.position.set(lx, 0.08, lz);
+    g.add(mkCyl(0.07, 0.11, 3.8, 8, poleMat, 0, 1.9, 0));
+    g.add(mkBox(0.6, 0.09, 0.11, poleMat, 0, 3.8, lz < 0 ? 0.28 : -0.28));
+    const bm = mStd({ color: 0xfffbeb, emissive: 0xfde68a, emissiveIntensity: 0.15, roughness: 0.15 });
+    const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.22, 10, 10), bm);
+    bulb.position.set(0, 3.68, lz < 0 ? 0.52 : -0.52);
+    g.add(bulb); lampBulbs.push(bm);
+    if (lx === -13 || lx === 3 || lx === 19) {
+      const pl = new THREE.PointLight(0xffd78a, 0, 18, 1.6);
+      pl.position.set(lx, 3.4, lz < 0 ? lz + 0.6 : lz - 0.6);
+      scene.add(pl); lampLights.push(pl);
+    }
+    scene.add(g);
+  }
+}
+
+// Rich instanced forest (trunks + layered pine & broadleaf crowns)
+const treeSpots = [];
+for (let i = 0; i < 85; i++) {
+  const a = (i / 85) * Math.PI * 2;
+  const rx = 31 + (Math.sin(i * 7.3) * 4.2), rz = 16.2 + (Math.cos(i * 5.1) * 2.8);
+  const tx = Math.cos(a) * rx, tz = Math.sin(a) * rz;
+  // Keep harbor pier and gate entrance clear
+  if (tz > 10 && tx > -2 && tx < 12) continue;
+  if (Math.abs(tz) < 5.2 && tx < -20) continue;
+  const ty = islandHeight(tx, tz);
+  if (ty < -0.2) continue;
+  treeSpots.push([tx, ty, tz, 0.8 + (i % 5) * 0.18, i % 2]);
+}
+const trunkInst = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.14, 0.24, 1.6, 7), mStd({ color: 0x5c3d28, roughness: 0.9 }), treeSpots.length);
+const pineInst = new THREE.InstancedMesh(new THREE.ConeGeometry(1.15, 2.7, 7), mStd({ color: 0x1e5631, roughness: 0.82 }), treeSpots.length);
+const oakInst = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(1.15, 1), mStd({ color: 0x2d7a3e, roughness: 0.85 }), treeSpots.length);
+trunkInst.castShadow = pineInst.castShadow = oakInst.castShadow = true;
+const dummy = new THREE.Object3D();
+treeSpots.forEach(([x, y, z, sc, kind], i) => {
+  dummy.position.set(x, y + 0.75 * sc, z); dummy.scale.setScalar(sc); dummy.rotation.y = i; dummy.updateMatrix();
+  trunkInst.setMatrixAt(i, dummy.matrix);
+  if (kind === 0) {
+    dummy.position.set(x, y + 2.4 * sc, z); dummy.updateMatrix(); pineInst.setMatrixAt(i, dummy.matrix);
+    dummy.scale.setScalar(0); dummy.updateMatrix(); oakInst.setMatrixAt(i, dummy.matrix);
+  } else {
+    dummy.position.set(x, y + 2.3 * sc, z); dummy.updateMatrix(); oakInst.setMatrixAt(i, dummy.matrix);
+    dummy.scale.setScalar(0); dummy.updateMatrix(); pineInst.setMatrixAt(i, dummy.matrix);
+  }
+});
+scene.add(trunkInst, pineInst, oakInst);
+
+// Night stars & warm fireflies
+const starPos = new Float32Array(450 * 3);
+for (let i = 0; i < 450; i++) {
+  starPos[i * 3] = (Math.random() - 0.5) * 280;
+  starPos[i * 3 + 1] = 35 + Math.random() * 80;
+  starPos[i * 3 + 2] = -40 - Math.random() * 140;
+}
+const starGeo = new THREE.BufferGeometry();
+starGeo.setAttribute("position", new THREE.BufferAttribute(starPos, 3));
+const starMat = new THREE.PointsMaterial({ color: 0xfef9c3, size: 0.7, transparent: true, opacity: 0.0 });
+scene.add(new THREE.Points(starGeo, starMat));
+
+// ============================================================
+// 6. 3D VEHICLES, GUARD, INSPECTOR & ARCING DATA DRONES
+// ============================================================
+function buildGuardOrInspector(coatColor, isGuard, isInspector) {
+  const g = new THREE.Group();
+  const coat = mStd({ color: coatColor, roughness: 0.55 });
+  const skin = mStd({ color: 0xf3c69f, roughness: 0.6 });
+  const dark = mStd({ color: 0x1e293b, roughness: 0.7 });
+  const legL = mkBox(0.24, 0.65, 0.24, dark, -0.16, 0.32, 0);
+  const legR = mkBox(0.24, 0.65, 0.24, dark, 0.16, 0.32, 0);
+  const body = mkBox(0.68, 0.88, 0.44, coat, 0, 1.08, 0);
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.32, 14, 14), skin);
+  head.position.set(0, 1.82, 0); head.castShadow = true;
+  const armL = new THREE.Group(); armL.position.set(-0.46, 1.4, 0); armL.add(mkBox(0.2, 0.7, 0.2, coat, 0, -0.32, 0));
+  const armR = new THREE.Group(); armR.position.set(0.46, 1.4, 0); armR.add(mkBox(0.2, 0.7, 0.2, coat, 0, -0.32, 0));
+  g.add(legL, legR, body, head, armL, armR);
+  if (isGuard) {
+    g.add(mkCyl(0.36, 0.36, 0.14, 12, dark, 0, 2.08, 0));
+    g.add(mkBox(0.2, 0.2, 0.06, mStd({ color: 0xfacc15, emissive: 0xeab308, emissiveIntensity: 0.5, metalness: 0.8 }), 0.16, 1.24, 0.24));
+  }
+  if (isInspector) {
+    const hatM = mStd({ color: 0x3b0764, roughness: 0.55 });
+    g.add(mkCyl(0.56, 0.56, 0.07, 16, hatM, 0, 2.06, 0));
+    g.add(mkCyl(0.32, 0.36, 0.32, 16, hatM, 0, 2.24, 0));
+    const mag = new THREE.Group(); mag.position.set(0, -0.58, 0.34);
+    mag.add(new THREE.Mesh(new THREE.TorusGeometry(0.22, 0.05, 8, 18), mStd({ color: 0xfacc15, emissive: 0xf59e0b, emissiveIntensity: 0.8, metalness: 0.9 })));
+    armR.add(mag);
+  }
+  g.userData = { legL, legR, armL, armR };
+  return g;
+}
+
+function buildDeliveryVan(colorHex, isZap = false) {
+  const g = new THREE.Group();
+  const bodyM = mStd({ color: isZap ? 0xfacc15 : colorHex, roughness: 0.32, metalness: 0.45 });
+  const cabM = mStd({ color: 0xf8fafc, roughness: 0.28, metalness: 0.4 });
+  const wheelM = mStd({ color: 0x111827, roughness: 0.85 });
+  // Cargo box + cab + windshield
+  g.add(mkBox(1.15, 0.95, 1.65, bodyM, 0, 0.72, -0.25));
+  g.add(mkBox(1.08, 0.72, 0.85, cabM, 0, 0.6, 0.85));
+  g.add(mkBox(0.96, 0.36, 0.12, mStd({ color: 0x38bdf8, roughness: 0.1, metalness: 0.9 }), 0, 0.75, 1.26));
+  // Headlights (bloom!)
+  const hlM = mStd({ color: 0xffffff, emissive: 0xfef08a, emissiveIntensity: 2.0 });
+  g.add(mkBox(0.22, 0.14, 0.08, hlM, -0.34, 0.44, 1.29));
+  g.add(mkBox(0.22, 0.14, 0.08, hlM, 0.34, 0.44, 1.29));
+  // 4 wheels
+  for (const wx of [-0.58, 0.58]) for (const wz of [-0.72, 0.82]) {
+    const w = mkCyl(0.24, 0.24, 0.18, 12, wheelM, wx, 0.24, wz);
+    w.rotation.z = Math.PI / 2; g.add(w);
+  }
+  return g;
+}
+
+const guardMesh = buildGuardOrInspector(0x1e3a8a, true, false);
+guardMesh.position.set(GATE_X + 1.3, 0.08, -2.5);
+guardMesh.rotation.y = Math.PI * 0.25;
+scene.add(guardMesh);
+const guardState = { block: 0, pass: 0 };
+
+// ============================================================
+// 7. EVENTS, STORY, 3D WALKERS/VANS/DRONES, PARTICLES
+// ============================================================
 const VERBS = {
-  PutObject: "상자를 창고에 넣었습니다", GetObject: "창고에서 상자를 꺼냈습니다", DeleteObject: "상자를 버렸습니다", ListObjectsV2: "창고 목록을 확인했습니다",
-  CreateBucket: "새 창고 칸을 만들었습니다", PutItem: "카드를 보관함에 꽂았습니다", GetItem: "카드를 찾아 읽었습니다", Query: "보관함을 뒤졌습니다", Scan: "보관함 전체를 훑었습니다",
-  UpdateItem: "카드 내용을 고쳤습니다", SendMessage: "택배를 접수했습니다", ReceiveMessage: "택배를 찾아갔습니다", DeleteMessage: "배달 완료 처리했습니다",
-  Publish: "방송을 내보냈습니다", Deliver: "배달했습니다", PutEvents: "역에 이벤트 열차가 도착했습니다", Invoke: "공방에서 작업을 돌렸습니다",
-  StateEntered: "조립 라인이 다음 단계로 넘어갔습니다", ExecutionFinished: "조립이 끝났습니다", StartExecution: "조립을 시작했습니다",
-  Encrypt: "금고에서 봉인했습니다", Decrypt: "금고에서 봉인을 풀었습니다", GetSecretValue: "비밀 서랍을 열었습니다", GetParameter: "설정 쪽지를 꺼냈습니다",
-  ResourceStatus: "공사가 진행 중입니다", CreateStack: "공사를 시작했습니다", DeleteStack: "철거를 시작했습니다",
-  TaskStateChange: "항구의 컨테이너 상태가 바뀌었습니다", StatusChanged: "항구 시설 상태가 바뀌었습니다", Forward: "교통 정리원이 손님을 안내했습니다",
-  SignUp: "신분증을 신청했습니다", InitiateAuth: "신분증을 확인했습니다", CodeSent: "확인 코드를 보냈습니다", AssumeRole: "임시 출입증을 받았습니다",
-  PutLogEvents: "게시판에 기록을 붙였습니다", RunInstances: "관제탑이 새 기지를 표시했습니다",
+  PutObject: "화물을 창고에 입고", GetObject: "창고에서 화물 출고", DeleteObject: "화물 폐기", ListObjectsV2: "재고 목록 조회",
+  PutItem: "레코드 저장", GetItem: "레코드 조회", Query: "인덱스 쿼리", Scan: "테이블 스캔",
+  SendMessage: "메시지 접수", ReceiveMessage: "메시지 수신", DeleteMessage: "배달 완료 처리",
+  Publish: "이벤트 방송 송출", Deliver: "서비스 간 배달", PutEvents: "이벤트 버스 수신", Invoke: "함수 실행",
+  StateEntered: "단계 진입", ExecutionFinished: "워크플로우 완료", StartExecution: "워크플로우 시작",
+  Encrypt: "암호화 봉인", Decrypt: "복호화 해제", GetSecretValue: "시크릿 인출", GetParameter: "설정 파라미터 조회",
+  CreateStack: "인프라 스택 시공", ResourceStatus: "리소스 프로비저닝", TaskStateChange: "컨테이너 상태 변경",
+  Forward: "트래픽 로드밸런싱", InitiateAuth: "신원 인증 통과", FilterLogEvents: "로그 관제 검색",
 };
 function story(e) {
   if (e.service === "inspector") {
-    if (e.op === "RunStarted") return `검사관: 마을 보안·안정성 순찰을 시작했습니다 (${e.total || 0}건)`;
-    if (e.op === "RunFinished") return `검사관: 순찰 완료 — 통과 ${e.passed}/${e.total}${e.failed ? ` (실패 ${e.failed})` : ""}`;
-    if (e.blocked && e.passed) return `검사관 → ${(byService[e.target_service] || {name: "정문"}).name}: ${e.name} — 경비가 막아 방어 성공`;
-    return `검사관 → ${(byService[e.target_service] || {name: e.target_service || "마을"}).name}: ${e.name} (${e.passed ? "통과" : "실패!"})`;
+    if (e.op === "RunStarted") return `검사관 순찰 개시 (${e.total || 0}건)`;
+    if (e.op === "RunFinished") return `검사관 순찰 종료 — 통과 ${e.passed}/${e.total}`;
+    if (e.blocked && e.passed) return `검사관 → ${(byService[e.target_service] || {name: "정문"}).name}: ${e.name} (방어 성공)`;
+    return `검사관 → ${(byService[e.target_service] || {name: "시티"}).name}: ${e.name} (${e.passed ? "통과" : "취약점 경고!"})`;
   }
-  const verb = VERBS[e.op] || `${e.op} 처리`;
-  const who = e.principal && !/:root$/.test(e.principal) ? e.principal.replace(/^arn:aws:(iam|sts)::\d+:/, "") + " — " : "";
-  const tgt = e.target ? ` (${String(e.target).replace(/^arn:aws:[^:]+:[^:]*:\d*:/, "").slice(0, 40)})` : "";
-  return `${who}${(byService[e.service] || {name: e.service}).name}: ${verb}${tgt}`;
+  const verb = VERBS[e.op] || e.op;
+  const tgt = e.target ? ` (${String(e.target).replace(/^arn:aws:[^:]+:[^:]*:\d*:/, "").slice(0, 32)})` : "";
+  return `${(byService[e.service] || {name: e.service}).name}: ${verb}${tgt}`;
 }
 function outcome(e) {
-  if (e.service === "inspector") {
-    if (e.op === "ScenarioDone") return e.passed ? (e.blocked ? "defend" : "ok") : "breach";
-    return e.status >= 400 ? "breach" : "ok";
-  }
+  if (e.service === "inspector") return e.op === "ScenarioDone" ? (e.passed ? (e.blocked ? "defend" : "ok") : "breach") : "ok";
   if (e.auth && e.auth.decision !== "allowed" && e.auth.enforced) return "deny";
   if (e.chaos && e.chaos.fault) return "zap";
   if (e.status >= 500 && e.status !== 299) return "bad";
@@ -684,48 +942,34 @@ function destination(e) {
   return byService[e.service];
 }
 
-// ---------- 3D walkers, rings & popups ----------
-const walkers = [];
-const rings = [];
-const pops = [];
-let speed = 1, paused = false;
-
-const OUT_COLORS = { ok: 0x34d399, warn: 0xfbbf24, bad: 0xf87171, zap: 0xfacc15, deny: 0xef4444, defend: 0x22c55e, breach: 0xef4444 };
+const OUT_COLORS = { ok: 0x34d399, warn: 0xfbbf24, bad: 0xf87171, zap: 0xfde047, deny: 0xef4444, defend: 0x22c55e, breach: 0xef4444 };
 const OUT_SYMS   = { ok: "✓", warn: "!", bad: "✗", zap: "⚡", deny: "✋", defend: "🛡", breach: "⚠" };
-const OUT_CSS    = { ok: "#34d399", warn: "#fbbf24", bad: "#f87171", zap: "#facc15", deny: "#ef4444", defend: "#34d399", breach: "#f87171" };
+const OUT_CSS    = { ok: "#34d399", warn: "#fbbf24", bad: "#f87171", zap: "#fde047", deny: "#ef4444", defend: "#34d399", breach: "#f87171" };
 
-function spawnRing(x, z, color, maxR = 4.5) {
-  const m = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9, side: THREE.DoubleSide });
-  const r = new THREE.Mesh(new THREE.RingGeometry(0.5, 0.85, 28), m);
-  r.rotation.x = -Math.PI / 2;
-  r.position.set(x, 0.25, z);
-  scene.add(r);
-  rings.push({ mesh: r, mat: m, life: 0, maxR });
+const walkers = [], drones = [], rings = [], pops = [];
+let speed = 1, paused = false, stTotal = 0, stOk = 0, stErr = 0;
+
+function spawnRing(x, z, color, maxR = 5.0) {
+  const m = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.92, side: THREE.DoubleSide });
+  const r = new THREE.Mesh(new THREE.RingGeometry(0.5, 0.9, 32), m);
+  r.rotation.x = -Math.PI / 2; r.position.set(x, 0.2, z);
+  scene.add(r); rings.push({ mesh: r, mat: m, life: 0, maxR });
 }
-
-function spawnPop(worldPos, out) {
+function spawnPop(pos, out) {
   const el = document.createElement("div");
-  el.className = "pop";
-  el.textContent = OUT_SYMS[out] || "✓";
-  el.style.color = OUT_CSS[out] || "#fff";
-  $("fx").appendChild(el);
-  pops.push({ el, pos: worldPos.clone(), life: 1.35 });
+  el.className = "pop"; el.textContent = OUT_SYMS[out] || "✓"; el.style.color = OUT_CSS[out] || "#fff";
+  $("fx").appendChild(el); pops.push({ el, pos: pos.clone(), life: 1.4 });
 }
 
-function buildPath(from, to, blockedAtGate) {
-  if (blockedAtGate) {
-    return [new THREE.Vector3(-31, 0.2, 0), new THREE.Vector3(GATE_X - 1.4, 0.2, 0)];
-  }
-  const pts = [];
-  if (from) {
-    pts.push(new THREE.Vector3(from.door.x, 0.2, from.door.z));
-    pts.push(new THREE.Vector3(from.door.x, 0.2, 0));
-  } else {
-    pts.push(new THREE.Vector3(-31, 0.2, 0));
-  }
-  pts.push(new THREE.Vector3(to.door.x, 0.2, 0));
-  pts.push(new THREE.Vector3(to.door.x, 0.2, to.door.z));
-  return pts;
+function land(b, out, e) {
+  b.count++; b.cntEl.textContent = b.count > 999 ? "999+" : b.count;
+  b.bounce = 1; b.act = 1;
+  if (e.service === "states" && e.op === "StateEntered") b.step = (b.step || 0) + 1;
+  const col = OUT_COLORS[out] || 0x34d399;
+  b.mesh.userData.glowMat.color.setHex(col);
+  b.mesh.userData.glowMat.opacity = 0.9;
+  spawnRing(b.x, b.z, col, 5.4);
+  spawnPop(new THREE.Vector3(b.x, 6.4, b.z), out);
 }
 
 function spawn(e) {
@@ -733,85 +977,116 @@ function spawn(e) {
   if (!to) return;
   const from = origin(e);
   const out = outcome(e);
-  if (walkers.length > 45) { land(to, out, e); return; }
+  // Service-to-service: glowing parabolic energy drone flying roof-to-roof!
+  if (from) {
+    if (drones.length > 30) { land(to, out, e); return; }
+    const col = (byService[e.service] || to).color;
+    const p0 = new THREE.Vector3(from.x, 4.6, from.z);
+    const p2 = new THREE.Vector3(to.x, 4.6, to.z);
+    const mid = p0.clone().lerp(p2, 0.5); mid.y += 5.5 + p0.distanceTo(p2) * 0.14;
+    const curve = new THREE.QuadraticBezierCurve3(p0, mid, p2);
+    const orb = new THREE.Mesh(
+      new THREE.OctahedronGeometry(0.42, 1),
+      mStd({ color: col, emissive: col, emissiveIntensity: 2.2, roughness: 0.1 })
+    );
+    const trailGeo = new THREE.TubeGeometry(curve, 24, 0.06, 6, false);
+    const trailMat = new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.45 });
+    const trail = new THREE.Mesh(trailGeo, trailMat);
+    scene.add(orb, trail);
+    drones.push({ orb, trail, trailMat, curve, t: 0, dur: reduce ? 0.05 : 0.95, to, out, e });
+    return;
+  }
+  if (walkers.length > 36) { land(to, out, e); return; }
   const blocked = out === "deny" || out === "defend";
-  const pts = buildPath(from, to, blocked);
+  const isInsp = e.service === "inspector";
+  const pts = blocked
+    ? [new THREE.Vector3(-34, 0.14, 0), new THREE.Vector3(GATE_X - 1.7, 0.14, 0)]
+    : [new THREE.Vector3(-34, 0.14, 0), new THREE.Vector3(to.door.x, 0.14, 0), new THREE.Vector3(to.door.x, 0.14, to.door.z)];
   let len = 0;
   for (let i = 1; i < pts.length; i++) len += pts[i].distanceTo(pts[i - 1]);
-  const isInsp = e.service === "inspector";
-  let mesh;
-  if (from) {
-    // Internal service-to-service delivery: glowing energy orb
-    const g = new THREE.Group();
-    const c = (byService[e.service] || to).color;
-    const orb = new THREE.Mesh(new THREE.OctahedronGeometry(0.45, 1), new THREE.MeshStandardMaterial({ color: c, emissive: c, emissiveIntensity: 0.9, roughness: 0.2 }));
-    orb.position.y = 1.1; g.add(orb);
-    mesh = g;
-  } else {
-    mesh = buildCharacter(isInsp ? 0x6b21a8 : (byService[e.service] || to).color, false, isInsp);
-    if (out === "zap") {
-      const p = mesh.getObjectByName("parcel");
-      if (p) p.material = mat(0xfacc15, 0.3, 0.2, { emissive: 0xfacc15, emissiveIntensity: 0.6 });
-    }
-  }
+  const mesh = isInsp
+    ? buildGuardOrInspector(0x6b21a8, false, true)
+    : buildDeliveryVan((byService[e.service] || to).color, out === "zap");
   mesh.position.copy(pts[0]);
   scene.add(mesh);
   walkers.push({
-    mesh, pts, len, t: 0, dur: reduce ? 0.05 : Math.max(0.85, len / 14),
-    to, from, out, e, internal: !!from, inspector: isInsp, leaving: false, done: false,
+    mesh, pts, len, t: 0, dur: reduce ? 0.05 : Math.max(1.0, len / 15),
+    to, out, e, isInsp, leaving: false, done: false,
   });
 }
 
-function land(b, out, e) {
-  b.count++;
-  b.cntEl.textContent = b.count > 999 ? "999+" : b.count;
-  b.bounce = 1;
-  b.act = 1;
-  if (e.service === "states" && e.op === "StateEntered") b.step = (b.step || 0) + 1;
-  const col = OUT_COLORS[out] || 0x34d399;
-  b.mesh.userData.glowMat.color.setHex(col);
-  b.mesh.userData.glowMat.opacity = 0.85;
-  spawnRing(b.x, b.z, col, 5.2);
-  spawnPop(new THREE.Vector3(b.x, 5.8, b.z), out);
-}
-
-// ---------- theme & camera controls ----------
+// ============================================================
+// 8. LIGHTING THEMES (PHYSICAL SKY + PMREM ENVIRONMENT) & CAMERA
+// ============================================================
 const THEMES = {
-  day:    { bg: 0x87ceeb, fog: 0x87ceeb, fogD: 0.006, sunC: 0xfff5e4, sunI: 1.9, sunP: [28, 42, 24], hemiSky: 0xdff6ff, hemiGnd: 0x4d7c4f, hemiI: 0.85, winE: 0.08, lampI: 0, lampE: 0.1, water: 0x0ea5e9 },
-  sunset: { bg: 0xf97316, fog: 0xfb923c, fogD: 0.0085, sunC: 0xffedd5, sunI: 1.6, sunP: [-38, 14, 18], hemiSky: 0xfdba74, hemiGnd: 0x3b2f4a, hemiI: 0.65, winE: 0.75, lampI: 1.6, lampE: 1.4, water: 0x0369a1 },
-  night:  { bg: 0x0b1530, fog: 0x0b1530, fogD: 0.009, sunC: 0x93c5fd, sunI: 0.72, sunP: [-20, 32, -20], hemiSky: 0x334155, hemiGnd: 0x1e293b, hemiI: 0.65, winE: 1.5, lampI: 4.0, lampE: 2.4, water: 0x0c3454 },
+  day:    { elev: 36, azim: 145, turb: 3.5, ray: 1.4, mie: 0.004, sunC: 0xfff5e4, sunI: 2.6, hemiI: 0.85, fogC: 0x9ec5e8, fogD: 0.0038, winE: 0.12, lampI: 0, lampE: 0.15, bloom: 0.24, exp: 1.05, water: 0x0369a1, stars: 0 },
+  golden: { elev: 9.0, azim: 168, turb: 7.5, ray: 2.6, mie: 0.006, sunC: 0xffae52, sunI: 2.2, hemiI: 0.58, fogC: 0xc97b4b, fogD: 0.0044, winE: 1.15, lampI: 2.8, lampE: 1.9, bloom: 0.30, exp: 0.88, water: 0x0c4a6e, stars: 0.25 },
+  night:  { elev: -6, azim: 120, turb: 10, ray: 0.4, mie: 0.002, sunC: 0x7aa2f7, sunI: 0.55, hemiI: 0.42, fogC: 0x070d1c, fogD: 0.0068, winE: 2.1, lampI: 5.2, lampE: 3.2, bloom: 0.68, exp: 0.92, water: 0x082036, stars: 0.95 },
 };
-function setTheme(name) {
+function applyTheme(name) {
   const th = THEMES[name];
-  scene.background.setHex(th.bg);
-  scene.fog.color.setHex(th.fog); scene.fog.density = th.fogD;
-  sun.color.setHex(th.sunC); sun.intensity = th.sunI; sun.position.set(...th.sunP);
-  hemi.color.setHex(th.hemiSky); hemi.groundColor.setHex(th.hemiGnd); hemi.intensity = th.hemiI;
+  const u = sky.material.uniforms;
+  u.turbidity.value = th.turb; u.rayleigh.value = th.ray; u.mieCoefficient.value = th.mie; u.mieDirectionalG.value = 0.82;
+  const phi = THREE.MathUtils.degToRad(90 - th.elev);
+  const theta = THREE.MathUtils.degToRad(th.azim);
+  const sunDir = new THREE.Vector3().setFromSphericalCoords(1, phi, theta);
+  u.sunPosition.value.copy(sunDir);
+  sun.position.copy(sunDir).multiplyScalar(68);
+  if (sun.position.y < 10) sun.position.set(-24, 34, -22); // moonlight angle at night
+  sun.color.setHex(th.sunC); sun.intensity = th.sunI;
+  hemi.intensity = th.hemiI;
+  scene.fog.color.setHex(th.fogC); scene.fog.density = th.fogD;
   waterMat.color.setHex(th.water);
-  windowMats.forEach(m => m.emissiveIntensity = th.winE);
+  litWindowMats.forEach(m => m.emissiveIntensity = th.winE);
   lampBulbs.forEach(m => m.emissiveIntensity = th.lampE);
   lampLights.forEach(l => l.intensity = th.lampI);
-  starMat.opacity = name === "night" ? 0.9 : name === "sunset" ? 0.25 : 0.0;
-  ["day", "sunset", "night"].forEach(k => $("theme_" + k).classList.toggle("active", k === name));
+  starMat.opacity = th.stars;
+  bloomPass.strength = th.bloom;
+  renderer.toneMappingExposure = th.exp;
+  // Bake sky into PBR environment reflections
+  if (envRT) envRT.dispose();
+  const envScene = new THREE.Scene();
+  const skyClone = new Sky(); skyClone.scale.setScalar(100);
+  Object.keys(u).forEach(k => skyClone.material.uniforms[k].value = u[k].value);
+  envScene.add(skyClone);
+  envRT = pmrem.fromScene(envScene);
+  scene.environment = envRT.texture;
+  ["day", "golden", "night"].forEach(k => $("t_" + k).classList.toggle("active", k === name));
 }
-$("theme_day").onclick = () => setTheme("day");
-$("theme_sunset").onclick = () => setTheme("sunset");
-$("theme_night").onclick = () => setTheme("night");
+applyTheme("day");
 
 let camGoal = null;
-function flyTo(pos, target) { camGoal = { pos: new THREE.Vector3(...pos), target: new THREE.Vector3(...target), t: 0 }; }
-$("cam_overview").onclick = () => { controls.autoRotate = false; $("cam_orbit").classList.remove("active"); flyTo([-28, 30, 44], [-1, 1, 0]); };
-$("cam_gate").onclick = () => { controls.autoRotate = false; $("cam_orbit").classList.remove("active"); flyTo([-34, 9, 13], [GATE_X + 1, 1.5, 0]); };
-$("cam_orbit").onclick = () => {
+function flyTo(pos, target, btnId) {
+  controls.autoRotate = false;
+  ["c_city", "c_street", "c_gate", "c_harbor", "c_orbit"].forEach(id => $(id).classList.toggle("active", id === btnId));
+  camGoal = { pos: new THREE.Vector3(...pos), target: new THREE.Vector3(...target) };
+}
+$("t_day").onclick = () => applyTheme("day");
+$("t_golden").onclick = () => applyTheme("golden");
+$("t_night").onclick = () => applyTheme("night");
+$("c_city").onclick = () => flyTo([-34, 28, 46], [0, 2, 0], "c_city");
+$("c_street").onclick = () => flyTo([-23, 5.0, 3.8], [14, 2.5, -1], "c_street");
+$("c_gate").onclick = () => flyTo([-38, 10, 14], [GATE_X + 1, 2, 0], "c_gate");
+$("c_harbor").onclick = () => flyTo([-6, 12, 32], [5, 1.5, 14], "c_harbor");
+$("c_orbit").onclick = () => {
+  camGoal = null;
   controls.autoRotate = !controls.autoRotate;
-  controls.autoRotateSpeed = 0.7;
-  $("cam_orbit").classList.toggle("active", controls.autoRotate);
+  controls.autoRotateSpeed = 0.65;
+  $("c_orbit").classList.toggle("active", controls.autoRotate);
+};
+$("feed_toggle").onclick = () => {
+  const c = $("hud-tr").classList.toggle("collapsed");
+  $("feed_arrow").textContent = c ? "▸" : "▾";
 };
 
-// ---------- raycast hover tooltip ----------
-const raycaster = new THREE.Raycaster();
-const mouse = new THREE.Vector2(-9, -9);
-let hovered = null;
+// Hover tooltip & click-to-focus on any 3D building
+const raycaster = new THREE.Raycaster(), mouse = new THREE.Vector2(-9, -9);
+let hovered = null, downPos = null;
+canvas.addEventListener("pointerdown", e => downPos = [e.clientX, e.clientY]);
+canvas.addEventListener("pointerup", e => {
+  if (!downPos || Math.hypot(e.clientX - downPos[0], e.clientY - downPos[1]) > 5) return;
+  if (hovered) flyTo([hovered.x - 10, 11, hovered.z + (hovered.z < 0 ? 14 : 16)], [hovered.x, 2.2, hovered.z], "");
+});
 canvas.addEventListener("mousemove", ev => {
   const r = canvas.getBoundingClientRect();
   mouse.x = ((ev.clientX - r.left) / r.width) * 2 - 1;
@@ -824,32 +1099,29 @@ canvas.addEventListener("mousemove", ev => {
   const tip = $("tip");
   if (!b) { tip.style.display = "none"; return; }
   b.labelEl.classList.add("hot");
-  tip.innerHTML = `<b>${b.name}</b> <span style="color:#94a3b8">${b.sub}</span><br>누적 처리: <b>${b.count}건</b>`;
+  tip.innerHTML = `<b>${b.name}</b> <span style="color:#94a3b8">${b.sub}</span><br>누적 처리: <b>${b.count}건</b> · <span style="color:#38bdf8">클릭하여 포커스</span>`;
   tip.style.display = "block";
-  tip.style.left = Math.min(r.width - 230, ev.clientX - r.left + 14) + "px";
-  tip.style.top = Math.max(10, ev.clientY - r.top + 14) + "px";
-});
-canvas.addEventListener("mouseleave", () => {
-  if (hovered) hovered.labelEl.classList.remove("hot");
-  hovered = null; $("tip").style.display = "none";
+  tip.style.left = Math.min(window.innerWidth - 260, ev.clientX + 16) + "px";
+  tip.style.top = Math.max(12, ev.clientY + 16) + "px";
 });
 
-// ---------- resize & animation loop ----------
+// ============================================================
+// 9. RESIZE & MAIN 60FPS GAME LOOP
+// ============================================================
 function resize() {
-  const r = $("stage").getBoundingClientRect();
-  if (!r.width || !r.height) return;
-  camera.aspect = r.width / r.height;
-  camera.updateProjectionMatrix();
-  renderer.setSize(r.width, r.height, false);
+  const w = window.innerWidth, h = window.innerHeight;
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+  renderer.setSize(w, h, false);
+  composer.setSize(w, h);
+  bloomPass.resolution.set(w, h);
 }
 addEventListener("resize", resize);
 resize();
 
 const tmpV = new THREE.Vector3();
-function projectToScreen(v) {
+function project(v) {
   tmpV.copy(v).project(camera);
-  const r = $("stage").getBoundingClientRect();
-  return { x: (tmpV.x * 0.5 + 0.5) * r.width, y: (-tmpV.y * 0.5 + 0.5) * r.height, visible: tmpV.z < 1 };
+  return { x: (tmpV.x * 0.5 + 0.5) * window.innerWidth, y: (-tmpV.y * 0.5 + 0.5) * window.innerHeight, visible: tmpV.z < 1 };
 }
 
 let last = performance.now(), clock = 0;
@@ -858,65 +1130,64 @@ function animate(now) {
   const dt = Math.min(0.05, (now - last) / 1000) * (paused ? 0 : speed);
   last = now; clock += dt;
 
-  // Smooth camera preset fly-to
   if (camGoal) {
-    camera.position.lerp(camGoal.pos, 0.09);
-    controls.target.lerp(camGoal.target, 0.09);
+    camera.position.lerp(camGoal.pos, 0.075);
+    controls.target.lerp(camGoal.target, 0.075);
     if (camera.position.distanceTo(camGoal.pos) < 0.25) camGoal = null;
   }
   controls.update();
 
-  // Gentle ocean waves & drifting clouds
+  // Animated ocean waves + moored ship gentle rock
   if (!reduce) {
-    const pos = waterGeo.attributes.position;
-    for (let i = 0; i < pos.count; i++) {
-      const x = waterBaseY[i * 3], z = waterBaseY[i * 3 + 2];
-      pos.setY(i, Math.sin(x * 0.12 + clock * 1.3) * 0.18 + Math.cos(z * 0.14 + clock) * 0.15);
+    const wp = waterGeo.attributes.position;
+    for (let i = 0; i < wp.count; i++) {
+      const x = waterOrig[i * 3], z = waterOrig[i * 3 + 2];
+      wp.setY(i, Math.sin(x * 0.09 + clock * 1.4) * 0.22 + Math.cos(z * 0.11 + clock * 1.1) * 0.18);
     }
-    pos.needsUpdate = true;
-    clouds.forEach((c, i) => { c.position.x += dt * (0.45 + (i % 3) * 0.15); if (c.position.x > 55) c.position.x = -55; });
+    wp.needsUpdate = true;
+    waterGeo.computeVertexNormals();
+    ship.position.y = -1.2 + Math.sin(clock * 1.3) * 0.12;
+    ship.rotation.z = Math.sin(clock * 1.1) * 0.025;
   }
 
-  // Update buildings (bounce + unique 3D animations)
+  // Building animations
   for (const b of B) {
     b.bounce = Math.max(0, b.bounce - dt * 2.5);
-    b.act = Math.max(0, b.act - dt * 0.7);
-    const s = 1 + Math.sin(b.bounce * Math.PI) * 0.1;
+    b.act = Math.max(0, b.act - dt * 0.65);
+    const s = 1 + Math.sin(b.bounce * Math.PI) * 0.08;
     b.mesh.scale.set(1 / Math.sqrt(s), s, 1 / Math.sqrt(s));
     const gm = b.mesh.userData.glowMat;
     if (gm.opacity > 0.01) gm.opacity = Math.max(0, gm.opacity - dt * 0.9);
     const a = b.mesh.userData.anim;
-    if (a.spin) a.spin.rotation.y += dt * (0.9 + b.act * 3.5);
+    if (a.spin) a.spin.rotation.y += dt * (1.0 + b.act * 4.0);
     if (a.gear) a.gear.rotation.z -= dt * (1.2 + b.act * 5.0);
-    if (a.wheel) a.wheel.rotation.z += dt * (b.act * 4.5);
-    if (a.bob) a.bob.position.y = 4.35 + Math.sin(clock * 2.5 + b.x) * 0.18;
+    if (a.wheel) a.wheel.rotation.z += dt * (b.act * 5.0);
+    if (a.bob) a.bob.position.y = 5.75 + Math.sin(clock * 2.4 + b.x) * 0.18;
     if (a.wave) {
       const k = (clock * (0.7 + b.act * 1.2)) % 1;
-      a.wave.scale.setScalar(0.5 + k * 2.8);
-      a.wave.material.opacity = (1 - k) * (0.35 + b.act * 0.65);
+      a.wave.scale.setScalar(0.5 + k * 3.2);
+      a.wave.material.opacity = (1 - k) * (0.4 + b.act * 0.6);
     }
-    if (a.lift) a.lift.position.y = (b.kind === "harbor" ? 2.35 : 1.42) + Math.sin(b.act * Math.PI) * 0.65;
-    if (a.lamps) a.lamps.forEach((lm, i) => lm.emissiveIntensity = (b.step % 4 === i && b.act > 0.05) ? 1.8 : 0.15);
-    if (a.jib) a.jib.rotation.y = Math.sin(clock * 0.4) * 0.45;
-    if (a.hook) a.hook.position.y = -2.2 + Math.sin(clock * (0.8 + b.act * 2.5)) * 0.9;
+    if (a.lift) a.lift.position.y = (b.kind === "harbor" ? 2.42 : 1.56) + Math.sin(b.act * Math.PI) * 0.7;
+    if (a.lamps) a.lamps.forEach((lm, i) => lm.emissiveIntensity = (b.step % 4 === i && b.act > 0.05) ? 2.6 : 0.35);
+    if (a.jib) a.jib.rotation.y = Math.sin(clock * 0.35) * 0.48;
+    if (a.hook) a.hook.position.y = -2.3 + Math.sin(clock * (0.8 + b.act * 2.5)) * 0.9;
   }
 
-  // Gate barrier & 3D Guard animation
+  // Gate barrier & guard
   guardState.block = Math.max(0, guardState.block - dt);
-  guardState.pass = Math.max(0, guardState.pass - dt * 1.4);
-  const targetAngle = guardState.pass > 0.05 ? -Math.PI * 0.42 : 0;
-  barrierPivot.rotation.x += (targetAngle - barrierPivot.rotation.x) * 0.18;
+  guardState.pass = Math.max(0, guardState.pass - dt * 1.3);
+  barrierPivot.rotation.x += ((guardState.pass > 0.05 ? -Math.PI * 0.42 : 0) - barrierPivot.rotation.x) * 0.18;
   beaconMat.color.setHex(guardState.block > 0.05 ? 0xef4444 : 0x22c55e);
   beaconMat.emissive.setHex(guardState.block > 0.05 ? 0xef4444 : 0x22c55e);
   guardMesh.userData.armL.rotation.x = -guardState.block * 2.6;
   guardMesh.userData.armR.rotation.x = -guardState.pass * 1.4;
 
-  // Update 3D walkers
+  // Delivery vans & Inspector
   for (let i = walkers.length - 1; i >= 0; i--) {
     const w = walkers[i];
     w.t += dt;
-    const frac = Math.min(1, w.t / w.dur);
-    let d = w.len * frac;
+    let d = w.len * Math.min(1, w.t / w.dur);
     let cur = w.pts[w.pts.length - 1], dir = new THREE.Vector3(1, 0, 0);
     for (let j = 1; j < w.pts.length; j++) {
       const seg = w.pts[j].distanceTo(w.pts[j - 1]);
@@ -928,81 +1199,89 @@ function animate(now) {
       d -= seg;
     }
     w.mesh.position.copy(cur);
-    if (!w.internal) {
-      w.mesh.rotation.y = Math.atan2(dir.x, dir.z);
+    w.mesh.rotation.y = Math.atan2(dir.x, dir.z);
+    if (w.isInsp) {
       const sw = reduce ? 0 : Math.sin(clock * 14 + i) * 0.65;
-      w.mesh.userData.legL.rotation.x = sw;
-      w.mesh.userData.legR.rotation.x = -sw;
+      w.mesh.userData.legL.rotation.x = sw; w.mesh.userData.legR.rotation.x = -sw;
       w.mesh.userData.armL.rotation.x = -sw * 0.7;
-      if (!w.inspector) w.mesh.userData.armR.rotation.x = sw * 0.7;
-      w.mesh.position.y = 0.2 + Math.abs(Math.sin(clock * 14 + i)) * 0.12;
-      if (!w.leaving && Math.abs(cur.x - GATE_X) < 3.0 && w.out !== "deny" && w.out !== "defend") guardState.pass = 1;
-    } else {
-      w.mesh.rotation.y += dt * 4;
-      w.mesh.position.y = 0.2 + Math.sin(clock * 8 + i) * 0.2;
     }
+    if (!w.leaving && Math.abs(cur.x - GATE_X) < 3.4 && w.out !== "deny" && w.out !== "defend") guardState.pass = 1;
     if (w.t >= w.dur && !w.done) {
       if ((w.out === "deny" || w.out === "defend") && !w.leaving) {
         guardState.block = 1;
-        spawnRing(GATE_X, 0, OUT_COLORS[w.out], 4.8);
-        spawnPop(new THREE.Vector3(GATE_X, 4.2, 0), w.out);
-        w.pts = [w.pts[1], new THREE.Vector3(-31, 0.2, 0)];
+        spawnRing(GATE_X, 0, OUT_COLORS[w.out], 5.2);
+        spawnPop(new THREE.Vector3(GATE_X, 4.8, 0), w.out);
+        w.pts = [w.pts[1], new THREE.Vector3(-34, 0.14, 0)];
         w.len = w.pts[0].distanceTo(w.pts[1]);
         w.t = 0; w.dur = 0.9; w.leaving = true;
       } else {
         w.done = true;
         if (!w.leaving) land(w.to, w.out, w.e);
-        scene.remove(w.mesh);
-        walkers.splice(i, 1);
+        scene.remove(w.mesh); walkers.splice(i, 1);
       }
     }
   }
 
-  // Expanding 3D pulse rings
-  for (let i = rings.length - 1; i >= 0; i--) {
-    const r = rings[i];
-    r.life += dt * 1.4;
-    r.mesh.scale.setScalar(1 + r.life * r.maxR);
-    r.mat.opacity = Math.max(0, 0.9 * (1 - r.life));
-    if (r.life >= 1) { scene.remove(r.mesh); r.mesh.geometry.dispose(); r.mat.dispose(); rings.splice(i, 1); }
+  // Arcing service-to-service energy drones
+  for (let i = drones.length - 1; i >= 0; i--) {
+    const dr = drones[i];
+    dr.t += dt;
+    const f = Math.min(1, dr.t / dr.dur);
+    dr.orb.position.copy(dr.curve.getPoint(f));
+    dr.orb.rotation.y += dt * 6;
+    dr.trailMat.opacity = Math.max(0, 0.55 * (1 - f));
+    if (f >= 1) {
+      land(dr.to, dr.out, dr.e);
+      scene.remove(dr.orb, dr.trail); dr.trail.geometry.dispose(); dr.trailMat.dispose();
+      drones.splice(i, 1);
+    }
   }
 
-  // Project HTML labels & popups onto 3D positions
+  // Rings & floating labels
+  for (let i = rings.length - 1; i >= 0; i--) {
+    const r = rings[i]; r.life += dt * 1.4;
+    r.mesh.scale.setScalar(1 + r.life * r.maxR);
+    r.mat.opacity = Math.max(0, 0.92 * (1 - r.life));
+    if (r.life >= 1) { scene.remove(r.mesh); r.mesh.geometry.dispose(); r.mat.dispose(); rings.splice(i, 1); }
+  }
   for (const b of B) {
-    const p = projectToScreen(new THREE.Vector3(b.x, b.kind === "tower" ? 7.8 : b.kind === "crane" ? 7.1 : 5.4, b.z));
+    const y = b.kind === "tower" ? 9.4 : b.kind === "crane" ? 8.1 : b.kind === "radar" ? 7.8 : 6.0;
+    const p = project(new THREE.Vector3(b.x, y, b.z));
     b.labelEl.style.display = p.visible ? "flex" : "none";
     b.labelEl.style.left = p.x + "px"; b.labelEl.style.top = p.y + "px";
   }
-  const gp = projectToScreen(new THREE.Vector3(GATE_X, 6.2, 0));
+  const gp = project(new THREE.Vector3(GATE_X, 6.8, 0));
   gateLabel.style.display = gp.visible ? "flex" : "none";
   gateLabel.style.left = gp.x + "px"; gateLabel.style.top = gp.y + "px";
 
   for (let i = pops.length - 1; i >= 0; i--) {
-    const pp = pops[i];
-    pp.life -= dt;
-    pp.pos.y += dt * 1.6;
-    const sc = projectToScreen(pp.pos);
+    const pp = pops[i]; pp.life -= dt; pp.pos.y += dt * 1.7;
+    const sc = project(pp.pos);
     pp.el.style.left = sc.x + "px"; pp.el.style.top = sc.y + "px";
     pp.el.style.opacity = Math.max(0, Math.min(1, pp.life));
     if (pp.life <= 0) { pp.el.remove(); pops.splice(i, 1); }
   }
 
-  renderer.render(scene, camera);
+  composer.render();
 }
 requestAnimationFrame(animate);
 
-// ---------- caption log & SSE / demo ----------
+// ============================================================
+// 10. EVENT FEED & LIVE SSE / DEMO MODE
+// ============================================================
 function caption(e) {
   const li = document.createElement("li");
   const out = outcome(e);
   li.className = out;
   const t = new Date(e.ts || Date.now());
   li.innerHTML = `<span class="t">${t.toTimeString().slice(0, 8)}</span>`;
-  li.append(document.createTextNode(story(e) + (out === "deny" ? " — 정문에서 막혔습니다" : out === "zap" ? " — 장애 주입" : "")));
-  if (e.auth && e.auth.decision !== "allowed") li.title = e.auth.reason || "";
+  li.append(document.createTextNode(story(e)));
   const log = $("log");
   log.prepend(li);
-  while (log.children.length > 120) log.lastChild.remove();
+  while (log.children.length > 80) log.lastChild.remove();
+  stTotal++;
+  if (out === "ok" || out === "defend") stOk++; else stErr++;
+  $("st_total").textContent = stTotal; $("st_ok").textContent = stOk; $("st_err").textContent = stErr;
 }
 function handle(e) {
   if (e.service === "admin") { caption({...e, op: e.op === "Reset" ? "전체 초기화" : e.op}); return; }
@@ -1012,61 +1291,56 @@ function handle(e) {
 }
 
 let es = null, demoTimer = null;
-function setMode(kind, text) { $("dot").className = "dot " + kind; $("mode").textContent = text; }
+function setMode(kind, text) { $("dot").className = "sdot " + kind; $("mode").textContent = text; }
 function live() {
   stopDemo();
   es = new EventSource("/_events");
   let opened = false;
   es.onopen = () => { opened = true; setMode("live", "실시간 연결됨"); };
   es.onmessage = m => { try { handle(JSON.parse(m.data)); } catch {} };
-  es.onerror = () => { if (es.readyState === 2 || !opened) startDemo("에뮬레이터에 연결할 수 없어 3D 데모를 보여 줍니다"); };
+  es.onerror = () => { if (es.readyState === 2 || !opened) startDemo("3D 시티 데모 (목업 트래픽)"); };
 }
 
 const SCRIPT = [
-  [{service: "apigateway", op: "Invoke", target: "shop POST /orders", status: 200}],
+  [{service: "apigateway", op: "Invoke", target: "POST /orders", status: 200}],
   [{service: "lambda", op: "Invoke", target: "create-order", trigger: "apigateway", status: 200}],
-  [{service: "dynamodb", op: "PutItem", target: "orders", status: 200, principal: "arn:aws:sts::0:assumed-role/order-fn/create-order", auth: {decision: "allowed"}}],
+  [{service: "dynamodb", op: "PutItem", target: "orders", status: 200}],
   [{service: "sns", op: "Publish", target: "order-created", status: 200}],
   [{service: "sns", op: "Deliver", target: "arn:aws:sqs:x:0:shipping", protocol: "sqs", status: 200}, {service: "sns", op: "Deliver", target: "arn:aws:sqs:x:0:emails", protocol: "sqs", status: 200}],
   [{service: "lambda", op: "Invoke", target: "ship-order", trigger: "sqs", status: 200}],
   [{service: "s3", op: "PutObject", target: "invoices/o-1042.pdf", status: 200}],
-  [{service: "ses", op: "SendEmail", status: 200}],
-  [{service: "s3", op: "GetObject", target: "secret/payroll.csv", status: 403, principal: "arn:aws:iam::0:user/intern", auth: {decision: "explicitDeny", enforced: true, reason: "explicit deny in NoSecrets"}}],
+  [{service: "s3", op: "GetObject", target: "secret/payroll.csv", status: 403, auth: {decision: "explicitDeny", enforced: true}}],
   [{service: "states", op: "StartExecution", status: 200}],
-  [{service: "states", op: "StateEntered", target: "Price", status: 200}],
   [{service: "states", op: "StateEntered", target: "Fulfil", status: 200}],
-  [{service: "states", op: "ExecutionFinished", status: 200}],
   [{service: "dynamodb", op: "Query", status: 400, chaos: {fault: "ProvisionedThroughputExceededException"}}],
   [{service: "kms", op: "Decrypt", status: 200}, {service: "secretsmanager", op: "GetSecretValue", status: 200}],
   [{service: "cloudformation", op: "CreateStack", status: 200}],
   [{service: "ecs", op: "TaskStateChange", target: "service:web", status: 200}, {service: "elbv2", op: "Forward", target: "127.0.0.1:49213", status: 200}],
-  [{service: "inspector", op: "ScenarioDone", name: "IAM 명시적 거부(Deny) 우선 차단", target_service: "s3", passed: true, blocked: true, status: 200}],
-  [{service: "inspector", op: "ScenarioDone", name: "무작위·기형 입력 퍼징 (15건)", target_service: "dynamodb", passed: true, blocked: false, status: 200}],
+  [{service: "inspector", op: "ScenarioDone", name: "IAM 명시적 Deny 차단", target_service: "s3", passed: true, blocked: true, status: 200}],
+  [{service: "inspector", op: "ScenarioDone", name: "무작위 입력 퍼징", target_service: "dynamodb", passed: true, blocked: false, status: 200}],
   [{service: "cognito-idp", op: "InitiateAuth", status: 200}],
   [{service: "route53", op: "GET /hostedzone", status: 200}, {service: "logs", op: "FilterLogEvents", status: 200}],
 ];
 function startDemo(why) {
   if (es) { es.close(); es = null; }
-  setMode("demo", why || "3D 데모 모드");
-  $("demo").textContent = "실시간 보기";
-  let i = 0;
-  clearInterval(demoTimer);
+  setMode("demo", why || "3D 시티 데모");
+  $("demo").textContent = "실시간";
+  let i = 0; clearInterval(demoTimer);
   const tick = () => {
     if (paused) return;
-    SCRIPT[i % SCRIPT.length].forEach((e, k) => setTimeout(() => handle({ts: new Date().toISOString(), principal: "arn:aws:iam::0:root", ...e}), k * 250));
+    SCRIPT[i % SCRIPT.length].forEach((e, k) => setTimeout(() => handle({ts: new Date().toISOString(), ...e}), k * 240));
     i++;
   };
   tick();
   demoTimer = setInterval(tick, 1150);
 }
-function stopDemo() { clearInterval(demoTimer); demoTimer = null; $("demo").textContent = "데모 보기"; }
-
-$("demo").onclick = () => demoTimer ? live() : startDemo("3D 데모 모드");
-$("pause").onclick = () => { paused = !paused; $("pause").textContent = paused ? "다시 재생" : "일시정지"; };
+function stopDemo() { clearInterval(demoTimer); demoTimer = null; $("demo").textContent = "데모"; }
+$("demo").onclick = () => demoTimer ? live() : startDemo("3D 시티 데모");
+$("pause").onclick = () => { paused = !paused; $("pause").textContent = paused ? "재생" : "일시정지"; };
 $("speed").oninput = e => speed = +e.target.value;
 
 if (location.protocol.startsWith("http") && !new URLSearchParams(location.search).has("demo") && location.pathname.startsWith("/_town")) live();
-else { $("gui").hidden = true; startDemo("3D 데모 모드 (목업 데이터)"); }
+else { $("gui").hidden = true; startDemo("3D 시티 데모 (목업 트래픽)"); }
 </script>
 </body>
 </html>
