@@ -8,8 +8,8 @@
 - 계획서 6장 순서 **1~8단계 전부 완료** (코어·22개 서비스·GUI·캐릭터 마을·해설 에이전트·검증 에이전트·Python/JS/Rust 3개 SDK 호환성 스위트·Dockerfile/Homebrew/GitHub Actions CI·Release 패키징·문서 정비).
 - 이후 추가: JSON 상태 스냅샷, 3D(Three.js) 캐릭터 마을, GitHub Pages 마을(`pages.yml`). Pages 마을은 방문자 PC의 로컬 에뮬레이터
   (`127.0.0.1:4566`, `?api=`)에 SSE로 붙어 실제 트래픽을 보여 주고, 연결 전에만 목업 트래픽을 돌린다(5초마다 재시도).
-- 남은 일: `v0.1.0` 릴리스. 태그는 8b4e7f8에 푸시됐지만 Release 워크플로가 폐지된 `macos-13` 러너를 기다리며 멈춤.
-  macos-13·macos-14 러너가 폐지돼 `macos-latest`로 바꿨다(사용자 승인으로 태그 재지정). 릴리스 뒤 Homebrew sha256 채우기.
+- `v0.1.0` 릴리스 완료(2026-11-21): 바이너리 3종 + SHA256SUMS, Homebrew sha256 반영.
+  macOS 러너는 `macos-latest`를 쓴다(버전 고정 러너 macos-13·14는 폐지됨).
 - Netlify 배포는 GitHub Pages로 대체됨(필요하면 사용자 계정 연결).
 - 이름은 `rocalcloud`(r로 시작, 사용자가 정함), 라이선스 Apache-2.0. 이름에 AWS/Amazon 금지.
 
