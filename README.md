@@ -72,11 +72,25 @@ service's building, service-to-service deliveries walk between buildings, and re
 A text log mirrors the animation. Opened anywhere else (or with `?demo`) it plays scripted mock events; `netlify.toml`
 publishes it as a static demo.
 
+## Explanation agent
+
+Every failed or denied request gets a rule-based explanation (`POST /_agent/explain {"request_id": ...}`); with a
+local LLM reachable at `RC_LLM_URL` (default `http://127.0.0.1:11434`, model `RC_LLM_MODEL`, default `qwen3.5:9b`
+via Ollama) a short natural-language explanation is added. `POST /_agent/ask {"question": ...}` answers through four
+tools (list resources, recent events, explain an event, call a JSON-protocol API) with schema-constrained output;
+destructive calls return a confirmation token and run only on `{"confirm": token}`. Without an LLM it falls back to
+a rule-based summary. `GET /_agent/template` drafts CloudFormation YAML from the current S3/DynamoDB/SQS/SNS/SSM
+resources. In the GUI, click a log row to explain it, or use the question box.
+
+LLM calls are serialized, spaced at least 1.5 s apart and kept short. If Ollama runs on another machine, tunnel it:
+`ssh -f -N -L 11434:127.0.0.1:11434 <host>`.
+
 ## Built-in endpoints
 
 - `GET /_events` — Server-Sent Events, one JSON event per request
 - `GET /_ui` — GUI page
 - `GET /_town` — character town
+- `GET /_agent/status`, `POST /_agent/explain`, `POST /_agent/ask`, `GET /_agent/template` — explanation agent
 - `GET /_admin/state`, `POST /_admin/reset` (needs header `x-rocalcloud`)
 - `GET /_admin/reach?from=internet|<instance-id>&to=...&protocol=tcp&port=443` — step-by-step reachability
   (route table → internet gateway, public IP, security group rules). NACLs, peering and NAT are not modeled yet.

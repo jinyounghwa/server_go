@@ -1,3 +1,4 @@
+mod agent;
 mod apigw;
 mod cognito;
 mod cfn;
@@ -21,6 +22,7 @@ mod sns;
 mod sqs;
 mod ssm;
 
+use axum::response::IntoResponse;
 use axum::{
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, State},
@@ -114,6 +116,7 @@ pub struct App {
     pub cfn: Mutex<cfn::Cfn>,
     chaos: Mutex<Vec<Value>>,
     events: broadcast::Sender<String>,
+    pub recent: Mutex<std::collections::VecDeque<Value>>,
 }
 
 fn json_reply(prefix: &str, r: Result<Value, ApiErr>) -> Response {
@@ -200,6 +203,24 @@ const JSON_TARGETS: &[(&str, &str)] = &[
 pub fn emit(app: &App, ev: Value) {
     println!("{ev}");
     let _ = app.events.send(ev.to_string());
+    // Recent history for the explanation agent.
+    let mut r = app.recent.lock().unwrap();
+    if r.len() >= 1000 {
+        r.pop_front();
+    }
+    r.push_back(ev);
+}
+
+// Error code and message from a failed response body (JSON or XML), for events and explanations.
+fn error_of(body: &[u8]) -> Option<Value> {
+    let text = String::from_utf8_lossy(body);
+    if let Ok(j) = serde_json::from_str::<Value>(&text) {
+        let code = j["__type"].as_str().or(j["code"].as_str()).map(|c| c.rsplit('#').next().unwrap_or(c).to_string());
+        let msg = j["message"].as_str().or(j["Message"].as_str()).unwrap_or("");
+        return code.map(|c| json!({"code": c, "message": msg}));
+    }
+    let code = s3::tags(&text, "Code").into_iter().next()?;
+    Some(json!({"code": code, "message": s3::tags(&text, "Message").concat()}))
 }
 
 const COGNITO_PUBLIC: &[&str] = &["SignUp", "ConfirmSignUp", "InitiateAuth", "RespondToAuthChallenge", "ForgotPassword",
@@ -592,6 +613,14 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
     if let Some(d) = decision.filter(|_| principal != iam::Principal::Root) {
         ev["auth"] = json!({"decision": d.kind, "reason": d.reason, "enforced": *ENFORCE});
     }
+    if resp.status().as_u16() >= 400 {
+        let (parts, body) = resp.into_parts();
+        let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap_or_default();
+        if let Some(e) = error_of(&bytes) {
+            ev["error"] = e;
+        }
+        resp = Response::from_parts(parts, Body::from(bytes));
+    }
     emit(&app, ev);
     resp
 }
@@ -804,6 +833,30 @@ async fn reach(State(app): State<Arc<App>>, axum::extract::Query(q): axum::extra
     Json(app.net.lock().unwrap().reach(&g("from", ""), &g("to", ""), &g("protocol", "tcp"), port))
 }
 
+// Explanation agent. POSTs need the x-rocalcloud header (blocks cross-site requests).
+async fn agent_status() -> Json<Value> {
+    Json(agent::status().await)
+}
+async fn agent_explain(State(app): State<Arc<App>>, h: HeaderMap, Json(b): Json<Value>) -> Response {
+    if !h.contains_key("x-rocalcloud") {
+        return Response::builder().status(403).body(Body::empty()).unwrap();
+    }
+    match agent::explain(&app, b["request_id"].as_str().unwrap_or(""), b["llm"] != false).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => Response::builder().status(e.status).body(Body::from(e.msg)).unwrap(),
+    }
+}
+async fn agent_ask(State(app): State<Arc<App>>, h: HeaderMap, Json(b): Json<Value>) -> Response {
+    if !h.contains_key("x-rocalcloud") {
+        return Response::builder().status(403).body(Body::empty()).unwrap();
+    }
+    Json(agent::ask(&app, b["question"].as_str().unwrap_or(""), b["confirm"].as_str()).await).into_response()
+}
+
+async fn agent_template(State(app): State<Arc<App>>) -> Response {
+    Response::builder().header("content-type", "text/yaml; charset=utf-8").body(Body::from(agent::template(&app))).unwrap()
+}
+
 async fn town() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("town.html"))
 }
@@ -840,11 +893,16 @@ async fn main() {
         cfn: Default::default(),
         chaos: Default::default(),
         events: broadcast::channel(1024).0,
+        recent: Default::default(),
     });
     let router = Router::new()
         .route("/_events", get(events))
         .route("/_ui", get(ui))
         .route("/_town", get(town))
+        .route("/_agent/status", get(agent_status))
+        .route("/_agent/explain", post(agent_explain))
+        .route("/_agent/ask", post(agent_ask))
+        .route("/_agent/template", get(agent_template))
         .route("/favicon.ico", get(|| async { axum::http::StatusCode::NO_CONTENT })) // keep browsers out of the S3 log
         .route("/_admin/state", get(state))
         .route("/_admin/reset", post(reset))

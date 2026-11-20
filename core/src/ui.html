@@ -45,6 +45,12 @@ section#log { border-top: 1px solid var(--line); display: grid; grid-template-ro
 .logbar { display: flex; align-items: center; gap: 12px; padding: 0 16px; border-bottom: 1px solid var(--line); }
 .logbar input[type=search] { font: inherit; padding: 3px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); width: 220px; }
 #logwrap { overflow: auto; padding: 0 16px; }
+#logwrap tr[data-rid] { cursor: pointer; } #logwrap tr[data-rid]:hover td { background: var(--sel); }
+.ask { display: flex; gap: 8px; align-items: center; }
+.ask input { font: inherit; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); width: 300px; }
+.explain { border-left: 3px solid var(--accent); padding: 4px 0 4px 12px; margin: 8px 0; white-space: pre-wrap; }
+.explain.llm { border-color: var(--ddb); }
+.steps { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--muted); white-space: pre-wrap; }
 #logwrap td { padding: 2px 12px 2px 0; font-family: ui-monospace, Menlo, monospace; font-size: 12px; white-space: nowrap; }
 .svc { font-weight: 600; }
 .svc.dynamodb { color: var(--ddb); } .svc.s3 { color: var(--s3); } .svc.sqs { color: var(--sqs); } .svc.admin { color: var(--admin); }
@@ -69,6 +75,8 @@ pre { margin: 4px 0 10px; padding: 8px 10px; background: var(--panel); border: 1
   <span><span id="dot" class="dot"></span><span id="conn" class="muted">연결 중</span></span>
   <span class="muted" id="counter">요청 0</span>
   <span class="spacer"></span>
+  <form class="ask" id="askform"><input id="q" placeholder="에이전트에게 묻기 (예: 최근 오류 왜 났어?)" aria-label="에이전트에게 질문"><button>묻기</button></form>
+  <span class="muted" id="llm"></span>
   <a href="/_town" style="color:inherit">마을 보기</a>
   <button id="refresh">새로고침</button>
   <button id="reset" class="danger">전체 초기화</button>
@@ -183,7 +191,7 @@ const authCell = a => !a ? `<span class="muted">루트</span>`
 function renderLog() {
   const f = $("filter").value.trim().toLowerCase();
   const rows = events.filter(e => !f || `${e.service} ${e.op} ${e.status}`.toLowerCase().includes(f));
-  $("logbody").innerHTML = rows.map(e => `<tr><td>${esc(clock(e.ts))}</td><td class="svc ${esc(e.service)}">${esc(e.service)}</td>
+  $("logbody").innerHTML = rows.map(e => `<tr ${e.request_id ? `data-rid="${esc(e.request_id)}"` : ""} title="눌러서 해설 보기"><td>${esc(clock(e.ts))}</td><td class="svc ${esc(e.service)}">${esc(e.service)}</td>
     <td>${esc(e.op)}</td><td class="st${String(e.status)[0]}">${esc(e.status)}</td>
     <td title="${esc(e.auth ? e.auth.reason : "")}">${authCell(e.auth)}</td><td>${e.ms != null ? e.ms.toFixed(1) : ""}</td>
     <td class="muted">${esc((e.principal || "").replace(/^arn:aws:(iam|sts)::\d+:/, ""))}</td></tr>`).join("");
@@ -201,7 +209,44 @@ es.onmessage = m => {
   renderLog();
 };
 
+// ---------- explanation agent ----------
+const H = {"x-rocalcloud": "1", "content-type": "application/json"};
+const post = (url, body) => fetch(url, {method: "POST", headers: H, body: JSON.stringify(body)}).then(r => r.ok ? r.json() : r.text().then(t => ({error: t})));
+fetch("/_agent/status").then(r => r.json()).then(s => $("llm").textContent = s.available ? `LLM: ${s.model}` : "LLM 없음 · 규칙 해설만").catch(() => {});
+function showAgent(html) { sel = null; location.hash = ""; renderNav(); $("detail").innerHTML = html; }
+$("logbody").onclick = async ev => {
+  const tr = ev.target.closest("tr[data-rid]");
+  if (!tr) return;
+  const rid = tr.dataset.rid;
+  const e = events.find(x => x.request_id === rid) || {};
+  const head = `<h2>요청 해설</h2><div class="sub">${esc(e.service)} ${esc(e.op)} · 상태 ${esc(e.status)} · ${esc(rid)}</div>`;
+  const quick = await post("/_agent/explain", {request_id: rid, llm: false});
+  showAgent(head + `<div class="explain">${esc(quick.rule || quick.error)}</div><div class="muted" id="llmwait">LLM 해설을 기다리는 중…</div>`);
+  const full = await post("/_agent/explain", {request_id: rid});
+  const w = $("llmwait");
+  if (w) w.outerHTML = full.llm ? `<div class="explain llm">${esc(full.llm)}</div><div class="muted">${esc(full.model)}</div>` : `<div class="muted">LLM 해설 없음 (${esc(full.llm_error || "꺼짐")})</div>`;
+};
+function renderAnswer(q, r) {
+  const steps = (r.steps || []).map(s => `→ ${s.action} ${JSON.stringify(s.args)}\n  ${s.result}`).join("\n");
+  const confirm = r.confirm ? `<p><button id="doconfirm" data-token="${esc(r.confirm.needs_confirmation)}" class="danger">${esc(r.confirm.service)} ${esc(r.confirm.operation)} 실행</button>
+     <span class="muted">${esc(JSON.stringify(r.confirm.params))}</span></p>` : "";
+  showAgent(`<h2>에이전트</h2><div class="sub">질문: ${esc(q)}</div><div class="explain ${r.llm ? "llm" : ""}">${esc(r.answer)}</div>${confirm}
+    ${steps ? `<details><summary class="muted">도구 사용 ${r.steps.length}회</summary><div class="steps">${esc(steps)}</div></details>` : ""}`);
+}
+$("askform").onsubmit = async ev => {
+  ev.preventDefault();
+  const q = $("q").value.trim();
+  if (!q) return;
+  showAgent(`<h2>에이전트</h2><div class="sub">질문: ${esc(q)}</div><div class="muted">생각하는 중…</div>`);
+  renderAnswer(q, await post("/_agent/ask", {question: q}));
+};
+
 $("detail").onclick = async ev => {
+  if (ev.target.id === "doconfirm") {
+    if (!confirm("되돌릴 수 없는 작업입니다. 실행할까요?")) return;
+    renderAnswer("(확인 후 실행)", await post("/_agent/ask", {confirm: ev.target.dataset.token}));
+    return;
+  }
   if (ev.target.id !== "rgo") return;
   Object.assign(reachForm, {from: $("rf").value, to: $("rt").value, protocol: $("rp").value, port: $("rport").value});
   const qs = new URLSearchParams({from: reachForm.from, to: reachForm.to, protocol: reachForm.protocol, port: reachForm.port});

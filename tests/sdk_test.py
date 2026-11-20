@@ -1018,6 +1018,70 @@ def test_cloudformation():
     assert code(cf.describe_stacks, StackName=name) == "ValidationError"
 
 
+def test_agent():
+    import urllib.request
+    H = {"x-rocalcloud": "1", "content-type": "application/json"}
+    post = lambda u, b: json.load(urllib.request.urlopen(urllib.request.Request(EP + u, data=json.dumps(b).encode(), headers=H, method="POST"), timeout=300))
+    t = f"agent{run}"
+    ddb.create_table(TableName=t, BillingMode="PAY_PER_REQUEST", KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+                     AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}])
+    ddb.put_item(TableName=t, Item={"id": {"S": "a"}})
+    rid = None
+    try:
+        ddb.put_item(TableName=t, Item={"id": {"S": "a"}}, ConditionExpression="attribute_not_exists(id)")
+    except ClientError as e:
+        rid = e.response["ResponseMetadata"]["RequestId"]
+    quick = post("/_agent/explain", {"request_id": rid, "llm": False})
+    assert quick["rule"].startswith("ConditionalCheckFailedException"), quick
+    st = json.load(urllib.request.urlopen(EP + "/_agent/status"))
+    if st["available"]:
+        full = post("/_agent/explain", {"request_id": rid})
+        assert full["llm"] and len(full["llm"]) > 10, full
+        r = post("/_agent/ask", {"question": f"{t} 테이블을 지워줘"})
+        assert r.get("confirm", {}).get("operation") == "DeleteTable", r  # destructive → needs confirmation
+        assert t in ddb.list_tables()["TableNames"], "nothing deleted before confirmation"
+        done = post("/_agent/ask", {"confirm": r["confirm"]["needs_confirmation"]})
+        assert t not in ddb.list_tables()["TableNames"], done
+        print("   llm:", full["llm"][:120].replace("\n", " "))
+    else:
+        ddb.delete_table(TableName=t)
+        assert "규칙 기반" in post("/_agent/ask", {"question": "최근 오류?"})["answer"]
+
+
+def test_template_roundtrip():
+    import urllib.request
+    sns, ssm, cf = boto3.client("sns", **kw), boto3.client("ssm", **kw), boto3.client("cloudformation", **kw)
+    urllib.request.urlopen(urllib.request.Request(f"{EP}/_admin/reset", headers={"x-rocalcloud": "1"}, method="POST"))
+    p = f"rt{run}"
+    ddb.create_table(TableName=f"{p}-orders", BillingMode="PAY_PER_REQUEST", KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+                     AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}])
+    dlq = sqs.create_queue(QueueName=f"{p}-dlq")["QueueUrl"]
+    q = sqs.create_queue(QueueName=f"{p}-jobs", Attributes={"VisibilityTimeout": "45", "RedrivePolicy": json.dumps(
+        {"deadLetterTargetArn": f"arn:aws:sqs:us-east-1:000000000000:{p}-dlq", "maxReceiveCount": "4"})})["QueueUrl"]
+    t = sns.create_topic(Name=f"{p}-events")["TopicArn"]
+    sns.subscribe(TopicArn=t, Protocol="sqs", Endpoint=f"arn:aws:sqs:us-east-1:000000000000:{p}-jobs", Attributes={"RawMessageDelivery": "true"})
+    s3.create_bucket(Bucket=f"{p}-files")
+    ssm.put_parameter(Name=f"/{p}/mode", Value="fast", Type="String")
+    yaml = urllib.request.urlopen(f"{EP}/_agent/template").read().decode()
+    assert "AWS::SNS::Subscription" in yaml and "Fn::GetAtt" in yaml, yaml
+    urllib.request.urlopen(urllib.request.Request(f"{EP}/_admin/reset", headers={"x-rocalcloud": "1"}, method="POST"))
+    assert not sqs.list_queues().get("QueueUrls")
+    cf.create_stack(StackName=p, TemplateBody=yaml)
+    for _ in range(100):
+        st = cf.describe_stacks(StackName=p)["Stacks"][0]["StackStatus"]
+        if not st.endswith("IN_PROGRESS"):
+            break
+        time.sleep(0.1)
+    assert st == "CREATE_COMPLETE", cf.describe_stacks(StackName=p)["Stacks"][0]
+    a = sqs.get_queue_attributes(QueueUrl=q, AttributeNames=["All"])["Attributes"]
+    assert a["VisibilityTimeout"] == "45" and json.loads(a["RedrivePolicy"])["maxReceiveCount"] in (4, "4"), a
+    sns.publish(TopicArn=t, Message="again")
+    assert sqs.receive_message(QueueUrl=q)["Messages"][0]["Body"] == "again"
+    assert ddb.describe_table(TableName=f"{p}-orders")["Table"]["KeySchema"][0]["AttributeName"] == "id"
+    assert ssm.get_parameter(Name=f"/{p}/mode")["Parameter"]["Value"] == "fast"
+    cf.delete_stack(StackName=p)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

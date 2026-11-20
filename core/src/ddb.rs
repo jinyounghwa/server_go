@@ -809,3 +809,23 @@ impl Db {
             .collect()
     }
 }
+
+impl Db {
+    // CloudFormation properties for every table (infrastructure-code draft).
+    pub fn export(&self) -> Vec<(String, Value)> {
+        self.tables.iter().map(|(n, t)| {
+            let d = &t.desc;
+            let mode = d["BillingModeSummary"]["BillingMode"].as_str().unwrap_or("PAY_PER_REQUEST");
+            let mut p = json!({"TableName": n, "KeySchema": d["KeySchema"], "AttributeDefinitions": d["AttributeDefinitions"], "BillingMode": mode});
+            if mode == "PROVISIONED" {
+                p["ProvisionedThroughput"] = json!({"ReadCapacityUnits": d["ProvisionedThroughput"]["ReadCapacityUnits"], "WriteCapacityUnits": d["ProvisionedThroughput"]["WriteCapacityUnits"]});
+            }
+            for k in ["GlobalSecondaryIndexes", "LocalSecondaryIndexes"] {
+                if let Some(ix) = d[k].as_array() {
+                    p[k] = ix.iter().map(|i| { let mut i = i.clone(); if let Some(o) = i.as_object_mut() { o.remove("IndexStatus"); o.remove("IndexArn"); } i }).collect();
+                }
+            }
+            (n.clone(), p)
+        }).collect()
+    }
+}

@@ -506,6 +506,9 @@ fn notify(st: &mut Store, b: &str, event: &str, key: &str, size: usize, etag: &s
 }
 
 impl Store {
+    pub fn bucket_names(&self) -> Vec<String> {
+        self.buckets.keys().cloned().collect()
+    }
     pub fn object(&self, b: &str, k: &str) -> Option<Bytes> {
         self.buckets.get(b)?.objs.get(k).map(|o| o.data.clone())
     }

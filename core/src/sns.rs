@@ -192,3 +192,10 @@ impl Sns {
             .collect()
     }
 }
+
+impl Sns {
+    // (topic ARNs, subscriptions as (topic ARN, protocol, endpoint, attributes)) for the infrastructure-code draft.
+    pub fn export(&self) -> (Vec<String>, Vec<(String, String, String, BTreeMap<String, String>)>) {
+        (self.topics.keys().cloned().collect(), self.subs.values().map(|s| (s.topic.clone(), s.protocol.clone(), s.endpoint.clone(), s.attrs.clone())).collect())
+    }
+}

@@ -93,3 +93,10 @@ impl Ssm {
         json!([{"name": "파라미터", "count": rows.len(), "cols": ["이름", "타입", "값", "버전"], "rows": rows}])
     }
 }
+
+impl Ssm {
+    // (name, type, value) for the infrastructure-code draft.
+    pub fn export(&self) -> Vec<(String, String, String)> {
+        self.p.iter().map(|(n, p)| (n.clone(), p.ty.clone(), p.value.clone())).collect()
+    }
+}

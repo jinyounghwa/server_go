@@ -270,3 +270,15 @@ impl Queues {
             .collect()
     }
 }
+
+impl Queues {
+    // Queue name → non-default attributes (infrastructure-code draft).
+    pub fn export(&self) -> Vec<(String, BTreeMap<String, String>)> {
+        let defaults = [("VisibilityTimeout", "30"), ("DelaySeconds", "0"), ("MaximumMessageSize", "262144"), ("MessageRetentionPeriod", "345600"), ("ReceiveMessageWaitTimeSeconds", "0")];
+        self.q.iter().map(|(n, q)| {
+            let a = q.attrs.iter().filter(|(k, v)| !["QueueArn", "CreatedTimestamp"].contains(&k.as_str()) && !defaults.contains(&(k.as_str(), v.as_str())))
+                .map(|(k, v)| (k.clone(), v.clone())).collect();
+            (n.clone(), a)
+        }).collect()
+    }
+}
