@@ -1,6 +1,7 @@
 """Official-SDK (boto3) compatibility check. Run: uv run --with boto3 tests/sdk_test.py
 Expects the emulator on ENDPOINT (default http://127.0.0.1:4566) started with ENFORCE_IAM=1.
-Run: uv run --with boto3 --with "pyjwt[crypto]" tests/sdk_test.py"""
+Run: uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with redis tests/sdk_test.py
+test_rds_elasticache needs Docker on the emulator host and is skipped without it."""
 import json, os, time, uuid
 import boto3
 from botocore.config import Config
@@ -696,6 +697,102 @@ def test_cognito():
     assert "IdToken" in idp.initiate_auth(ClientId=sec["ClientId"], AuthFlow="USER_PASSWORD_AUTH", AuthParameters=params)["AuthenticationResult"]
     idp.delete_user_pool(UserPoolId=pool)
     assert code(idp.get_user, AccessToken=tok["AccessToken"]) == "NotAuthorizedException"
+
+
+def test_kinesis():
+    k = boto3.client("kinesis", **kw)
+    n = f"clicks{run}"
+    k.create_stream(StreamName=n, ShardCount=2)
+    k.get_waiter("stream_exists").wait(StreamName=n)
+    assert code(k.create_stream, StreamName=n, ShardCount=1) == "ResourceInUseException"
+    shards = [s["ShardId"] for s in k.list_shards(StreamName=n)["Shards"]]
+    assert len(shards) == 2
+    first = k.put_record(StreamName=n, Data=b"hello", PartitionKey="user-1")
+    r = k.put_records(StreamName=n, Records=[{"Data": f"e{i}".encode(), "PartitionKey": f"user-{i % 5}"} for i in range(20)])
+    assert r["FailedRecordCount"] == 0
+    got = {}
+    for sid in shards:
+        it = k.get_shard_iterator(StreamName=n, ShardId=sid, ShardIteratorType="TRIM_HORIZON")["ShardIterator"]
+        recs = k.get_records(ShardIterator=it, Limit=100)
+        got[sid] = [x["Data"] for x in recs["Records"]]
+        assert k.get_records(ShardIterator=recs["NextShardIterator"])["Records"] == []
+    assert sum(len(v) for v in got.values()) == 21 and all(got.values()), "records spread over both shards"
+    same = [s for s, v in got.items() if b"hello" in v][0]
+    it = k.get_shard_iterator(StreamName=n, ShardId=first["ShardId"], ShardIteratorType="AFTER_SEQUENCE_NUMBER",
+                              StartingSequenceNumber=first["SequenceNumber"])["ShardIterator"]
+    assert b"hello" not in [x["Data"] for x in k.get_records(ShardIterator=it)["Records"]] and same == first["ShardId"]
+    k.delete_stream(StreamName=n)
+    assert code(k.describe_stream, StreamName=n) == "ResourceNotFoundException"
+
+
+def test_ses():
+    import urllib.request
+    v1, v2 = boto3.client("ses", **kw), boto3.client("sesv2", **kw)
+    sender = f"noreply{run}@example.com"
+    msg = {"Subject": {"Data": "Welcome"}, "Body": {"Text": {"Data": "Hi there"}}}
+    assert code(v1.send_email, Source=sender, Destination={"ToAddresses": ["a@x.com"]}, Message=msg) == "MessageRejected"
+    v1.verify_email_identity(EmailAddress=sender)
+    assert sender in v1.list_identities()["Identities"]
+    assert v1.get_identity_verification_attributes(Identities=[sender])["VerificationAttributes"][sender]["VerificationStatus"] == "Success"
+    assert v1.send_email(Source=sender, Destination={"ToAddresses": ["a@x.com"]}, Message=msg)["MessageId"]
+    v2.create_email_identity(EmailIdentity=f"shop{run}.example")
+    v2.send_email(FromEmailAddress=f"orders@shop{run}.example", Destination={"ToAddresses": ["b@x.com"]},
+                  Content={"Simple": {"Subject": {"Data": "Receipt"}, "Body": {"Html": {"Data": "<b>paid</b>"}}}})
+    raw = f"From: {sender}\r\nTo: c@x.com\r\nSubject: Raw one\r\n\r\nraw body".encode()
+    v1.send_raw_email(RawMessage={"Data": raw})
+    box = json.load(urllib.request.urlopen(f"{EP}/_admin/state"))["ses"][0]["rows"]
+    mine = [(r[2], r[3]) for r in box if run in r[1]]
+    assert ("c@x.com", "Raw one") in mine and ("b@x.com", "Receipt") in mine and ("a@x.com", "Welcome") in mine, mine
+
+
+def test_rds_elasticache():
+    import shutil, subprocess
+    if not shutil.which("docker") or subprocess.run(["docker", "ps"], capture_output=True).returncode != 0:
+        print("skip test_rds_elasticache (no docker)")
+        return
+    import pg8000.native, pymysql, redis
+    rds, ec = boto3.client("rds", **kw), boto3.client("elasticache", **kw)
+    pg, my, rc = f"pg{run}", f"my{run}", f"rc{run}"
+    rds.create_db_instance(DBInstanceIdentifier=pg, Engine="postgres", DBInstanceClass="db.t3.micro", MasterUsername="app",
+                           MasterUserPassword="secret123", DBName="shop", AllocatedStorage=20)
+    rds.create_db_instance(DBInstanceIdentifier=my, Engine="mysql", DBInstanceClass="db.t3.micro", MasterUsername="app",
+                           MasterUserPassword="secret123", DBName="shop", AllocatedStorage=20)
+    ec.create_cache_cluster(CacheClusterId=rc, Engine="redis", CacheNodeType="cache.t3.micro", NumCacheNodes=1)
+    assert code(rds.create_db_instance, DBInstanceIdentifier=pg, Engine="postgres", MasterUsername="a", MasterUserPassword="secret123",
+                DBInstanceClass="db.t3.micro", AllocatedStorage=20) == "DBInstanceAlreadyExists"
+
+    def until(fn, what, secs=120):
+        for _ in range(secs * 2):
+            v = fn()
+            if v:
+                return v
+            time.sleep(0.5)
+        raise AssertionError(f"{what} never became available")
+    db = lambda i: rds.describe_db_instances(DBInstanceIdentifier=i)["DBInstances"][0]
+    p = until(lambda: (d := db(pg))["DBInstanceStatus"] == "available" and d, "postgres")
+    c = pg8000.native.Connection("app", host=p["Endpoint"]["Address"], port=p["Endpoint"]["Port"], password="secret123", database="shop")
+    c.run("create table t (n int)"); c.run("insert into t values (41), (1)")
+    assert c.run("select sum(n) from t") == [[42]]
+    c.close()
+    cc = until(lambda: (x := ec.describe_cache_clusters(CacheClusterId=rc, ShowCacheNodeInfo=True)["CacheClusters"][0])["CacheClusterStatus"] == "available" and x, "redis")
+    ep = cc["CacheNodes"][0]["Endpoint"]
+    r = redis.Redis(host=ep["Address"], port=ep["Port"])
+    r.set("k", "v"); assert r.get("k") == b"v"
+    m = until(lambda: (d := db(my))["DBInstanceStatus"] == "available" and d, "mysql", 180)
+    conn = pymysql.connect(host=m["Endpoint"]["Address"], port=m["Endpoint"]["Port"], user="app", password="secret123", database="shop")
+    with conn.cursor() as cur:
+        cur.execute("select 6 * 7"); assert cur.fetchone() == (42,)
+    conn.close()
+
+    rds.stop_db_instance(DBInstanceIdentifier=pg)
+    until(lambda: db(pg)["DBInstanceStatus"] == "stopped", "stopped", 30)
+    for i in (pg, my):
+        rds.delete_db_instance(DBInstanceIdentifier=i, SkipFinalSnapshot=True)
+    ec.delete_cache_cluster(CacheClusterId=rc)
+    assert code(rds.describe_db_instances, DBInstanceIdentifier=pg) == "DBInstanceNotFound"
+    time.sleep(3)
+    left = subprocess.run(["docker", "ps", "-a", "--format", "{{.Names}}"], capture_output=True, text=True).stdout
+    assert run not in left, left
 
 
 if __name__ == "__main__":

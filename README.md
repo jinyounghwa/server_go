@@ -8,7 +8,7 @@ A local, in-memory emulator for the cloud APIs your app actually uses. Point an 
 ```sh
 cd core && cargo run --release        # emulator on 127.0.0.1:4566 (BIND, REGION env vars)
 cd gui && cargo run                   # desktop window (Tauri), or open http://127.0.0.1:4566/_ui
-ENFORCE_IAM=1 cargo run --release & uv run --with boto3 --with "pyjwt[crypto]" tests/sdk_test.py  # official-SDK check
+ENFORCE_IAM=1 cargo run --release & uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with redis tests/sdk_test.py
 ```
 
 ## Supported
@@ -29,6 +29,10 @@ ENFORCE_IAM=1 cargo run --release & uv run --with boto3 --with "pyjwt[crypto]" t
 | Step Functions | ASL interpreter: Pass, Task (Lambda, lambda:invoke, sqs:sendMessage, sns:publish, dynamodb:*), Choice, Wait, Succeed, Fail, Parallel, Map, Retry/Catch, Parameters/ResultSelector/ResultPath/OutputPath, intrinsics (Format, StringToJson, JsonToString, Array, UUID, MathAdd), execution history, StopExecution |
 | API Gateway (HTTP APIs) | apigatewayv2 APIs, Lambda proxy integrations (payload 2.0), routes with {params} and {proxy+}, stages, quick create; invoke at `/_api/{apiId}/[{stage}/]path` |
 | Cognito | User pools, app clients (with secrets), SignUp/Confirm, ForgotPassword, USER_PASSWORD_AUTH, refresh tokens, NEW_PASSWORD_REQUIRED, admin user APIs, RS256 JWTs with JWKS at `/_cognito/{poolId}/.well-known/jwks.json`; verification codes appear as `CodeSent` events |
+| Kinesis | Streams, shards (MD5 hash ranges), PutRecord(s), shard iterators (TRIM_HORIZON, LATEST, AT/AFTER_SEQUENCE_NUMBER, AT_TIMESTAMP), GetRecords |
+| SES | v1 (Query) and v2 (REST): identities, SendEmail, SendRawEmail; mail lands in the GUI mailbox, never sent |
+| RDS | postgres / mysql / mariadb instances as real Docker containers on 127.0.0.1; create, describe, stop, start, reboot, delete |
+| ElastiCache | redis / valkey / memcached clusters as Docker containers; create, describe (with node endpoints), delete |
 | EC2 (network) | VPCs, subnets, internet gateways, route tables, security groups, instances (records only), DescribeAvailabilityZones |
 
 ## IAM enforcement
@@ -50,6 +54,12 @@ EventBridge → SQS / SNS / Lambda. Every hop shows up in the event stream.
 `POST /_admin/chaos` (header `x-rocalcloud`) with
 `{"rules": [{"service": "dynamodb", "op": "Get*", "latency_ms": 200, "error_rate": 0.1, "throttle_rate": 0.2}]}`
 injects latency, 500s and service-specific throttling errors. `{"rules": []}` turns it off.
+
+## Docker-backed services
+
+RDS and ElastiCache start containers through the `docker` CLI (`RC_DOCKER` to override). Each container is published on
+127.0.0.1 only and capped at `RC_CONTAINER_MEMORY` (default 512m) and 1 CPU. Leftover `rocalcloud-*` containers are
+removed at startup and on reset.
 
 ## Built-in endpoints
 

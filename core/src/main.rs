@@ -3,11 +3,14 @@ mod cognito;
 mod ddb;
 mod events;
 mod iam;
+mod kinesis;
 mod kms;
 mod lambda;
 mod logs;
+mod managed;
 mod net;
 mod s3;
+mod ses;
 mod sfn;
 mod secrets;
 mod sns;
@@ -97,6 +100,9 @@ pub struct App {
     pub sfn: Mutex<sfn::Sfn>,
     pub apigw: Mutex<apigw::ApiGw>,
     pub cognito: Mutex<cognito::Cognito>,
+    pub kinesis: Mutex<kinesis::Kinesis>,
+    pub ses: Mutex<ses::Ses>,
+    pub managed: Mutex<managed::Managed>,
     chaos: Mutex<Vec<Value>>,
     events: broadcast::Sender<String>,
 }
@@ -147,6 +153,9 @@ const STS_OPS: &[&str] = &["GetCallerIdentity", "AssumeRole"];
 const IAM_NS: &str = "https://iam.amazonaws.com/doc/2010-05-08/";
 const STS_NS: &str = "https://sts.amazonaws.com/doc/2011-06-15/";
 const SNS_NS: &str = "http://sns.amazonaws.com/doc/2010-03-31/";
+const SES_NS: &str = "http://ses.amazonaws.com/doc/2010-12-01/";
+const RDS_NS: &str = "http://rds.amazonaws.com/doc/2014-10-31/";
+const CACHE_NS: &str = "http://elasticache.amazonaws.com/doc/2015-02-02/";
 
 fn query_reply(ns: &str, action: &str, rid: &str, r: Result<Value, ApiErr>) -> Response {
     let (status, body) = match r {
@@ -173,6 +182,7 @@ const JSON_TARGETS: &[(&str, &str)] = &[
     ("AWSEvents.", "events"),
     ("AWSStepFunctions.", "states"),
     ("AWSCognitoIdentityProviderService.", "cognito-idp"),
+    ("Kinesis_20131202.", "kinesis"),
 ];
 
 pub fn emit(app: &App, ev: Value) {
@@ -184,6 +194,10 @@ const COGNITO_PUBLIC: &[&str] = &["SignUp", "ConfirmSignUp", "InitiateAuth", "Re
     "ConfirmForgotPassword", "GetUser", "ChangePassword", "GlobalSignOut"];
 
 enum Svc {
+    Rds(HashMap<String, String>),
+    Cache(HashMap<String, String>),
+    SesV1(HashMap<String, String>),
+    SesV2(String, String), // method, path after /v2/email/
     ApiGw(String, String), // method, path after /v2/
     Lambda(&'static str, String, HashMap<String, String>), // op, path after the API version, query
     Json(&'static str, String),
@@ -203,6 +217,12 @@ fn arn(svc: &str, rest: &str) -> String {
 fn checks(app: &App, svc: &Svc, body: &[u8]) -> Vec<(String, String)> {
     let j: Value = serde_json::from_slice(body).unwrap_or_default();
     match svc {
+        Svc::Rds(q) => vec![(format!("rds:{}", q.get("Action").map_or("", String::as_str)),
+                             q.get("DBInstanceIdentifier").map_or("*".into(), |i| arn("rds", &format!("db:{i}"))))],
+        Svc::Cache(q) => vec![(format!("elasticache:{}", q.get("Action").map_or("", String::as_str)),
+                               q.get("CacheClusterId").map_or("*".into(), |i| arn("elasticache", &format!("cluster:{i}"))))],
+        Svc::SesV1(q) => vec![(format!("ses:{}", q.get("Action").map_or("", String::as_str)), "*".into())],
+        Svc::SesV2(m, path) => vec![(format!("ses:{m} {}", path.split('/').next().unwrap_or("")), "*".into())],
         // API Gateway's IAM model: action = HTTP verb, resource = API path.
         Svc::ApiGw(m, path) => vec![(format!("apigateway:{m}"), format!("arn:aws:apigateway:{}::/{path}", *REGION))],
         Svc::Lambda(op, path, _) => {
@@ -213,6 +233,7 @@ fn checks(app: &App, svc: &Svc, body: &[u8]) -> Vec<(String, String)> {
         Svc::Json("cognito-idp", op) if COGNITO_PUBLIC.contains(&op.as_str()) => vec![],
         Svc::Json(name, op) => {
             let res = match *name {
+                "kinesis" => j["StreamARN"].as_str().map(String::from).or_else(|| j["StreamName"].as_str().map(|n| arn("kinesis", &format!("stream/{n}")))),
                 "cognito-idp" => j["UserPoolId"].as_str().map(|p| arn("cognito-idp", &format!("userpool/{p}"))),
                 "secretsmanager" => j["SecretId"].as_str().and_then(|id| app.secrets.lock().unwrap().arn_of(id))
                     .or_else(|| j["Name"].as_str().map(|n| arn("secretsmanager", &format!("secret:{n}")))),
@@ -277,7 +298,9 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
     let target = headers.get("x-amz-target").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     let is_form = headers.get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|c| c.starts_with("application/x-www-form-urlencoded"));
     let lambda_path = ["/2015-03-31/", "/2014-11-13/"].iter().find_map(|v| uri.path().strip_prefix(v)).filter(|_| scope == "lambda" || scope.is_empty());
-    let svc = if let Some(path) = uri.path().strip_prefix("/v2/").filter(|_| scope == "apigateway") {
+    let svc = if let Some(path) = uri.path().strip_prefix("/v2/email/").filter(|_| scope == "ses") {
+        Svc::SesV2(method.to_string(), path.to_string())
+    } else if let Some(path) = uri.path().strip_prefix("/v2/").filter(|_| scope == "apigateway") {
         Svc::ApiGw(method.to_string(), path.to_string())
     } else if let Some(path) = lambda_path {
         Svc::Lambda(lambda::op_of(method.as_str(), path), path.to_string(), form(uri.query().unwrap_or("")).collect())
@@ -293,6 +316,12 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
         let version = q.get("Version").cloned().unwrap_or_default();
         if scope == "ec2" || version == "2016-11-15" {
             Svc::Ec2(q)
+        } else if scope == "rds" || version == "2014-10-31" {
+            Svc::Rds(q)
+        } else if scope == "elasticache" || version == "2015-02-02" {
+            Svc::Cache(q)
+        } else if scope == "ses" || version == "2010-12-01" {
+            Svc::SesV1(q)
         } else if scope == "sns" || version == "2010-03-31" {
             Svc::Sns(q)
         } else {
@@ -302,6 +331,10 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
         Svc::S3(s3::classify(&method, &uri, &headers))
     };
     let (service, op) = match &svc {
+        Svc::Rds(q) => ("rds", q.get("Action").cloned().unwrap_or_default()),
+        Svc::Cache(q) => ("elasticache", q.get("Action").cloned().unwrap_or_default()),
+        Svc::SesV1(q) => ("ses", q.get("Action").cloned().unwrap_or_default()),
+        Svc::SesV2(m, path) => ("ses", format!("{m} {}", path.split('/').next().unwrap_or(""))),
         Svc::Json(name, op) => (*name, op.clone()),
         Svc::Lambda(op, ..) => ("lambda", op.to_string()),
         Svc::ApiGw(_, path) => ("apigateway", format!("{method} /{}", path.split('/').take(3).collect::<Vec<_>>().join("/"))),
@@ -345,6 +378,36 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
     let fault = denied.or(chaos.as_ref().and_then(|(_, e)| e.as_ref().map(|e| ApiErr { status: e.status, code: e.code.clone(), msg: e.msg.clone(), extra: None })));
 
     let mut resp = match (svc, fault) {
+        (Svc::Rds(_), Some(e)) => query_reply(RDS_NS, &op, &rid, Err(e)),
+        (Svc::Cache(_), Some(e)) => query_reply(CACHE_NS, &op, &rid, Err(e)),
+        (s @ (Svc::Rds(_) | Svc::Cache(_)), None) => {
+            let is_rds = matches!(s, Svc::Rds(_));
+            let r = match &s {
+                Svc::Rds(q) => app.managed.lock().unwrap().rds(q),
+                Svc::Cache(q) => app.managed.lock().unwrap().cache(q),
+                _ => unreachable!(),
+            };
+            let r = r.map(|(v, job)| {
+                if let Some((kind, id, job)) = job {
+                    tokio::spawn(managed::run_job(app.clone(), kind, id, job));
+                }
+                v
+            });
+            query_reply(if is_rds { RDS_NS } else { CACHE_NS }, &op, &rid, r)
+        }
+        (Svc::SesV1(_), Some(e)) => query_reply(SES_NS, &op, &rid, Err(e)),
+        (Svc::SesV1(q), None) => {
+            let r = app.ses.lock().unwrap().handle_query(&q);
+            query_reply(SES_NS, &op, &rid, r)
+        }
+        (Svc::SesV2(..), Some(e)) => lambda::error_reply(e),
+        (Svc::SesV2(m, path), None) => {
+            let j: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+            match app.ses.lock().unwrap().handle_v2(&m, &path, &j) {
+                Ok((s, v)) => Response::builder().status(s).header("content-type", "application/json").body(Body::from(v.to_string())).unwrap(),
+                Err(e) => lambda::error_reply(e),
+            }
+        }
         (Svc::Lambda(..) | Svc::ApiGw(..), Some(e)) => lambda::error_reply(e),
         (Svc::ApiGw(_, path), None) => {
             let j: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
@@ -400,6 +463,7 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
                     "secretsmanager" => app.secrets.lock().unwrap().handle(&op, &j),
                     "ssm" => app.ssm.lock().unwrap().handle(&op, &j),
                     "kms" => app.kms.lock().unwrap().handle(&op, &j),
+                    "kinesis" => app.kinesis.lock().unwrap().handle(&op, &j),
                     _ => app.logs.lock().unwrap().handle(&op, &j),
                 });
             json_reply(name, r)
@@ -592,6 +656,9 @@ async fn state(State(app): State<Arc<App>>) -> Json<Value> {
         "sfn": app.sfn.lock().unwrap().admin(),
         "apigw": app.apigw.lock().unwrap().admin(),
         "cognito": app.cognito.lock().unwrap().admin(),
+        "kinesis": app.kinesis.lock().unwrap().admin(),
+        "ses": app.ses.lock().unwrap().admin(),
+        "managed": app.managed.lock().unwrap().admin(),
         "secrets": app.secrets.lock().unwrap().admin(),
         "ssm": app.ssm.lock().unwrap().admin(),
         "kms": app.kms.lock().unwrap().admin(),
@@ -619,6 +686,10 @@ async fn reset(State(app): State<Arc<App>>, h: HeaderMap) -> axum::http::StatusC
     *app.sfn.lock().unwrap() = Default::default();
     *app.apigw.lock().unwrap() = Default::default();
     *app.cognito.lock().unwrap() = Default::default();
+    *app.kinesis.lock().unwrap() = Default::default();
+    *app.ses.lock().unwrap() = Default::default();
+    *app.managed.lock().unwrap() = Default::default();
+    tokio::spawn(managed::cleanup());
     let _ = app.events.send(json!({"ts": chrono::Utc::now().to_rfc3339(), "service": "admin", "op": "Reset", "status": 200}).to_string());
     axum::http::StatusCode::NO_CONTENT
 }
@@ -673,6 +744,9 @@ async fn main() {
         sfn: Default::default(),
         apigw: Default::default(),
         cognito: Default::default(),
+        kinesis: Default::default(),
+        ses: Default::default(),
+        managed: Default::default(),
         chaos: Default::default(),
         events: broadcast::channel(1024).0,
     });
@@ -689,6 +763,7 @@ async fn main() {
         .fallback(handle)
         .layer(DefaultBodyLimit::max(256 << 20)) // ponytail: 256 MiB per request, bodies are held in memory
         .with_state(app);
+    tokio::spawn(managed::cleanup());
     let l = tokio::net::TcpListener::bind(&bind).await.expect("bind");
     eprintln!("rocalcloud listening on http://{bind}  (GUI: /_ui, events: /_events, ENFORCE_IAM={})", *ENFORCE as u8);
     axum::serve(l, router).await.unwrap();

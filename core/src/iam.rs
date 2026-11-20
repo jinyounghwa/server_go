@@ -513,7 +513,11 @@ pub fn to_xml(v: &Value) -> String {
         Value::Object(m) => m
             .iter()
             .map(|(k, v)| match v {
-                Value::Array(a) => format!("<{k}>{}</{k}>", a.iter().map(|x| format!("<member>{}</member>", to_xml(x))).collect::<String>()),
+                // "Outer|Item" names list items explicitly (RDS/ElastiCache), otherwise <member>.
+                Value::Array(a) => {
+                    let (outer, item) = k.split_once('|').unwrap_or((k.as_str(), "member"));
+                    format!("<{outer}>{}</{outer}>", a.iter().map(|x| format!("<{item}>{}</{item}>", to_xml(x))).collect::<String>())
+                }
                 Value::Object(o) if o.is_empty() => String::new(),
                 // {"__entries": {k: v}} renders a Query-protocol map.
                 Value::Object(o) if o.contains_key("__entries") => format!("<{k}>{}</{k}>", o["__entries"].as_object().into_iter().flatten()
