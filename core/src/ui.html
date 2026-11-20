@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rocalcloud</title>
+<style>
+:root {
+  --bg: #f6f6f3; --panel: #ffffff; --line: #e2e1dc; --text: #1d1d1b; --muted: #77766f;
+  --accent: #2f6f5e; --ok: #2f7d4f; --warn: #b36b00; --bad: #b3261e; --sel: #e8efe9;
+  --ddb: #3b5bdb; --s3: #2b8a3e; --sqs: #c2410c; --admin: #6b6b6b;
+  font: 13px/1.45 ui-sans-serif, -apple-system, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #151614; --panel: #1d1e1b; --line: #30312d; --text: #e9e8e3; --muted: #9a998f;
+          --accent: #7cc4ad; --sel: #263129; --ddb: #8ea4ff; --s3: #6fcf86; --sqs: #ff9a5c; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; height: 100vh; display: grid; grid-template-rows: 44px 1fr 38%; background: var(--bg); color: var(--text); }
+header { display: flex; align-items: center; gap: 14px; padding: 0 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+header b { font-size: 14px; letter-spacing: .02em; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); display: inline-block; margin-right: 6px; }
+.dot.on { background: var(--ok); }
+.spacer { flex: 1; }
+.muted { color: var(--muted); }
+button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+button:hover { border-color: var(--muted); }
+button.danger { color: var(--bad); }
+main { display: grid; grid-template-columns: 240px 1fr; min-height: 0; }
+nav { border-right: 1px solid var(--line); overflow: auto; padding: 8px 0; background: var(--panel); }
+nav h3 { margin: 12px 16px 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 600; }
+nav a { display: flex; justify-content: space-between; padding: 4px 16px; color: inherit; text-decoration: none; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+nav a:hover { background: var(--bg); }
+nav a.sel { background: var(--sel); font-weight: 600; }
+nav .empty { padding: 2px 16px; color: var(--muted); font-size: 12px; }
+#detail { overflow: auto; padding: 16px 20px; min-width: 0; }
+#detail h2 { margin: 0 0 4px; font-size: 16px; }
+.sub { color: var(--muted); margin-bottom: 12px; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-weight: 600; color: var(--muted); font-size: 12px; position: sticky; top: 0; background: var(--bg); }
+td.v { font-family: ui-monospace, Menlo, monospace; font-size: 12px; max-width: 420px; overflow-wrap: anywhere; }
+section#log { border-top: 1px solid var(--line); display: grid; grid-template-rows: 36px 1fr; min-height: 0; background: var(--panel); }
+.logbar { display: flex; align-items: center; gap: 12px; padding: 0 16px; border-bottom: 1px solid var(--line); }
+.logbar input[type=search] { font: inherit; padding: 3px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); width: 220px; }
+#logwrap { overflow: auto; padding: 0 16px; }
+#logwrap td { padding: 2px 12px 2px 0; font-family: ui-monospace, Menlo, monospace; font-size: 12px; white-space: nowrap; }
+.svc { font-weight: 600; }
+.svc.dynamodb { color: var(--ddb); } .svc.s3 { color: var(--s3); } .svc.sqs { color: var(--sqs); } .svc.admin { color: var(--admin); }
+.st2 { color: var(--ok); } .st4 { color: var(--warn); } .st5 { color: var(--bad); }
+.hint { color: var(--muted); padding: 40px 0; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <b>rocalcloud</b>
+  <span><span id="dot" class="dot"></span><span id="conn" class="muted">연결 중</span></span>
+  <span class="muted" id="counter">요청 0</span>
+  <span class="spacer"></span>
+  <button id="refresh">새로고침</button>
+  <button id="reset" class="danger">전체 초기화</button>
+</header>
+<main>
+  <nav id="nav"></nav>
+  <div id="detail"><div class="hint">왼쪽에서 리소스를 고르세요.</div></div>
+</main>
+<section id="log">
+  <div class="logbar">
+    <b>실시간 요청</b>
+    <input id="filter" type="search" placeholder="필터 (서비스, 작업, 상태)">
+    <label><input id="pause" type="checkbox"> 일시정지</label>
+    <span class="spacer"></span>
+    <button id="clear">지우기</button>
+  </div>
+  <div id="logwrap"><table><thead><tr><th>시각</th><th>서비스</th><th>작업</th><th>상태</th><th>ms</th><th>요청 ID</th></tr></thead><tbody id="logbody"></tbody></table></div>
+</section>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+let state = {dynamodb: [], s3: [], sqs: []}, sel = null, count = 0;
+const events = [];
+const MAX_LOG = 500;
+
+// DynamoDB attribute value → short display text.
+function av(v) {
+  if (!v || typeof v !== "object") return "";
+  const [t, x] = Object.entries(v)[0] || [];
+  if (t === "S" || t === "N" || t === "B") return x;
+  if (t === "BOOL") return String(x);
+  if (t === "NULL") return "null";
+  return t + " " + JSON.stringify(x);
+}
+
+function renderNav() {
+  const sec = (svc, title, list) => `<h3>${title}</h3>` + (list.length
+    ? list.map(r => `<a data-svc="${svc}" data-name="${esc(r.name)}" class="${sel && sel.svc === svc && sel.name === r.name ? "sel" : ""}">
+        <span>${esc(r.name)}</span><span class="muted">${r.count}</span></a>`).join("")
+    : `<div class="empty">없음</div>`);
+  $("nav").innerHTML = sec("dynamodb", "DynamoDB 테이블", state.dynamodb) + sec("s3", "S3 버킷", state.s3) + sec("sqs", "SQS 큐", state.sqs);
+}
+
+function table(cols, rows) {
+  if (!rows.length) return `<div class="hint">비어 있습니다.</div>`;
+  return `<table><thead><tr>${cols.map(c => `<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>` +
+    rows.map(r => `<tr>${r.map(v => `<td class="v">${esc(v)}</td>`).join("")}</tr>`).join("") + `</tbody></table>`;
+}
+
+function renderDetail() {
+  const r = sel && (state[sel.svc] || []).find(x => x.name === sel.name);
+  if (!r) { $("detail").innerHTML = `<div class="hint">왼쪽에서 리소스를 고르세요.</div>`; return; }
+  const more = r.count > 100 ? ` · 앞의 100개만 표시` : "";
+  let body;
+  if (sel.svc === "dynamodb") {
+    const cols = [...r.keys];
+    r.items.forEach(i => Object.keys(i).forEach(k => cols.includes(k) || cols.push(k)));
+    body = `<div class="sub">키: ${esc(r.keys.join(", "))} · 항목 ${r.count}개${more}</div>` + table(cols, r.items.map(i => cols.map(c => av(i[c]))));
+  } else if (sel.svc === "s3") {
+    body = `<div class="sub">객체 ${r.count}개${more}</div>` + table(["키", "크기", "타입", "수정 시각"], r.objects.map(o => [o.key, o.size, o.type, o.modified]));
+  } else {
+    body = `<div class="sub">메시지 ${r.count}개${more} · 엿보기만 하며 수신 횟수는 바뀌지 않습니다</div>` + table(["ID", "본문", "상태", "수신 횟수"], r.messages.map(m => [m.id, m.body, m.state, m.receives]));
+  }
+  $("detail").innerHTML = `<h2>${esc(r.name)}</h2>` + body;
+}
+
+async function load() {
+  try { state = await (await fetch("/_admin/state")).json(); } catch { return; }
+  renderNav(); renderDetail();
+}
+let pending = null;
+const loadSoon = () => { if (!pending) pending = setTimeout(() => { pending = null; load(); }, 300); };
+
+const clock = ts => { const d = new Date(ts); return isNaN(d) ? "" : d.toTimeString().slice(0, 8) + "." + String(d.getMilliseconds()).padStart(3, "0"); };
+
+function renderLog() {
+  const f = $("filter").value.trim().toLowerCase();
+  const rows = events.filter(e => !f || `${e.service} ${e.op} ${e.status}`.toLowerCase().includes(f));
+  $("logbody").innerHTML = rows.map(e => `<tr><td>${esc(clock(e.ts))}</td><td class="svc ${esc(e.service)}">${esc(e.service)}</td>
+    <td>${esc(e.op)}</td><td class="st${String(e.status)[0]}">${esc(e.status)}</td><td>${e.ms != null ? e.ms.toFixed(1) : ""}</td>
+    <td class="muted">${esc(e.request_id || "")}</td></tr>`).join("");
+}
+
+const es = new EventSource("/_events");
+es.onopen = () => { $("dot").className = "dot on"; $("conn").textContent = "연결됨"; load(); };
+es.onerror = () => { $("dot").className = "dot"; $("conn").textContent = "연결 끊김, 재시도 중"; };
+es.onmessage = m => {
+  const e = JSON.parse(m.data);
+  $("counter").textContent = `요청 ${++count}`;
+  loadSoon();
+  if ($("pause").checked) return;
+  events.unshift(e); if (events.length > MAX_LOG) events.pop();
+  renderLog();
+};
+
+$("nav").onclick = ev => { const a = ev.target.closest("a"); if (!a) return; sel = {svc: a.dataset.svc, name: a.dataset.name}; renderNav(); renderDetail(); };
+$("filter").oninput = renderLog;
+$("clear").onclick = () => { events.length = 0; renderLog(); };
+$("refresh").onclick = load;
+$("reset").onclick = async () => {
+  if (!confirm("모든 테이블, 버킷, 큐를 지웁니다. 계속할까요?")) return;
+  await fetch("/_admin/reset", {method: "POST", headers: {"x-rocalcloud": "1"}});
+  sel = null; load();
+};
+load();
+</script>
+</body>
+</html>

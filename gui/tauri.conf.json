@@ -1,0 +1,12 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "rocalcloud",
+  "version": "0.1.0",
+  "identifier": "dev.rocalcloud.gui",
+  "build": {},
+  "app": {
+    "windows": [{ "title": "rocalcloud", "url": "http://127.0.0.1:4566/_ui", "width": 1200, "height": 800 }],
+    "security": { "csp": null }
+  },
+  "bundle": { "active": true, "icon": ["icons/icon.png"] }
+}
