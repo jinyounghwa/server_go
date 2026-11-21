@@ -1136,6 +1136,7 @@ const VERBS = {
   Forward: "트래픽 로드밸런싱", FilterLogEvents: "로그 관제 검색", Explain: "오류 AI 해설", Ask: "자연어 에이전트 질의",
   SetChaos: "장애 규칙 주입", Reset: "전체 초기화",
 };
+const POLICY_SRC = { "bucket policy": "버킷 정책", "queue policy": "큐 정책" };
 function story(e) {
   if (e.service === "inspector") {
     if (e.op === "RunStarted") return `검사관 순찰 개시 (${e.total || 0}건)`;
@@ -1145,7 +1146,8 @@ function story(e) {
   }
   const verb = VERBS[e.op] || e.op;
   const tgt = e.target ? ` (${String(e.target).replace(/^arn:aws:[^:]+:[^:]*:\d*:/, "").slice(0, 32)})` : "";
-  return `${(byService[e.service] || {name: e.service}).name}: ${verb}${tgt}`;
+  const by = e.auth && e.auth.decision !== "allowed" && POLICY_SRC[e.auth.source] ? ` · 📜 ${POLICY_SRC[e.auth.source]} 거부` : "";
+  return `${(byService[e.service] || {name: e.service}).name}: ${verb}${tgt}${by}`;
 }
 function outcome(e) {
   if (e.service === "inspector") return e.op === "ScenarioDone" ? (e.passed ? (e.blocked ? "defend" : "ok") : "breach") : "ok";
@@ -2574,6 +2576,7 @@ const SCRIPT = [
   [{service: "inspector", op: "ScenarioDone", name: "IAM 명시적 Deny 차단", target_service: "s3", passed: true, blocked: true, status: 200}],
   [{service: "inspector", op: "ScenarioDone", name: "부분실패·메모리·퍼징 검증", target_service: "dynamodb", passed: true, blocked: false, status: 200}],
   [{service: "sqlite", op: "SnapshotLoaded", target: "sqlite snapshot #1", status: 200}],
+  [{service: "s3", op: "GetObject", target: "vault/locked.pdf", status: 403, auth: {decision: "explicitDeny", enforced: true, source: "bucket policy"}}, {service: "sqs", op: "SendMessage", target: "orders-queue", status: 403, auth: {decision: "implicitDeny", enforced: true, source: "queue policy"}}],
 ];
 function startDemo(why) {
   if (es) { es.close(); es = null; }

@@ -647,7 +647,12 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
         ev["chaos"] = json!({"rule": rule, "fault": e.as_ref().map(|e| e.code.clone())});
     }
     if let Some(d) = decision.filter(|_| principal != iam::Principal::Root) {
-        ev["auth"] = json!({"decision": d.kind, "reason": d.reason, "enforced": *ENFORCE});
+        // Which policy decided, as a fixed label (identity policy names are never exposed here).
+        let source = match d.matched.first().map(String::as_str) {
+            Some(k @ ("bucket policy" | "queue policy")) => k,
+            _ => "identity",
+        };
+        ev["auth"] = json!({"decision": d.kind, "reason": d.reason, "enforced": *ENFORCE, "source": source});
     }
     if resp.status().as_u16() >= 400 {
         let (parts, body) = resp.into_parts();
@@ -800,6 +805,10 @@ fn town_view(s: String) -> String {
         let mut ao = serde_json::Map::new();
         for k in ["decision", "enforced"] {
             if let Some(v) = a.get(k) { ao.insert(k.into(), v.clone()); }
+        }
+        // Only known labels pass, so nothing else can ride along in this field.
+        if let Some(s) = a.get("source").filter(|s| ["identity", "bucket policy", "queue policy"].iter().any(|k| *s == *k)) {
+            ao.insert("source".into(), s.clone());
         }
         if !ao.is_empty() { out.insert("auth".into(), Value::Object(ao)); }
     }
@@ -1296,6 +1305,9 @@ mod town_tests {
         assert!(!s.contains("Deny policy X"));
         assert!(!s.contains("\"rule\""));
         assert!(s.contains("CodeSent") && s.contains("explicitDeny") && s.contains("ThrottlingException"));
+        let p = super::town_view(r#"{"auth":{"decision":"explicitDeny","source":"bucket policy"}}"#.into());
+        assert!(p.contains("bucket policy"));
+        assert!(!super::town_view(r#"{"auth":{"source":"user/alice secret"}}"#.into()).contains("alice"));
         assert_eq!(super::town_view("{\"op\":\"x\"}".into()), "{\"op\":\"x\"}");
         assert_eq!(super::town_view("not-json".into()), "{}");
     }
