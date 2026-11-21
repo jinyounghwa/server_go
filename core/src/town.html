@@ -2369,6 +2369,9 @@ function resumeLive() {
 $("btn_reconnect").onclick = () => resumeLive();
 $("btn_close_tab").onclick = () => { window.close(); $("close_hint").hidden = false; };
 
+// Each failed attempt is logged by the browser as ERR_CONNECTION_REFUSED, so back off (5s → 60s) and skip hidden tabs.
+let retryDelay = 5000;
+document.addEventListener("visibilitychange", () => { if (!document.hidden && !es && !townStopped && !params.has("demo") && demoTimer) { retryDelay = 5000; live(); } });
 function live() {
   if (townStopped) return;
   stopDemo();
@@ -2376,7 +2379,7 @@ function live() {
   es = new EventSource(API + "/_events");
   let opened = false;
   es.onopen = () => {
-    opened = true; setMode("live", sameOrigin ? "실시간 연결됨" : "실시간 연결됨 · " + API);
+    opened = true; retryDelay = 5000; setMode("live", sameOrigin ? "실시간 연결됨" : "실시간 연결됨 · " + API);
     $("connect").hidden = true; $("gui").hidden = false;
   };
   es.onmessage = m => { try { handle(JSON.parse(m.data)); } catch {} };
@@ -2388,7 +2391,8 @@ function live() {
     }
     startDemo("에뮬레이터 연결 대기 중 · 메가 시티 데모");
     $("connect").hidden = sameOrigin; $("gui").hidden = true;
-    retryTimer = setTimeout(live, 5000);
+    retryTimer = setTimeout(() => { if (!document.hidden) live(); }, retryDelay);
+    retryDelay = Math.min(60000, retryDelay * 2);
   };
 }
 
