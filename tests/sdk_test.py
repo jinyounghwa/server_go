@@ -611,8 +611,27 @@ def test_lambda():
     time.sleep(0.3)
     assert sqs.get_queue_attributes(QueueUrl=q, AttributeNames=["All"])["Attributes"]["ApproximateNumberOfMessages"] == "0"
 
+    # Versions and aliases: v1 is frozen with STAGE=dev; "live" moves from v1 to $LATEST.
+    v1 = lam.publish_version(FunctionName=fn)
+    assert v1["Version"] == "1" and v1["FunctionArn"].endswith(":1")
+    assert lam.publish_version(FunctionName=fn)["Version"] == "1"  # nothing changed: same version
+    lam.create_alias(FunctionName=fn, Name="live", FunctionVersion="1")
+    assert code(lam.create_alias, FunctionName=fn, Name="live", FunctionVersion="1") == "ResourceConflictException"
+    assert code(lam.create_alias, FunctionName=fn, Name="old", FunctionVersion="9") == "ResourceNotFoundException"
     lam.update_function_configuration(FunctionName=fn, Environment={"Variables": {"STAGE": "prod", "BUCKET": b}})
     assert json.loads(lam.invoke(FunctionName=fn, Payload="{}")["Payload"].read())["stage"] == "prod"
+    r = lam.invoke(FunctionName=fn, Qualifier="live", Payload="{}")
+    assert json.loads(r["Payload"].read())["stage"] == "dev" and r["ExecutedVersion"] == "1"
+    assert json.loads(lam.invoke(FunctionName=f"{fn}:1", Payload="{}")["Payload"].read())["stage"] == "dev"
+    assert code(lam.invoke, FunctionName=fn, Qualifier="nope") == "ResourceNotFoundException"
+    assert [v["Version"] for v in lam.list_versions_by_function(FunctionName=fn)["Versions"]] == ["$LATEST", "1"]
+    assert lam.get_function_configuration(FunctionName=fn, Qualifier="live")["Environment"]["Variables"]["STAGE"] == "dev"
+    lam.update_alias(FunctionName=fn, Name="live", FunctionVersion="$LATEST")
+    assert lam.get_alias(FunctionName=fn, Name="live")["FunctionVersion"] == "$LATEST"
+    assert json.loads(lam.invoke(FunctionName=fn, Qualifier="live", Payload="{}")["Payload"].read())["stage"] == "prod"
+    assert [a["Name"] for a in lam.list_aliases(FunctionName=fn)["Aliases"]] == ["live"]
+    lam.delete_alias(FunctionName=fn, Name="live")
+    assert code(lam.get_alias, FunctionName=fn, Name="live") == "ResourceNotFoundException"
     assert {fn, fn + "-node"} <= {f["FunctionName"] for f in lam.list_functions()["Functions"]}
     lam.delete_event_source_mapping(UUID=m); lam.delete_event_source_mapping(UUID=km["UUID"]); kin.delete_stream(StreamName=f"clicks{run}")
     for f in (fn, fn + "-boom", fn + "-slow", fn + "-node"):

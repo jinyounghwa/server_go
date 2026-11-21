@@ -709,7 +709,7 @@ fn send_to_target(app: &Arc<App>, rid: &str, arn: &str, payload: Value, from: &s
         return;
     }
     if arn.starts_with("arn:aws:lambda:") {
-        let (app, name, from) = (app.clone(), lambda::name_of(arn), from.to_string());
+        let (app, name, from) = (app.clone(), arn.to_string(), from.to_string()); // keeps a :version / :alias qualifier
         tokio::spawn(async move { lambda::invoke_logged(&app, &name, payload, &from).await });
     } else if arn.starts_with("arn:aws:sns:") {
         let subject = if from == "s3" { "Amazon S3 Notification" } else { "" };

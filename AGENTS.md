@@ -121,7 +121,7 @@ SQS 메시지 속성, Step Functions 동시 실행·실패 중단, ALB 경로·�
 2. ~~EventBridge `cron()`(UTC, L·W·#은 거부)·InputTransformer·InputPath `[0]`~~ 완료(2026-11-22).
 3. ~~Kinesis → Lambda 이벤트 소스 매핑~~ 완료(2026-11-22, `lambda.rs` `poll_kinesis`: 샤드별 순서, 실패 배치는 재시도하며 샤드를 막고 `MaximumRetryAttempts` 뒤 건너뜀).
 4. ~~DynamoDB 경로 `a.b[0]`~~ 완료(2026-11-22): 업데이트(SET 끝 너머는 추가, REMOVE는 원래 인덱스 기준)·조건·프로젝션(중첩 경로 유지).
-5. **Lambda 버전·별칭**(`lambda.rs`): PublishVersion·CreateAlias와 `:alias` 호출.
+5. ~~Lambda 버전·별칭~~ 완료(2026-11-22): PublishVersion(설정·코드 고정, 변화 없으면 같은 버전)·ListVersions·Create/Get/List/Update/DeleteAlias, `fn:1`·`fn:alias`·`Qualifier` 호출과 Get*. 가중치 라우팅은 거부.
 6. **IAM 조건 연산자**(`iam.rs` 116행): Numeric*·Date*·IpAddress, ForAnyValue/ForAllValues.
 7. (선택) 배달 정책을 AWS처럼 엄격하게: 대상에 정책이 없으면 거부(`iam.rs` `service_may`). 기존 사용자 흐름이 깨지므로 설정 스위치로만.
 8. (선택) `?api=`로 IPv6 `[::1]`: CSP가 IPv6 리터럴을 못 받으므로 요청이 있을 때만.

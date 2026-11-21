@@ -1,5 +1,6 @@
 // Lambda (REST-JSON). Functions run as local processes (python3 / node) per invocation.
-// ponytail: no warm containers, layers, versions/aliases, or container images; the host interpreter is used
+// Versions (PublishVersion snapshots config + code) and aliases resolve "fn:qualifier" / ?Qualifier= on Invoke and Get*.
+// ponytail: no warm containers, layers, weighted alias routing, or container images; the host interpreter is used
 // regardless of the runtime's minor version. Add a container runner when isolation matters.
 use crate::{b64, err, now_ms, unb64, ApiErr, App, ACCOUNT, REGION};
 use axum::{body::Body, http::HeaderMap, response::Response};
@@ -31,6 +32,9 @@ pub struct Func {
     sha: String,
     modified: String,
     perms: Vec<Value>, // resource-based policy statements from AddPermission
+    version: String,   // "$LATEST" or the published number
+    versions: Vec<Func>, // published snapshots; version n is versions[n - 1]
+    aliases: BTreeMap<String, (String, String)>, // alias -> (version, description)
 }
 pub struct Mapping {
     source: String,
@@ -56,6 +60,15 @@ pub fn name_of(id: &str) -> String {
     let id = id.split_once("function:").map_or(id, |(_, rest)| rest);
     id.split(':').next().unwrap_or(id).to_string()
 }
+fn alias_json(n: &str, a: &str, (ver, desc): &(String, String)) -> Value {
+    json!({"AliasArn": format!("{}:{a}", arn(n)), "Name": a, "FunctionVersion": ver, "Description": desc, "RevisionId": format!("{n}-{a}-{ver}")})
+}
+// "name", "name:qualifier", ARN, or ARN:qualifier → (name, qualifier).
+pub fn split_qualifier(id: &str) -> (String, Option<String>) {
+    let rest = id.split_once("function:").map_or(id, |(_, r)| r);
+    let mut it = rest.splitn(2, ':');
+    (it.next().unwrap_or("").to_string(), it.next().map(String::from))
+}
 fn not_found(n: &str) -> ApiErr {
     ApiErr { status: 404, ..err("ResourceNotFoundException", format!("Function not found: {}", arn(n))) }
 }
@@ -63,7 +76,7 @@ fn not_found(n: &str) -> ApiErr {
 fn config(n: &str, f: &Func) -> Value {
     json!({"FunctionName": n, "FunctionArn": f.arn, "Runtime": f.runtime, "Role": f.role, "Handler": f.handler,
         "CodeSize": f.size, "CodeSha256": f.sha, "Description": f.description, "Timeout": f.timeout, "MemorySize": f.memory,
-        "LastModified": f.modified, "Version": "$LATEST", "PackageType": "Zip", "State": "Active", "LastUpdateStatus": "Successful",
+        "LastModified": f.modified, "Version": f.version, "PackageType": "Zip", "State": "Active", "LastUpdateStatus": "Successful",
         "Environment": {"Variables": f.env}, "Architectures": ["x86_64"], "TracingConfig": {"Mode": "PassThrough"}})
 }
 
@@ -101,6 +114,7 @@ pub struct Invocation {
     pub payload: Value,
     pub error: Option<String>, // "Unhandled" when the handler threw or timed out
     pub log_tail: String,
+    pub version: String,
 }
 
 const PY_BOOT: &str = r#"
@@ -156,8 +170,10 @@ const done = out => fs.writeFileSync(process.env._RC_RESULT, JSON.stringify(out)
 "#;
 
 // Run one invocation: spawn the runtime, feed the event, collect result and logs (also written to CloudWatch Logs).
-pub async fn invoke(app: &Arc<App>, name: &str, event: Value) -> Result<Invocation, ApiErr> {
-    let f = app.lambda.lock().unwrap().f.get(name).cloned().ok_or_else(|| not_found(name))?;
+pub async fn invoke(app: &Arc<App>, id: &str, event: Value) -> Result<Invocation, ApiErr> {
+    let (name, qual) = split_qualifier(id);
+    let name = name.as_str();
+    let f = app.lambda.lock().unwrap().resolve(name, qual.as_deref())?;
     let (exe, boot) = if f.runtime.starts_with("python") {
         (std::env::var("RC_PYTHON").unwrap_or("python3".into()), PY_BOOT)
     } else if f.runtime.starts_with("nodejs") {
@@ -179,7 +195,7 @@ pub async fn invoke(app: &Arc<App>, name: &str, event: Value) -> Result<Invocati
         .env("_HANDLER", &f.handler).env("_RC_TIMEOUT", f.timeout.to_string()).env("_RC_ARN", &f.arn)
         .env("_RC_REQUEST_ID", &rid).env("_RC_RESULT", &result)
         .env("AWS_LAMBDA_FUNCTION_NAME", name).env("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", f.memory.to_string())
-        .env("AWS_LAMBDA_FUNCTION_VERSION", "$LATEST").env("AWS_LAMBDA_LOG_GROUP_NAME", format!("/aws/lambda/{name}"))
+        .env("AWS_LAMBDA_FUNCTION_VERSION", &f.version).env("AWS_LAMBDA_LOG_GROUP_NAME", format!("/aws/lambda/{name}"))
         .env("AWS_REGION", REGION.as_str()).env("AWS_DEFAULT_REGION", REGION.as_str())
         .env("AWS_ENDPOINT_URL", crate::endpoint()).env("AWS_ACCESS_KEY_ID", akid).env("AWS_SECRET_ACCESS_KEY", secret)
         .env("AWS_SESSION_TOKEN", token).env("PYTHONUNBUFFERED", "1")
@@ -207,18 +223,18 @@ pub async fn invoke(app: &Arc<App>, name: &str, event: Value) -> Result<Invocati
     if outcome["ok"] != true {
         log += &format!("{}\n", outcome["error"]["errorMessage"].as_str().unwrap_or(""));
     }
-    let lines = std::iter::once(format!("START RequestId: {rid} Version: $LATEST"))
+    let lines = std::iter::once(format!("START RequestId: {rid} Version: {}", f.version))
         .chain(log.lines().map(String::from))
         .chain([format!("END RequestId: {rid}"),
                 format!("REPORT RequestId: {rid}\tDuration: {ms:.2} ms\tBilled Duration: {} ms\tMemory Size: {} MB", ms.ceil() as u64, f.memory)]);
     let now = now_ms();
-    let stream = format!("{}/[$LATEST]{}", chrono::Utc::now().format("%Y/%m/%d"), &rid[..8]);
+    let stream = format!("{}/[{}]{}", chrono::Utc::now().format("%Y/%m/%d"), f.version, &rid[..8]);
     let entries: Vec<(i64, String)> = lines.map(|l| (now, l)).collect();
     let tail = entries.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
     app.logs.lock().unwrap().put(&format!("/aws/lambda/{name}"), &stream, entries);
     Ok(match outcome["ok"].as_bool() {
-        Some(true) => Invocation { payload: outcome["result"].clone(), error: None, log_tail: tail },
-        _ => Invocation { payload: outcome["error"].clone(), error: Some("Unhandled".into()), log_tail: tail },
+        Some(true) => Invocation { payload: outcome["result"].clone(), error: None, log_tail: tail, version: f.version.clone() },
+        _ => Invocation { payload: outcome["error"].clone(), error: Some("Unhandled".into()), log_tail: tail, version: f.version.clone() },
     })
 }
 
@@ -243,6 +259,13 @@ pub fn op_of(method: &str, path: &str) -> &'static str {
         ("PUT", ["functions", _, "code"]) => "UpdateFunctionCode",
         ("POST", ["functions", _, "invocations"]) => "Invoke",
         ("POST", ["functions", _, "policy"]) => "AddPermission",
+        ("POST", ["functions", _, "versions"]) => "PublishVersion",
+        ("GET", ["functions", _, "versions"]) => "ListVersionsByFunction",
+        ("POST", ["functions", _, "aliases"]) => "CreateAlias",
+        ("GET", ["functions", _, "aliases"]) => "ListAliases",
+        ("GET", ["functions", _, "aliases", _]) => "GetAlias",
+        ("PUT", ["functions", _, "aliases", _]) => "UpdateAlias",
+        ("DELETE", ["functions", _, "aliases", _]) => "DeleteAlias",
         ("GET", ["functions", _, "policy"]) => "GetPolicy",
         ("DELETE", ["functions", _, "policy", _]) => "RemovePermission",
         ("POST", ["event-source-mappings"]) => "CreateEventSourceMapping",
@@ -254,6 +277,20 @@ pub fn op_of(method: &str, path: &str) -> &'static str {
 }
 // Function resource policy, consulted by the authorizer.
 impl Lambda {
+    // The function a qualifier selects: $LATEST (none), a version number, or an alias.
+    fn resolve(&self, name: &str, qual: Option<&str>) -> Result<Func, ApiErr> {
+        let f = self.f.get(name).ok_or_else(|| not_found(name))?;
+        let missing = |q: &str| ApiErr { status: 404, ..err("ResourceNotFoundException", format!("Function not found: {}:{q}", arn(name))) };
+        let q = match qual {
+            None | Some("$LATEST") => return Ok(f.clone()),
+            Some(q) => q,
+        };
+        let ver = if q.bytes().all(|b| b.is_ascii_digit()) { q.to_string() } else { f.aliases.get(q).ok_or_else(|| missing(q))?.0.clone() };
+        if ver == "$LATEST" {
+            return Ok(f.clone());
+        }
+        ver.parse::<usize>().ok().and_then(|n| f.versions.get(n.wrapping_sub(1))).cloned().ok_or_else(|| missing(q))
+    }
     pub fn policy(&self, name: &str) -> Option<Value> {
         let f = self.f.get(name)?;
         (!f.perms.is_empty()).then(|| json!({"Statement": f.perms}))
@@ -268,25 +305,29 @@ pub fn path_name(path: &str) -> Option<String> {
 pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::HashMap<String, String>, h: &HeaderMap, body: &[u8]) -> Response {
     let j: Value = serde_json::from_slice(body).unwrap_or(json!({}));
     let name = path_name(path).unwrap_or_default();
+    let parts: Vec<String> = path.trim_matches('/').split('/').map(crate::s3::pct_decode).collect();
+    let seg = |i: usize| parts.get(i).cloned().unwrap_or_default();
+    let qual = q.get("Qualifier").cloned().or_else(|| split_qualifier(&seg(1)).1);
     if op == "Invoke" {
         let event: Value = if body.is_empty() { json!({}) } else { serde_json::from_slice(body).unwrap_or(Value::String(String::from_utf8_lossy(body).into())) };
         let kind = h.get("x-amz-invocation-type").and_then(|v| v.to_str().ok()).unwrap_or("RequestResponse");
-        if !app.lambda.lock().unwrap().f.contains_key(&name) {
-            return error_reply(not_found(&name));
+        if let Err(e) = app.lambda.lock().unwrap().resolve(&name, qual.as_deref()) {
+            return error_reply(e);
         }
         match kind {
             "DryRun" => return Response::builder().status(204).body(Body::empty()).unwrap(),
             "Event" => {
-                let (app, name) = (app.clone(), name.clone());
+                let (app, name) = (app.clone(), qual.as_ref().map_or(name.clone(), |q| format!("{name}:{q}")));
                 tokio::spawn(async move { invoke_logged(&app, &name, event, "async").await });
                 return Response::builder().status(202).body(Body::empty()).unwrap();
             }
             _ => {}
         }
-        return match invoke(app, &name, event).await {
+        let target = qual.as_ref().map_or(name.clone(), |q| format!("{name}:{q}"));
+        return match invoke(app, &target, event).await {
             Err(e) => error_reply(e),
             Ok(inv) => {
-                let mut r = Response::builder().status(200).header("content-type", "application/json").header("x-amz-executed-version", "$LATEST");
+                let mut r = Response::builder().status(200).header("content-type", "application/json").header("x-amz-executed-version", &inv.version);
                 if let Some(e) = &inv.error {
                     r = r.header("x-amz-function-error", e);
                 }
@@ -313,6 +354,7 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
                     timeout: j["Timeout"].as_u64().unwrap_or(3), memory: j["MemorySize"].as_u64().unwrap_or(128),
                     env: j["Environment"]["Variables"].as_object().cloned().unwrap_or_default(),
                     description: j["Description"].as_str().unwrap_or("").into(), dir, size, sha, modified: modified_now(), perms: vec![],
+                    version: "$LATEST".into(), versions: vec![], aliases: BTreeMap::new(),
                 };
                 let out = config(&n, &f);
                 st.f.insert(n, f);
@@ -320,10 +362,67 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
             }
             "ListFunctions" => (200, json!({"Functions": st.f.iter().map(|(n, f)| config(n, f)).collect::<Vec<_>>()})),
             "GetFunction" => {
-                let f = st.f.get(&name).ok_or_else(|| not_found(&name))?;
-                (200, json!({"Configuration": config(&name, f), "Code": {"RepositoryType": "S3", "Location": format!("file://{}", f.dir.display())}}))
+                let f = st.resolve(&name, qual.as_deref())?;
+                (200, json!({"Configuration": config(&name, &f), "Code": {"RepositoryType": "S3", "Location": format!("file://{}", f.dir.display())}}))
             }
-            "GetFunctionConfiguration" => (200, config(&name, st.f.get(&name).ok_or_else(|| not_found(&name))?)),
+            "GetFunctionConfiguration" => (200, config(&name, &st.resolve(&name, qual.as_deref())?)),
+            "PublishVersion" => {
+                let f = st.f.get_mut(&name).ok_or_else(|| not_found(&name))?;
+                // Like AWS, publishing unchanged code + config again returns the last version.
+                if let Some(last) = f.versions.last().filter(|v| v.sha == f.sha && v.modified == f.modified) {
+                    return Ok((201, config(&name, last)));
+                }
+                let n = (f.versions.len() + 1).to_string();
+                let mut v = Func { versions: vec![], aliases: BTreeMap::new(), perms: vec![], version: n.clone(), arn: format!("{}:{n}", arn(&name)), ..f.clone() };
+                if let Some(d) = j["Description"].as_str() {
+                    v.description = d.into();
+                }
+                let out = config(&name, &v);
+                f.versions.push(v);
+                (201, out)
+            }
+            "ListVersionsByFunction" => {
+                let f = st.f.get(&name).ok_or_else(|| not_found(&name))?;
+                (200, json!({"Versions": std::iter::once(config(&name, f)).chain(f.versions.iter().map(|v| config(&name, v))).collect::<Vec<_>>()}))
+            }
+            "CreateAlias" | "UpdateAlias" => {
+                let f = st.f.get_mut(&name).ok_or_else(|| not_found(&name))?;
+                let a = if op == "CreateAlias" { crate::need(&j, "Name")?.to_string() } else { seg(3) };
+                if a.is_empty() || a.bytes().all(|b| b.is_ascii_digit()) || a == "$LATEST" || !a.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+                    return Err(err("ValidationException", format!("Alias name {a} is not valid (letters, digits, - and _, not only digits)")));
+                }
+                let cur = f.aliases.get(&a).cloned();
+                match (op, &cur) {
+                    ("CreateAlias", Some(_)) => return Err(ApiErr { status: 409, ..err("ResourceConflictException", format!("Alias already exists: {}:{a}", arn(&name))) }),
+                    ("UpdateAlias", None) => return Err(ApiErr { status: 404, ..err("ResourceNotFoundException", format!("Alias not found: {}:{a}", arn(&name))) }),
+                    _ => {}
+                }
+                let ver = j["FunctionVersion"].as_str().map(String::from).or(cur.as_ref().map(|c| c.0.clone())).ok_or_else(|| err("ValidationException", "FunctionVersion is required"))?;
+                if ver != "$LATEST" && !ver.parse::<usize>().is_ok_and(|n| n >= 1 && n <= f.versions.len()) {
+                    return Err(ApiErr { status: 404, ..err("ResourceNotFoundException", format!("Function not found: {}:{ver}", arn(&name))) });
+                }
+                if !j["RoutingConfig"].is_null() {
+                    return Err(err("InvalidParameterValueException", "Weighted alias routing (RoutingConfig) is not supported locally"));
+                }
+                let desc = j["Description"].as_str().map(String::from).or(cur.map(|c| c.1)).unwrap_or_default();
+                f.aliases.insert(a.clone(), (ver, desc));
+                (if op == "CreateAlias" { 201 } else { 200 }, alias_json(&name, &a, &f.aliases[&a]))
+            }
+            "ListAliases" => {
+                let f = st.f.get(&name).ok_or_else(|| not_found(&name))?;
+                (200, json!({"Aliases": f.aliases.iter().map(|(a, v)| alias_json(&name, a, v)).collect::<Vec<_>>()}))
+            }
+            "GetAlias" | "DeleteAlias" => {
+                let f = st.f.get_mut(&name).ok_or_else(|| not_found(&name))?;
+                let a = seg(3);
+                let nf = || ApiErr { status: 404, ..err("ResourceNotFoundException", format!("Alias not found: {}:{a}", arn(&name))) };
+                if op == "GetAlias" {
+                    (200, alias_json(&name, &a, f.aliases.get(&a).ok_or_else(nf)?))
+                } else {
+                    f.aliases.remove(&a).ok_or_else(nf)?;
+                    (204, Value::Null)
+                }
+            }
             "DeleteFunction" => {
                 st.f.remove(&name).ok_or_else(|| not_found(&name))?;
                 st.maps.retain(|_, m| m.function != name);
