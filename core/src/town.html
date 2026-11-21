@@ -634,7 +634,7 @@ const B = [
   {id: "ssm",      name: "SSM 설정통제실",    sub: "Parameter Store",      district: "보안 지구",   kind: "console",   color: 0x059669, hex: "#6ee7b7", svc: ["ssm"],            x: -11, z: 29,  roadZ: 20},
 
   // --- SE: Infra, Net, Harbor & Agents (z = 10 & 29) ---
-  {id: "alb",      name: "ALB 로드밸런서",    sub: "L4 Listener · Health", district: "인프라 지구", kind: "splitter",  color: 0x0ea5e9, hex: "#38bdf8", svc: ["elbv2"],          x: 11,  z: 10,  roadZ: 0},
+  {id: "alb",      name: "ALB 로드밸런서",    sub: "경로·호스트 규칙 · Health", district: "인프라 지구", kind: "splitter",  color: 0x0ea5e9, hex: "#38bdf8", svc: ["elbv2"],          x: 11,  z: 10,  roadZ: 0},
   {id: "vpc",      name: "VPC 관제탑",        sub: "Subnets · SG · Reach", district: "인프라 지구", kind: "radar",     color: 0x4d7c0f, hex: "#a3e635", svc: ["ec2"],            x: 20,  z: 10,  roadZ: 0},
   {id: "logs",     name: "CloudWatch 로그탑", sub: "Log Groups · Filter",  district: "인프라 지구", kind: "logtower",  color: 0x65a30d, hex: "#bef264", svc: ["logs"],           x: 33,  z: 10,  roadZ: 0},
   {id: "cfn",      name: "CloudFormation 현장", sub: "IaC Stacks · Rollback", district: "인프라 지구", kind: "crane",   color: 0xca8a04, hex: "#facc15", svc: ["cloudformation"], x: 43,  z: 10,  roadZ: 0},

@@ -1027,6 +1027,50 @@ def test_ecs_alb():
     assert "rocalcloud-ecs" not in left, left
 
 
+def test_alb_rules():
+    """Listener rules route by path and Host to different target groups (real local HTTP servers as targets)."""
+    import http.server, socket, threading, urllib.request
+    def server(tag):
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                b = tag.encode(); self.send_response(200); self.send_header("content-length", str(len(b))); self.end_headers(); self.wfile.write(b)
+            def log_message(self, *a): pass
+        s = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+        return s
+    api_srv, web_srv = server("api"), server("web")
+    elb = boto3.client("elbv2", **kw)
+    lb = elb.create_load_balancer(Name=f"rules{run}")["LoadBalancers"][0]["LoadBalancerArn"]
+    tg = {}
+    for name, srv in (("api", api_srv), ("web", web_srv)):
+        tg[name] = elb.create_target_group(Name=f"{name}{run}", Protocol="HTTP", Port=srv.server_port, VpcId="vpc-local", TargetType="ip")["TargetGroups"][0]["TargetGroupArn"]
+        elb.register_targets(TargetGroupArn=tg[name], Targets=[{"Id": "127.0.0.1", "Port": srv.server_port}])
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]
+    ln = elb.create_listener(LoadBalancerArn=lb, Protocol="HTTP", Port=port, DefaultActions=[{"Type": "forward", "TargetGroupArn": tg["web"]}])["Listeners"][0]["ListenerArn"]
+    elb.create_rule(ListenerArn=ln, Priority=10, Conditions=[{"Field": "path-pattern", "Values": ["/api/*"]}], Actions=[{"Type": "forward", "TargetGroupArn": tg["api"]}])
+    elb.create_rule(ListenerArn=ln, Priority=20, Conditions=[{"Field": "host-header", "HostHeaderConfig": {"Values": ["admin.*"]}}],
+                    Actions=[{"Type": "fixed-response", "FixedResponseConfig": {"StatusCode": "403", "MessageBody": "no admin"}}])
+    assert code(elb.create_rule, ListenerArn=ln, Priority=10, Conditions=[{"Field": "path-pattern", "Values": ["/x"]}],
+                Actions=[{"Type": "forward", "TargetGroupArn": tg["api"]}]) == "PriorityInUse"
+    rules = elb.describe_rules(ListenerArn=ln)["Rules"]
+    assert [r["Priority"] for r in rules] == ["10", "20", "default"] and rules[-1]["IsDefault"], rules
+    get = lambda path, host=None: urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers={"Host": host} if host else {}), timeout=5).read()
+    assert get("/api/orders?x=1") == b"api" and get("/") == b"web" and get("/apix") == b"web"
+    try:
+        get("/", host="admin.local"); raise AssertionError("fixed 403 expected")
+    except urllib.error.HTTPError as e:
+        assert e.code == 403 and e.read() == b"no admin"
+    assert code(elb.delete_target_group, TargetGroupArn=tg["api"]) == "ResourceInUse"  # used by a rule
+    for r in rules[:-1]:
+        elb.delete_rule(RuleArn=r["RuleArn"])
+    assert get("/api/orders") == b"web"
+    elb.delete_listener(ListenerArn=ln); elb.delete_load_balancer(LoadBalancerArn=lb)
+    for a in tg.values():
+        elb.delete_target_group(TargetGroupArn=a)
+    api_srv.shutdown(); web_srv.shutdown()
+
+
 def test_route53():
     import dns.resolver, dns.rcode
     r53 = boto3.client("route53", **kw)

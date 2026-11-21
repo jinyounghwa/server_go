@@ -97,7 +97,7 @@ Status as of **2026-11-21**: `[x]` completed, `[~]` partially implemented or int
 - [x] RDS (real Postgres / MySQL / MariaDB Docker containers bound to `127.0.0.1`)
 - [x] ECS / EC2 (ECS tasks run as real Docker containers with ALB registration & `awslogs`; EC2 instances tracked as metadata records)
 - [x] ElastiCache (real Redis / Valkey / Memcached Docker containers)
-- [x] ELB v2 / ALB (real local TCP listeners on `127.0.0.1:{Port}` with round-robin forwarding and target health)
+- [x] ELB v2 / ALB (real local TCP listeners on `127.0.0.1:{Port}` with round-robin forwarding, target health and path/host listener rules)
 - [x] Route 53 (hosted zones, record sets, built-in local UDP DNS server on `127.0.0.1:10053`)
 
 ### 5. Cross-Service Integrations & Chaos Engineering

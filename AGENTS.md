@@ -117,7 +117,7 @@ Step Functions Parallel·Map 동시 실행, 이벤트 `auth.source`와 마을 �
    최신은 upload v7·download v8·gh-release v3. 태그로만 돌아 미리 검증할 수 없으니 다음 릴리스 때 올리고 결과를 확인한다.
 2. ~~SNS 토픽 정책·Lambda 함수 정책~~(완료). IAM 액션 이름도 `lambda:InvokeFunction`으로 맞췄다(전에는 `lambda:Invoke`).
 3. ~~Step Functions Parallel·Map 실패 시 나머지 중단~~(완료).
-4. **ALB 경로 규칙**(지금 L4) → **aws-chunked 조각 서명 검증**. 각각 sdk_test.py에 정상·오류 경로 테스트를 같이 넣는다.
+4. ~~ALB 경로·호스트 규칙~~(완료) → **aws-chunked 조각 서명 검증**. 각각 sdk_test.py에 정상·오류 경로 테스트를 같이 넣는다.
 5. **3D 마을 점검**: 저사양 GPU·모바일·Safari·Firefox. 연대기 섬 숫자(SDK 테스트 28/5/4개, 시나리오 21개, GPU 65°C)는
    `town.html` 12절에 손으로 적은 값이다(검사관 훈련장 기둥 수는 `RANGE_CAT` 길이를 따른다).
 6. (선택) `?api=`로 IPv6 `[::1]`: CSP가 IPv6 리터럴을 못 받으므로 요청이 있을 때만.
@@ -127,5 +127,5 @@ Step Functions Parallel·Map 동시 실행, 이벤트 `auth.source`와 마을 �
 ## 8. 알려진 한계 (요약)
 상태는 기본 인메모리(JSON 스냅샷 `RC_STATE_FILE` 또는 SQLite `RC_SQLITE_FILE`로 영속 저장 가능), SigV4 서명은 `VERIFY_SIGV4=1`일 때만 검증(SigV2 거부,
 aws-chunked 조각 서명은 미검증), 리소스 기반 정책은 S3 버킷·SQS 큐·SNS 토픽·Lambda 함수(AddPermission)를 평가하지만 서비스 주체(sns.amazonaws.com 등)의 내부 호출은 정책으로 막지 않음, KMS는 진짜 암호 아님,
-ALB는 L4 라운드로빈(경로 규칙 없음), Query 프로토콜 구버전 SQS 미지원,
+ALB 리스너 규칙(path-pattern·host-header)은 연결의 첫 요청으로만 고름(keep-alive 이후 요청은 같은 대상), Query 프로토콜 구버전 SQS 미지원,
 ECS 태스크가 에뮬레이터를 부르려면 `BIND=0.0.0.0:4566` 필요. 세부는 각 파일의 `ponytail:` 주석.
