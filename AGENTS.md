@@ -107,20 +107,20 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
   `VERIFY_SIGV4=1`이면 서명 없는 요청도 루트로 서명한다. 서명 없이 보내야 하는 검사는 `x-rc-unsigned` 헤더를 단다.
 - 새 시나리오: `sc_x()` 함수 → `run_inner()`의 `plan` 목록과 `match id`에 추가 → `make_result()`로 결과.
 
-## 7. 다음에 할 일 (2026-11-21 기준, 우선순위 순)
-계획서 4장 체크리스트는 전부 완료. 아래는 그 뒤에 남은 일이다.
+## 7. 다음에 할 일 (2026-11-21 저녁 기준, 우선순위 순)
+계획서 4장 체크리스트는 전부 완료. 2026-11-21에 끝낸 것: v0.1.1 릴리스, 우분투 전체 검증 통과, CI 액션 Node 20 탈출,
+SQS 메시지 속성·SNS raw 배달 속성 전달, S3 버킷 정책·SQS 큐 정책 평가(`iam.rs` `authorize_with`), 검사 시나리오 21개,
+Step Functions Parallel·Map 동시 실행, 이벤트 `auth.source`와 마을 📜 정책 거부 표시, GUI 정책·메시지 속성 표시.
 
-1. ~~v0.1.1 릴리스~~ 완료(2026-11-21).
-2. **우분투 전체 검증 1회.** 3D 개편과 종료 수정 뒤 `tools/ubuntu_verify.sh`를 끝까지 돌리지 않았다
-   (CI와 같은 순서의 Python 스위트 두 모드만 통과 확인). 끝나면 `pgrep rocalcloud`·`docker ps -a`가 0인지 본다.
-3. **CI 경고 정리.** Node 20 액션 폐지 경고: `actions/checkout@v5`, `actions/setup-node@v5`, `astral-sh/setup-uv` 최신으로.
-   setup-uv 캐시 경고(`uv.lock` 없음)는 `enable-cache: false` 또는 `cache-dependency-glob` 지정.
-4. **3D 마을 점검.** 저사양 GPU·모바일·Safari·Firefox 화면 확인(지금까지 맥 Chrome만 확인). 연대기 섬의 숫자
-   (SDK 테스트 28/5/4개, 시나리오 21개, GPU 65°C)는 `town.html` 12절에 손으로 적은 값이라 테스트가 늘면 같이 고친다.
-   맥에서 에뮬레이터를 띄운 `/_town` 실시간 모드는 이번 3D 개편 뒤 아직 직접 보지 않았다.
-5. **알려진 한계(8절) 중 효과 큰 순서.** ~~SQS 메시지 속성~~(완료) → ~~S3 버킷 정책~~(완료, `iam.rs` `authorize_with`) → ~~SQS 큐 정책~~(완료) →
-   ~~Step Functions Parallel·Map 동시 실행~~(완료) → ALB 경로 규칙 → aws-chunked 조각 서명 검증. 각각 sdk_test.py에 정상·오류 경로 테스트를 같이 넣는다.
-6. (선택) `?api=`로 IPv6 `[::1]`을 쓰려면 CSP `connect-src`가 IPv6 리터럴을 못 받으므로 별도 방법이 필요하다. 요청이 있을 때만.
+1. **v0.1.2 릴리스.** 위 기능들은 `main`에만 있다. `core/Cargo.toml`·`Cargo.lock` 버전 → 태그 → release.yml → Homebrew sha256.
+   release.yml은 아직 Node 20 액션(upload/download-artifact v4, action-gh-release v2)을 쓴다. 최신은 upload v7·download v8·gh-release v3이고
+   태그로만 돌아서 미리 검증할 수 없으니, 올린다면 릴리스 때 결과를 꼭 확인한다(`astral-sh/setup-uv`는 major 태그가 없어 전체 버전으로 고정).
+2. **SNS 토픽 정책·Lambda 리소스 정책**도 같은 `authorize_with`로 평가(저장 위치: SNS `Policy` 속성, Lambda `AddPermission`).
+3. **Step Functions Parallel 실패 시 나머지 가지 중단**(지금은 끝까지 실행).
+4. **ALB 경로 규칙**(지금 L4) → **aws-chunked 조각 서명 검증**. 각각 sdk_test.py에 정상·오류 경로 테스트를 같이 넣는다.
+5. **3D 마을 점검**: 저사양 GPU·모바일·Safari·Firefox. 연대기 섬 숫자(SDK 테스트 28/5/4개, 시나리오 21개, GPU 65°C)는
+   `town.html` 12절에 손으로 적은 값이다(검사관 훈련장 기둥 수는 `RANGE_CAT` 길이를 따른다).
+6. (선택) `?api=`로 IPv6 `[::1]`: CSP가 IPv6 리터럴을 못 받으므로 요청이 있을 때만.
 
 큰 변경 뒤에는 4절 방법으로 우분투 전체 검증을 돌린다.
 
