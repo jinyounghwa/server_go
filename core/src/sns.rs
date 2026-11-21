@@ -42,6 +42,17 @@ fn xml_map(m: &BTreeMap<String, String>) -> Value {
 }
 
 // ponytail: filter policies support exact strings, numbers, prefix, exists and anything-but on message attributes.
+// A topic policy must be a valid resource policy; an empty value removes it.
+fn check_policy(p: Option<&String>) -> Result<(), ApiErr> {
+    match p.filter(|p| !p.is_empty()) {
+        None => Ok(()),
+        Some(p) => serde_json::from_str::<Value>(p)
+            .map_err(|e| e.to_string())
+            .and_then(|v| crate::iam::validate_resource_policy(&v))
+            .map_err(|m| err("InvalidParameter", format!("Invalid parameter: Policy Error: {m}"))),
+    }
+}
+
 fn filter_ok(policy: &str, attrs: &Map<String, Value>) -> bool {
     let Ok(Value::Object(pol)) = serde_json::from_str::<Value>(policy) else { return true };
     pol.iter().all(|(k, rules)| {
@@ -78,6 +89,7 @@ impl Sns {
                 let n = p(q, "Name")?;
                 let arn = format!("arn:aws:sns:{}:{ACCOUNT}:{n}", *REGION);
                 let mut attrs = entries(q, "Attributes");
+                check_policy(attrs.get("Policy"))?;
                 attrs.insert("TopicArn".into(), arn.clone());
                 attrs.insert("DisplayName".into(), attrs.get("DisplayName").cloned().unwrap_or_default());
                 self.topics.entry(arn.clone()).or_insert(attrs);
@@ -101,7 +113,15 @@ impl Sns {
             "SetTopicAttributes" => {
                 let t = topic("TopicArn")?;
                 let (k, v) = (p(q, "AttributeName")?, q.get("AttributeValue").cloned().unwrap_or_default());
-                self.topics.get_mut(&t).unwrap().insert(k.into(), v);
+                let attrs = self.topics.get_mut(&t).unwrap();
+                if k == "Policy" {
+                    check_policy(Some(&v))?;
+                    if v.is_empty() {
+                        attrs.remove("Policy");
+                        return Ok((json!({}), vec![]));
+                    }
+                }
+                attrs.insert(k.into(), v);
                 json!({})
             }
             "Subscribe" => {
@@ -189,6 +209,11 @@ impl Sns {
             _ => return Err(err("InvalidAction", format!("{action} is not supported yet"))),
         };
         Ok((out, vec![]))
+    }
+
+    // Topic policy (the Policy attribute), consulted by the authorizer.
+    pub fn policy(&self, arn: &str) -> Option<Value> {
+        self.topics.get(arn)?.get("Policy").and_then(|p| serde_json::from_str(p).ok())
     }
 
     pub fn admin(&self) -> Value {

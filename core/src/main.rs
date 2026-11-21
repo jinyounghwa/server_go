@@ -414,6 +414,7 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
             let name = b["QueueUrl"].as_str()?.rsplit('/').next()?.to_string();
             app.sqs.lock().unwrap().policy(&name).map(|p| ("queue policy", p))
         }),
+        Svc::Sns(q) => q.get("TopicArn").or(q.get("TargetArn")).and_then(|t| app.sns.lock().unwrap().policy(t)).map(|p| ("topic policy", p)),
         _ => None,
     };
     let decision = {
@@ -649,7 +650,7 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
     if let Some(d) = decision.filter(|_| principal != iam::Principal::Root) {
         // Which policy decided, as a fixed label (identity policy names are never exposed here).
         let source = match d.matched.first().map(String::as_str) {
-            Some(k @ ("bucket policy" | "queue policy")) => k,
+            Some(k @ ("bucket policy" | "queue policy" | "topic policy")) => k,
             _ => "identity",
         };
         ev["auth"] = json!({"decision": d.kind, "reason": d.reason, "enforced": *ENFORCE, "source": source});
@@ -807,7 +808,7 @@ fn town_view(s: String) -> String {
             if let Some(v) = a.get(k) { ao.insert(k.into(), v.clone()); }
         }
         // Only known labels pass, so nothing else can ride along in this field.
-        if let Some(s) = a.get("source").filter(|s| ["identity", "bucket policy", "queue policy"].iter().any(|k| *s == *k)) {
+        if let Some(s) = a.get("source").filter(|s| ["identity", "bucket policy", "queue policy", "topic policy"].iter().any(|k| *s == *k)) {
             ao.insert("source".into(), s.clone());
         }
         if !ao.is_empty() { out.insert("auth".into(), Value::Object(ao)); }

@@ -115,7 +115,7 @@ Step Functions Parallel·Map 동시 실행, 이벤트 `auth.source`와 마을 �
 
 1. ~~v0.1.2 릴리스~~ 완료(2026-11-21). release.yml은 아직 Node 20 액션(upload/download-artifact v4, action-gh-release v2)을 쓴다.
    최신은 upload v7·download v8·gh-release v3. 태그로만 돌아 미리 검증할 수 없으니 다음 릴리스 때 올리고 결과를 확인한다.
-2. **SNS 토픽 정책·Lambda 리소스 정책**도 같은 `authorize_with`로 평가(저장 위치: SNS `Policy` 속성, Lambda `AddPermission`).
+2. ~~SNS 토픽 정책~~(완료). **Lambda 리소스 정책**(`AddPermission`)도 같은 `authorize_with`로 평가.
 3. **Step Functions Parallel 실패 시 나머지 가지 중단**(지금은 끝까지 실행).
 4. **ALB 경로 규칙**(지금 L4) → **aws-chunked 조각 서명 검증**. 각각 sdk_test.py에 정상·오류 경로 테스트를 같이 넣는다.
 5. **3D 마을 점검**: 저사양 GPU·모바일·Safari·Firefox. 연대기 섬 숫자(SDK 테스트 28/5/4개, 시나리오 21개, GPU 65°C)는
@@ -126,6 +126,6 @@ Step Functions Parallel·Map 동시 실행, 이벤트 `auth.source`와 마을 �
 
 ## 8. 알려진 한계 (요약)
 상태는 기본 인메모리(JSON 스냅샷 `RC_STATE_FILE` 또는 SQLite `RC_SQLITE_FILE`로 영속 저장 가능), SigV4 서명은 `VERIFY_SIGV4=1`일 때만 검증(SigV2 거부,
-aws-chunked 조각 서명은 미검증), SNS 토픽·Lambda 리소스 기반 정책 미평가(S3 버킷·SQS 큐 정책은 평가), KMS는 진짜 암호 아님,
+aws-chunked 조각 서명은 미검증), Lambda 리소스 기반 정책(AddPermission) 미평가(S3 버킷·SQS 큐·SNS 토픽 정책은 평가), KMS는 진짜 암호 아님,
 ALB는 L4 라운드로빈(경로 규칙 없음), Step Functions Parallel에서 한 가지가 실패해도 나머지는 끝까지 실행, Query 프로토콜 구버전 SQS 미지원,
 ECS 태스크가 에뮬레이터를 부르려면 `BIND=0.0.0.0:4566` 필요. 세부는 각 파일의 `ponytail:` 주석.

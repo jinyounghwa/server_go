@@ -269,12 +269,12 @@ impl Iam {
     // Same-account evaluation with a resource-based policy (bucket policy): an explicit Deny in either policy wins,
     // otherwise an Allow in either grants. The account root can always manage the bucket policy itself, as in AWS,
     // so a Deny-everyone policy can't lock the bucket for good.
-    // The root can likewise always rewrite a queue policy (SetQueueAttributes).
-    // ponytail: S3 bucket and SQS queue policies only; SNS topic and Lambda resource policies are not evaluated.
+    // The root can likewise always rewrite a queue or topic policy.
+    // ponytail: S3 bucket, SQS queue and SNS topic policies; Lambda resource policies (AddPermission) are not evaluated.
     pub fn authorize_with(&self, p: &Principal, action: &str, resource: &str, rp: Option<(&str, &Value)>) -> Decision {
         let id = self.authorize(p, action, resource);
         let Some((kind, doc)) = rp else { return id };
-        if id.kind == "explicitDeny" || (matches!(p, Principal::Root) && (action.ends_with("BucketPolicy") || action == "sqs:SetQueueAttributes")) {
+        if id.kind == "explicitDeny" || (matches!(p, Principal::Root) && (action.ends_with("BucketPolicy") || action == "sqs:SetQueueAttributes" || action == "sns:SetTopicAttributes")) {
             return id;
         }
         let ctx = req_ctx(p);

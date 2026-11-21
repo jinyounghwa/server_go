@@ -233,6 +233,20 @@ def test_iam():
     assert code(sqb.send_message, QueueUrl=qu, MessageBody="x") == "AccessDenied"
     sqs.delete_queue(QueueUrl=qu)
 
+    # Topic policy: same rules for SNS.
+    sns, snb = boto3.client("sns", **kw), boto3.client("sns", **dict(kw, aws_access_key_id=bk["AccessKeyId"], aws_secret_access_key=bk["SecretAccessKey"]))
+    tp = sns.create_topic(Name=f"tp{run}")["TopicArn"]
+    assert code(snb.publish, TopicArn=tp, Message="x") == "AuthorizationError"
+    assert code(sns.set_topic_attributes, TopicArn=tp, AttributeName="Policy", AttributeValue="[]") == "InvalidParameter"
+    sns.set_topic_attributes(TopicArn=tp, AttributeName="Policy", AttributeValue=json.dumps({"Statement": [
+        {"Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::000000000000:user/{bob}"}, "Action": "sns:Publish", "Resource": tp}]}))
+    snb.publish(TopicArn=tp, Message="from-bob")
+    assert code(snb.subscribe, TopicArn=tp, Protocol="sqs", Endpoint=qarn) == "AuthorizationError"
+    sns.set_topic_attributes(TopicArn=tp, AttributeName="Policy", AttributeValue="")
+    assert "Policy" not in sns.get_topic_attributes(TopicArn=tp)["Attributes"]
+    assert code(snb.publish, TopicArn=tp, Message="x") == "AuthorizationError"
+    sns.delete_topic(TopicArn=tp)
+
     sim = iam.simulate_principal_policy(PolicySourceArn=f"arn:aws:iam::000000000000:user/{u}", ActionNames=["s3:GetObject"],
                                         ResourceArns=[f"arn:aws:s3:::{b}/public/a", f"arn:aws:s3:::{b}/secret/a", "arn:aws:s3:::other/x"])
     assert [r["EvalDecision"] for r in sim["EvaluationResults"]] == ["allowed", "explicitDeny", "implicitDeny"], sim
