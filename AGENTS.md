@@ -101,7 +101,7 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
 
 ## 6. 검증 에이전트 요점 (inspector.rs)
 - 실행기·판정기는 결정적 코드, 대상은 127.0.0.1만. LLM은 시나리오 제안만 한다(꺼져 있으면 내장 시나리오만).
-- 내장 시나리오 20개: 보안 7, 장애 6(스로틀·5xx·지연·부분 실패·연결 끊김·부하 중 재생성), 사고 4(DLQ·Lambda 반복 실패·
+- 내장 시나리오 21개: 보안 8(버킷 정책 Deny·잠김 방지 포함), 장애 6(스로틀·5xx·지연·부분 실패·연결 끊김·부하 중 재생성), 사고 4(DLQ·Lambda 반복 실패·
   큐 폭주·저장소 한도), 성능 2(동시 처리량·메모리 증가), 퍼징 1. 파괴적 작업은 `rc-insp-` 접두사 리소스에서만.
 - 요청은 `local_http()` 하나로 나가며 `resign()`이 진짜 SigV4로 서명한다(`sig_header()`의 `Signature=00`은 자리표시).
   `VERIFY_SIGV4=1`이면 서명 없는 요청도 루트로 서명한다. 서명 없이 보내야 하는 검사는 `x-rc-unsigned` 헤더를 단다.
@@ -116,7 +116,7 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
 3. **CI 경고 정리.** Node 20 액션 폐지 경고: `actions/checkout@v5`, `actions/setup-node@v5`, `astral-sh/setup-uv` 최신으로.
    setup-uv 캐시 경고(`uv.lock` 없음)는 `enable-cache: false` 또는 `cache-dependency-glob` 지정.
 4. **3D 마을 점검.** 저사양 GPU·모바일·Safari·Firefox 화면 확인(지금까지 맥 Chrome만 확인). 연대기 섬의 숫자
-   (SDK 테스트 28/5/4개, 시나리오 20개, GPU 65°C)는 `town.html` 12절에 손으로 적은 값이라 테스트가 늘면 같이 고친다.
+   (SDK 테스트 28/5/4개, 시나리오 21개, GPU 65°C)는 `town.html` 12절에 손으로 적은 값이라 테스트가 늘면 같이 고친다.
    맥에서 에뮬레이터를 띄운 `/_town` 실시간 모드는 이번 3D 개편 뒤 아직 직접 보지 않았다.
 5. **알려진 한계(8절) 중 효과 큰 순서.** ~~SQS 메시지 속성~~(완료) → ~~S3 버킷 정책~~(완료, `iam.rs` `authorize_with`) → ~~SQS 큐 정책~~(완료) →
    Step Functions Parallel 진짜 병렬 → ALB 경로 규칙 → aws-chunked 조각 서명 검증. 각각 sdk_test.py에 정상·오류 경로 테스트를 같이 넣는다.

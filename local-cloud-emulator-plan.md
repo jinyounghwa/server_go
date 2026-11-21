@@ -141,7 +141,7 @@ Status as of **2026-11-21**: `[x]` completed, `[~]` partially implemented or int
 **Role:** Continuously probes and fault-tests the local emulator, visualizing attacks and defenses in the GUI and 3D town. The local LLM may optionally propose non-destructive scenarios, while all execution and pass/fail verdicts are strictly deterministic.
 
 **Test Categories (20 built-in scenarios)**
-- [x] **Security (7):** IAM implicit/explicit deny, CSRF header enforcement, S3 path traversal, missing/malformed SigV4, >256 MiB payload rejection (413), injection payloads
+- [x] **Security (8):** IAM implicit/explicit deny, bucket policy Deny binding root without lockout, CSRF header enforcement, S3 path traversal, missing/malformed SigV4, >256 MiB payload rejection (413), injection payloads
 - [x] **Incidents (4):** 1000-message queue flood, DynamoDB 400 KB item & SQS 256 KiB message limits, Lambda repeated failures, SQS DLQ buildup
 - [x] **Chaos / Fault Injection (6):** Throttling recovery, 5xx recovery, latency injection, 50% partial failure, mid-request dropped connections, table delete/recreate under write load
 - [x] **Cross-SDK Compatibility:** Python, JS, and Rust suites verify overlapping services, and `tools/sdk_compare.py` runs identical 7-service scenarios on Python (`boto3`) and JS (`@aws-sdk` v3) to automatically diff normalized responses and error codes.

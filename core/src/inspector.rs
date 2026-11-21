@@ -386,6 +386,41 @@ async fn sc_iam_explicit_deny(tag: &str) -> Value {
     }
 }
 
+// A bucket policy Deny binds even the account root, but the root can always remove the policy (no lockout).
+async fn sc_bucket_policy_deny(tag: &str) -> Value {
+    let t0 = Instant::now();
+    let bucket = format!("{PREFIX}bp-{tag}");
+    let _ = local_http("PUT", &format!("/{bucket}"), &[], b"").await;
+    let _ = local_http("PUT", &format!("/{bucket}/locked.txt"), &[], b"x").await;
+    let policy = json!({"Statement": [{"Sid": "LockAll", "Effect": "Deny", "Principal": "*", "Action": "s3:GetObject",
+        "Resource": format!("arn:aws:s3:::{bucket}/*")}]}).to_string();
+    let put = local_http("PUT", &format!("/{bucket}?policy"), &[], policy.as_bytes()).await;
+    let get = local_http("GET", &format!("/{bucket}/locked.txt"), &[], b"").await;
+    let del = local_http("DELETE", &format!("/{bucket}?policy"), &[], b"").await;
+    let after = local_http("GET", &format!("/{bucket}/locked.txt"), &[], b"").await;
+    let _ = local_http("DELETE", &format!("/{bucket}/locked.txt"), &[], b"").await;
+    let _ = local_http("DELETE", &format!("/{bucket}"), &[], b"").await;
+    let st = |r: &Result<HttpResp, String>| r.as_ref().map(|r| r.status).unwrap_or(0);
+    let repro = vec![
+        repro_step("PUT", &format!("/{bucket}?policy"), &[], &policy),
+        repro_step("GET", &format!("/{bucket}/locked.txt"), &[], ""),
+    ];
+    let observed = json!({"put_policy": st(&put), "denied_get": st(&get), "delete_policy": st(&del), "get_after_delete": st(&after)});
+    if !*ENFORCE {
+        return make_result("sec-bucket-policy-deny", "버킷 정책 Deny·잠김 방지", "security", "info", "s3", true, false,
+            "ENFORCE_IAM=0 모드라 거부가 보고만 됩니다. 강제 검증은 ENFORCE_IAM=1로 실행하세요.".into(),
+            t0.elapsed().as_secs_f64() * 1000.0, json!({"enforced": false}), observed, repro);
+    }
+    let ok = st(&put) == 204 && st(&get) == 403 && st(&del) == 204 && st(&after) == 200;
+    let detail = if ok {
+        "버킷 정책의 Deny가 루트의 GetObject도 403으로 막았고, 루트는 정책을 지워 접근을 되찾았습니다.".into()
+    } else {
+        format!("기대: 정책 등록 204 → 읽기 403 → 정책 삭제 204 → 읽기 200, 실제: {observed}")
+    };
+    make_result("sec-bucket-policy-deny", "버킷 정책 Deny·잠김 방지", "security", "high", "s3", ok, ok, detail,
+        t0.elapsed().as_secs_f64() * 1000.0, json!({"put_policy": 204, "denied_get": 403, "delete_policy": 204, "get_after_delete": 200}), observed, repro)
+}
+
 async fn sc_s3_path_traversal(tag: &str) -> Value {
     let t0 = Instant::now();
     let bucket = format!("{PREFIX}trav-{tag}");
@@ -1085,6 +1120,7 @@ async fn run_inner(app: &Arc<App>, req: &Value) -> Result<Value, ApiErr> {
             ("sec-admin-csrf", "security"),
             ("sec-iam-implicit-deny", "security"),
             ("sec-iam-explicit-deny", "security"),
+            ("sec-bucket-policy-deny", "security"),
             ("sec-s3-path-traversal", "security"),
             ("sec-missing-sigv4", "security"),
             ("sec-oversize-payload", "security"),
@@ -1126,6 +1162,7 @@ async fn run_inner(app: &Arc<App>, req: &Value) -> Result<Value, ApiErr> {
             "sec-admin-csrf" => sc_admin_csrf().await,
             "sec-iam-implicit-deny" => sc_iam_implicit_deny(tag).await,
             "sec-iam-explicit-deny" => sc_iam_explicit_deny(tag).await,
+            "sec-bucket-policy-deny" => sc_bucket_policy_deny(tag).await,
             "sec-s3-path-traversal" => sc_s3_path_traversal(tag).await,
             "sec-missing-sigv4" => sc_missing_sigv4().await,
             "sec-oversize-payload" => sc_oversize_payload().await,
