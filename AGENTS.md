@@ -1,4 +1,4 @@
-# rocalcloud — 인수인계 지침 (2026-11-20)
+# rocalcloud — 인수인계 지침 (2026-11-21)
 
 다음 작업자(모델)가 바로 이어서 코딩할 수 있도록 현재 상태, 규칙, 남은 일을 정리한 문서다.
 계획 원본은 `local-cloud-emulator-plan.md`. 이 문서와 충돌하면 계획서가 목표, 이 문서가 현재 사실이다.
@@ -23,8 +23,8 @@ core/            Rust 단일 바이너리 (axum + tokio), 모든 서비스가 �
   src/<svc>.rs   서비스별 모듈. 상태 struct + handle() + admin()
   src/ui.html    관리 GUI (/_ui), town.html 캐릭터 마을 (/_town) — include_str!로 내장
 gui/             Tauri 2 창. /_ui를 여는 껍데기일 뿐
-tests/sdk_test.py  boto3 호환성 테스트 23개 (유일한 통합 테스트)
-netlify.toml     마을 데모 정적 배포 설정 (배포는 아직 안 함)
+tests/sdk_test.py  boto3 호환성 테스트 28개 (주 통합 테스트), tests/js·tests/rust는 JS v3·Rust SDK 스위트
+netlify.toml     예전 Netlify 설정(지금은 GitHub Pages `pages.yml`로 배포)
 ```
 
 서비스 모듈: ddb, s3, sqs, sns, iam(+STS, 정책 평가기), net(EC2 VPC + 도달성), secrets, ssm, kms, logs,
@@ -94,7 +94,7 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
   (Cognito 확인 코드 등이 이벤트에 들어 있다). 예외는 GitHub Pages 마을 출처 하나(`RC_TOWN_ORIGIN`, 기본
   `https://jinyounghwa.github.io`, `off`로 끔, `Vary: Origin` 포함)이고, 그 사본은 `town_view()`가
   allowlist 필터링으로 시각화 필수 필드만 남겨 `code`·`principal`·`error`·`auth.reason`·`request_id` 등을 제거한다.
-  `town.html`은 `?api=`를 루프백(`127.0.0.1`/`localhost`/`[::1]`)으로만 제한하고 CSP와 `no-referrer`를 적용한다.
+  `town.html`은 `?api=`를 루프백(`127.0.0.1`/`localhost`, IPv6 `[::1]`은 CSP가 막으므로 제외)으로만 제한하고 CSP와 `no-referrer`를 적용한다.
 - LLM은 코어 바깥에만 둔다. LLM이 꺼져도 모든 기능이 동작해야 한다(규칙 기반 폴백 먼저).
 - 결과 보고는 사실대로: 실패와 생략을 숨기지 않는다. 테스트 채점 기준이 느슨했다면 그것도 밝힌다.
 
@@ -106,9 +106,24 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
   `VERIFY_SIGV4=1`이면 서명 없는 요청도 루트로 서명한다. 서명 없이 보내야 하는 검사는 `x-rc-unsigned` 헤더를 단다.
 - 새 시나리오: `sc_x()` 함수 → `run_inner()`의 `plan` 목록과 `match id`에 추가 → `make_result()`로 결과.
 
-## 7. 남은 일 (계획서 4장)
-- SQLite 저장소(`core/src/storage.rs`, `RC_SQLITE_FILE`, `/_admin/sql`, `/_admin/sqlite/*`)와 SDK 간 응답 자동 대조(`tools/sdk_compare.py`), DB 쿼리 도구(`tools/db_query.py`), 부분실패 검사(`tools/partial_fail_check.py`), 메모리 측정(`tools/mem_bench.py`) 모두 구현 완료.
-- 우분투 전체 검증(Docker 필요 테스트 포함)은 큰 변경 뒤마다 4절 방법으로 돌린다.
+## 7. 다음에 할 일 (2026-11-21 기준, 우선순위 순)
+계획서 4장 체크리스트는 전부 완료. 아래는 그 뒤에 남은 일이다.
+
+1. **v0.1.1 릴리스 (가장 급함).** v0.1.0 바이너리는 SIGTERM·Ctrl-C를 받아도 graceful shutdown이 열린 연결을 기다리며
+   끝나지 않을 수 있다(우분투에서 실제로 남은 프로세스를 확인했다). 2초 강제 종료로 고친 커밋은 `main`에만 있다.
+   `core/Cargo.toml` 버전을 올리고 태그 `v0.1.1` → release.yml → Homebrew 포뮬러 sha256 갱신.
+2. **우분투 전체 검증 1회.** 3D 개편과 종료 수정 뒤 `tools/ubuntu_verify.sh`를 끝까지 돌리지 않았다
+   (CI와 같은 순서의 Python 스위트 두 모드만 통과 확인). 끝나면 `pgrep rocalcloud`·`docker ps -a`가 0인지 본다.
+3. **CI 경고 정리.** Node 20 액션 폐지 경고: `actions/checkout@v5`, `actions/setup-node@v5`, `astral-sh/setup-uv` 최신으로.
+   setup-uv 캐시 경고(`uv.lock` 없음)는 `enable-cache: false` 또는 `cache-dependency-glob` 지정.
+4. **3D 마을 점검.** 저사양 GPU·모바일·Safari·Firefox 화면 확인(지금까지 맥 Chrome만 확인). 연대기 섬의 숫자
+   (SDK 테스트 28/5/4개, 시나리오 20개, GPU 65°C)는 `town.html` 12절에 손으로 적은 값이라 테스트가 늘면 같이 고친다.
+   맥에서 에뮬레이터를 띄운 `/_town` 실시간 모드는 이번 3D 개편 뒤 아직 직접 보지 않았다.
+5. **알려진 한계(8절) 중 효과 큰 순서.** SQS 메시지 속성 저장 → 리소스 기반 정책(S3 버킷 정책·SQS 큐 정책) 평가 →
+   Step Functions Parallel 진짜 병렬 → ALB 경로 규칙 → aws-chunked 조각 서명 검증. 각각 sdk_test.py에 정상·오류 경로 테스트를 같이 넣는다.
+6. (선택) `?api=`로 IPv6 `[::1]`을 쓰려면 CSP `connect-src`가 IPv6 리터럴을 못 받으므로 별도 방법이 필요하다. 요청이 있을 때만.
+
+큰 변경 뒤에는 4절 방법으로 우분투 전체 검증을 돌린다.
 
 ## 8. 알려진 한계 (요약)
 상태는 기본 인메모리(JSON 스냅샷 `RC_STATE_FILE` 또는 SQLite `RC_SQLITE_FILE`로 영속 저장 가능), SigV4 서명은 `VERIFY_SIGV4=1`일 때만 검증(SigV2 거부,
