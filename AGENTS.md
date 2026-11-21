@@ -127,5 +127,5 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
 ## 8. 알려진 한계 (요약)
 상태는 기본 인메모리(JSON 스냅샷 `RC_STATE_FILE` 또는 SQLite `RC_SQLITE_FILE`로 영속 저장 가능), SigV4 서명은 `VERIFY_SIGV4=1`일 때만 검증(SigV2 거부,
 aws-chunked 조각 서명은 미검증), SNS 토픽·Lambda 리소스 기반 정책 미평가(S3 버킷·SQS 큐 정책은 평가), KMS는 진짜 암호 아님,
-ALB는 L4 라운드로빈(경로 규칙 없음), Step Functions 병렬 가지가 순차 실행, SNS→SQS 배달 시 메시지 속성 미전달, Query 프로토콜 구버전 SQS 미지원,
+ALB는 L4 라운드로빈(경로 규칙 없음), Step Functions 병렬 가지가 순차 실행, Query 프로토콜 구버전 SQS 미지원,
 ECS 태스크가 에뮬레이터를 부르려면 `BIND=0.0.0.0:4566` 필요. 세부는 각 파일의 `ponytail:` 주석.

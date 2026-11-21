@@ -10,7 +10,7 @@ use std::{
 // FIFO: MessageGroupId is required, a group with a message in flight is held back (strict per-group order),
 // and duplicates (MessageDeduplicationId or ContentBasedDeduplication) within 5 minutes return the first MessageId.
 // Message attributes are validated (≤10, AWS naming rules, String/Number/Binary types) and returned with the AWS MD5.
-// ponytail: SNS→SQS delivery does not forward attributes; FIFO high-throughput mode and per-message DelaySeconds rules are not emulated.
+// SNS raw delivery forwards attributes. ponytail: FIFO high-throughput mode and per-message DelaySeconds rules are not emulated.
 const DEDUP_WINDOW: Duration = Duration::from_secs(300);
 
 struct Msg {
@@ -410,8 +410,8 @@ impl Queues {
             q.msgs.retain(|m| m.receipt.as_deref() != Some(receipt));
         }
     }
-    pub fn deliver(&mut self, name: &str, body: String) -> bool {
-        self.q.get_mut(name).is_some_and(|q| send(q, &json!({ "MessageBody": body })).is_ok())
+    pub fn deliver(&mut self, name: &str, body: String, attrs: &Value) -> bool {
+        self.q.get_mut(name).is_some_and(|q| send(q, &json!({ "MessageBody": body, "MessageAttributes": attrs })).is_ok())
     }
 
     // GUI view: every queue with counts and up to 100 messages (peek, no receive).

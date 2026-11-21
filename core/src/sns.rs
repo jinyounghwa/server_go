@@ -10,6 +10,7 @@ pub struct Delivery {
     pub protocol: String,
     pub endpoint: String,
     pub body: String,
+    pub attrs: Value, // SQS-shaped message attributes for raw delivery
 }
 struct Sub {
     topic: String,
@@ -169,7 +170,17 @@ impl Sns {
                         let raw = s.attrs.get("RawMessageDelivery").is_some_and(|v| v == "true");
                         let mut e = env.clone();
                         e["UnsubscribeURL"] = format!("local:unsubscribe:{arn}").into();
-                        Delivery { protocol: s.protocol.clone(), endpoint: s.endpoint.clone(), body: if raw { msg.to_string() } else { e.to_string() } }
+                        // Raw delivery to SQS turns SNS attributes into SQS message attributes; otherwise they ride in the envelope.
+                        let sqs_attrs: Map<String, Value> = if raw {
+                            attrs.iter().map(|(k, a)| {
+                                let ty = a["Type"].as_str().unwrap_or("String");
+                                let key = if ty.starts_with("Binary") { "BinaryValue" } else { "StringValue" };
+                                (k.clone(), json!({"DataType": ty, key: a["Value"]}))
+                            }).collect()
+                        } else {
+                            Map::new()
+                        };
+                        Delivery { protocol: s.protocol.clone(), endpoint: s.endpoint.clone(), body: if raw { msg.to_string() } else { e.to_string() }, attrs: sqs_attrs.into() }
                     })
                     .collect();
                 *self.published.entry(t).or_default() += 1;

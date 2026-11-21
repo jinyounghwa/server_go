@@ -686,7 +686,7 @@ fn send_to_target(app: &Arc<App>, rid: &str, arn: &str, payload: Value, from: &s
             deliver(app, rid, &d, "sns");
         }
     } else {
-        deliver(app, rid, &sns::Delivery { protocol: "sqs".into(), endpoint: arn.into(), body: text }, from);
+        deliver(app, rid, &sns::Delivery { protocol: "sqs".into(), endpoint: arn.into(), body: text, attrs: Value::Null }, from);
     }
 }
 
@@ -714,7 +714,7 @@ fn start_schedule(app: Arc<App>, bus: String, name: String) {
 // Push a message to its subscriber and report it as its own event.
 fn deliver(app: &Arc<App>, rid: &str, d: &sns::Delivery, from: &str) {
     let ok = match d.protocol.as_str() {
-        "sqs" => app.sqs.lock().unwrap().deliver(d.endpoint.rsplit(':').next().unwrap_or(""), d.body.clone()),
+        "sqs" => app.sqs.lock().unwrap().deliver(d.endpoint.rsplit(':').next().unwrap_or(""), d.body.clone(), &d.attrs),
         "lambda" => {
             let name = lambda::name_of(&d.endpoint);
             let env: Value = serde_json::from_str(&d.body).unwrap_or_default();

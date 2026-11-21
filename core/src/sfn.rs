@@ -236,7 +236,7 @@ async fn task(app: &Arc<App>, resource: &str, p: Value) -> Result<Value, Fail> {
         }
         "sqs:sendMessage" => {
             let q = p["QueueUrl"].as_str().unwrap_or("").rsplit('/').next().unwrap_or("").to_string();
-            if !app.sqs.lock().unwrap().deliver(&q, text(&p["MessageBody"])) {
+            if !app.sqs.lock().unwrap().deliver(&q, text(&p["MessageBody"]), &p["MessageAttributes"]) {
                 return Err(fail("SQS.QueueDoesNotExist", format!("Queue {q} does not exist")));
             }
             Ok(json!({"MessageId": uuid::Uuid::new_v4().to_string()}))

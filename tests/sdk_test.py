@@ -385,8 +385,9 @@ def test_sns_to_sqs():
     got = [json.loads(m["Body"]) for m in sqs.receive_message(QueueUrl=all_q, MaxNumberOfMessages=10)["Messages"]]
     assert [g["Message"] for g in got] == ["plain", "golden"] and got[0]["Subject"] == "s1" and got[0]["TopicArn"] == t
     assert got[1]["MessageAttributes"]["tier"] == {"Type": "String", "Value": "gold"}
-    vip = sqs.receive_message(QueueUrl=vip_q, MaxNumberOfMessages=10)["Messages"]
+    vip = sqs.receive_message(QueueUrl=vip_q, MaxNumberOfMessages=10, MessageAttributeNames=["All"])["Messages"]
     assert [m["Body"] for m in vip] == ["golden"], vip  # filter + raw delivery
+    assert vip[0]["MessageAttributes"]["tier"] == {"DataType": "String", "StringValue": "gold"}, vip  # raw keeps attributes
     assert code(sns.publish, TopicArn=t + "x", Message="m") == "NotFound"
     sns.delete_topic(TopicArn=t)
     sqs.delete_queue(QueueUrl=all_q); sqs.delete_queue(QueueUrl=vip_q)
