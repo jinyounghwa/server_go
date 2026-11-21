@@ -275,7 +275,8 @@ fn checks(app: &App, svc: &Svc, body: &[u8]) -> Vec<(String, String)> {
         Svc::ApiGw(m, path) => vec![(format!("apigateway:{m}"), format!("arn:aws:apigateway:{}::/{path}", *REGION))],
         Svc::Lambda(op, path, _) => {
             let res = lambda::path_name(path).or_else(|| j["FunctionName"].as_str().map(lambda::name_of)).map_or("*".into(), |n| lambda::arn(&n));
-            vec![(format!("lambda:{op}"), res)]
+            // IAM names the Invoke API "lambda:InvokeFunction".
+            vec![(format!("lambda:{}", if *op == "Invoke" { "InvokeFunction" } else { op }), res)]
         }
         // Cognito's end-user APIs are public (token- or client-id based), not IAM-authorized.
         Svc::Json("cognito-idp", op) if COGNITO_PUBLIC.contains(&op.as_str()) => vec![],
@@ -414,6 +415,10 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
             let name = b["QueueUrl"].as_str()?.rsplit('/').next()?.to_string();
             app.sqs.lock().unwrap().policy(&name).map(|p| ("queue policy", p))
         }),
+        Svc::Lambda(_, path, _) => lambda::path_name(path)
+            .or_else(|| serde_json::from_slice::<Value>(&body).ok().and_then(|j| j["FunctionName"].as_str().map(lambda::name_of)))
+            .and_then(|n| app.lambda.lock().unwrap().policy(&n))
+            .map(|p| ("function policy", p)),
         Svc::Sns(q) => q.get("TopicArn").or(q.get("TargetArn")).and_then(|t| app.sns.lock().unwrap().policy(t)).map(|p| ("topic policy", p)),
         _ => None,
     };
@@ -650,7 +655,7 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
     if let Some(d) = decision.filter(|_| principal != iam::Principal::Root) {
         // Which policy decided, as a fixed label (identity policy names are never exposed here).
         let source = match d.matched.first().map(String::as_str) {
-            Some(k @ ("bucket policy" | "queue policy" | "topic policy")) => k,
+            Some(k @ ("bucket policy" | "queue policy" | "topic policy" | "function policy")) => k,
             _ => "identity",
         };
         ev["auth"] = json!({"decision": d.kind, "reason": d.reason, "enforced": *ENFORCE, "source": source});
@@ -808,7 +813,7 @@ fn town_view(s: String) -> String {
             if let Some(v) = a.get(k) { ao.insert(k.into(), v.clone()); }
         }
         // Only known labels pass, so nothing else can ride along in this field.
-        if let Some(s) = a.get("source").filter(|s| ["identity", "bucket policy", "queue policy", "topic policy"].iter().any(|k| *s == *k)) {
+        if let Some(s) = a.get("source").filter(|s| ["identity", "bucket policy", "queue policy", "topic policy", "function policy"].iter().any(|k| *s == *k)) {
             ao.insert("source".into(), s.clone());
         }
         if !ao.is_empty() { out.insert("auth".into(), Value::Object(ao)); }

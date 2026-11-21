@@ -1136,7 +1136,7 @@ const VERBS = {
   Forward: "트래픽 로드밸런싱", FilterLogEvents: "로그 관제 검색", Explain: "오류 AI 해설", Ask: "자연어 에이전트 질의",
   SetChaos: "장애 규칙 주입", Reset: "전체 초기화",
 };
-const POLICY_SRC = { "bucket policy": "버킷 정책", "queue policy": "큐 정책", "topic policy": "토픽 정책" };
+const POLICY_SRC = { "bucket policy": "버킷 정책", "queue policy": "큐 정책", "topic policy": "토픽 정책", "function policy": "함수 정책" };
 function story(e) {
   if (e.service === "inspector") {
     if (e.op === "RunStarted") return `검사관 순찰 개시 (${e.total || 0}건)`;

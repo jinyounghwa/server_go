@@ -247,6 +247,23 @@ def test_iam():
     assert code(snb.publish, TopicArn=tp, Message="x") == "AuthorizationError"
     sns.delete_topic(TopicArn=tp)
 
+    # Function policy (AddPermission): bob may invoke only while the statement exists.
+    lam = boto3.client("lambda", **kw)
+    lmb = boto3.client("lambda", **dict(kw, aws_access_key_id=bk["AccessKeyId"], aws_secret_access_key=bk["SecretAccessKey"]))
+    fn = f"fp{run}"
+    lam.create_function(FunctionName=fn, Runtime="python3.12", Role="arn:aws:iam::000000000000:role/x", Handler="app.h",
+                        Code={"ZipFile": zipped({"app.py": "def h(e, c):\n    return {'ok': True}\n"})})
+    assert code(lmb.invoke, FunctionName=fn) == "AccessDeniedException"
+    assert code(lam.get_policy, FunctionName=fn) == "ResourceNotFoundException"
+    lam.add_permission(FunctionName=fn, StatementId="bob", Action="lambda:InvokeFunction", Principal=f"arn:aws:iam::000000000000:user/{bob}")
+    assert code(lam.add_permission, FunctionName=fn, StatementId="bob", Action="lambda:InvokeFunction", Principal="*") == "ResourceConflictException"
+    assert json.loads(lam.get_policy(FunctionName=fn)["Policy"])["Statement"][0]["Sid"] == "bob"
+    assert json.loads(lmb.invoke(FunctionName=fn)["Payload"].read()) == {"ok": True}
+    assert code(lmb.remove_permission, FunctionName=fn, StatementId="bob") == "AccessDeniedException"
+    lam.remove_permission(FunctionName=fn, StatementId="bob")
+    assert code(lmb.invoke, FunctionName=fn) == "AccessDeniedException"
+    lam.delete_function(FunctionName=fn)
+
     sim = iam.simulate_principal_policy(PolicySourceArn=f"arn:aws:iam::000000000000:user/{u}", ActionNames=["s3:GetObject"],
                                         ResourceArns=[f"arn:aws:s3:::{b}/public/a", f"arn:aws:s3:::{b}/secret/a", "arn:aws:s3:::other/x"])
     assert [r["EvalDecision"] for r in sim["EvaluationResults"]] == ["allowed", "explicitDeny", "implicitDeny"], sim

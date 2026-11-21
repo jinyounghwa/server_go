@@ -30,6 +30,7 @@ pub struct Func {
     size: usize,
     sha: String,
     modified: String,
+    perms: Vec<Value>, // resource-based policy statements from AddPermission
 }
 pub struct Mapping {
     source: String,
@@ -235,6 +236,8 @@ pub fn op_of(method: &str, path: &str) -> &'static str {
         ("PUT", ["functions", _, "code"]) => "UpdateFunctionCode",
         ("POST", ["functions", _, "invocations"]) => "Invoke",
         ("POST", ["functions", _, "policy"]) => "AddPermission",
+        ("GET", ["functions", _, "policy"]) => "GetPolicy",
+        ("DELETE", ["functions", _, "policy", _]) => "RemovePermission",
         ("POST", ["event-source-mappings"]) => "CreateEventSourceMapping",
         ("GET", ["event-source-mappings"]) => "ListEventSourceMappings",
         ("GET", ["event-source-mappings", _]) => "GetEventSourceMapping",
@@ -242,6 +245,14 @@ pub fn op_of(method: &str, path: &str) -> &'static str {
         _ => "Unsupported",
     }
 }
+// Function resource policy, consulted by the authorizer.
+impl Lambda {
+    pub fn policy(&self, name: &str) -> Option<Value> {
+        let f = self.f.get(name)?;
+        (!f.perms.is_empty()).then(|| json!({"Statement": f.perms}))
+    }
+}
+
 pub fn path_name(path: &str) -> Option<String> {
     let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
     (parts.first() == Some(&"functions")).then(|| parts.get(1).map(|n| name_of(&crate::s3::pct_decode(n)))).flatten()
@@ -294,7 +305,7 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
                     arn: arn(&n), runtime: crate::need(&j, "Runtime")?.into(), role: crate::need(&j, "Role")?.into(), handler: crate::need(&j, "Handler")?.into(),
                     timeout: j["Timeout"].as_u64().unwrap_or(3), memory: j["MemorySize"].as_u64().unwrap_or(128),
                     env: j["Environment"]["Variables"].as_object().cloned().unwrap_or_default(),
-                    description: j["Description"].as_str().unwrap_or("").into(), dir, size, sha, modified: modified_now(),
+                    description: j["Description"].as_str().unwrap_or("").into(), dir, size, sha, modified: modified_now(), perms: vec![],
                 };
                 let out = config(&n, &f);
                 st.f.insert(n, f);
@@ -335,10 +346,51 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
                 f.modified = modified_now();
                 (200, config(&name, f))
             }
-            // ponytail: resource policies are accepted but not evaluated; any service may invoke.
+            // Resource-based policy: statements are evaluated for IAM-signed calls (see iam::authorize_with).
+            // ponytail: service principals (sns.amazonaws.com …) are stored but internal triggers are not authorized by them.
             "AddPermission" => {
-                st.f.get(&name).ok_or_else(|| not_found(&name))?;
-                (201, json!({"Statement": json!({"Sid": j["StatementId"], "Effect": "Allow", "Action": j["Action"], "Resource": arn(&name)}).to_string()}))
+                let f = st.f.get_mut(&name).ok_or_else(|| not_found(&name))?;
+                let sid = crate::need(&j, "StatementId")?;
+                let action = crate::need(&j, "Action")?;
+                let who = crate::need(&j, "Principal")?;
+                if sid.is_empty() || sid.len() > 100 || !sid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+                    return Err(err("InvalidParameterValueException", "StatementId must match [a-zA-Z0-9-_]{1,100}"));
+                }
+                if f.perms.iter().any(|s| s["Sid"] == sid) {
+                    return Err(ApiErr { status: 409, ..err("ResourceConflictException", format!("The statement id ({sid}) provided already exists. Please provide a new statement id, or remove the existing statement.")) });
+                }
+                let principal = if who.ends_with(".amazonaws.com") {
+                    json!({"Service": who})
+                } else if who.len() == 12 && who.bytes().all(|b| b.is_ascii_digit()) {
+                    json!({"AWS": format!("arn:aws:iam::{who}:root")})
+                } else if who == "*" {
+                    json!("*")
+                } else {
+                    json!({"AWS": who})
+                };
+                let mut st_json = json!({"Sid": sid, "Effect": "Allow", "Principal": principal, "Action": action, "Resource": arn(&name)});
+                if let Some(src) = j["SourceArn"].as_str() {
+                    st_json["Condition"] = json!({"ArnLike": {"AWS:SourceArn": src}});
+                }
+                f.perms.push(st_json.clone());
+                (201, json!({"Statement": st_json.to_string()}))
+            }
+            "GetPolicy" => {
+                let f = st.f.get(&name).ok_or_else(|| not_found(&name))?;
+                if f.perms.is_empty() {
+                    return Err(ApiErr { status: 404, ..err("ResourceNotFoundException", "The resource you requested does not exist.") });
+                }
+                (200, json!({"Policy": json!({"Version": "2012-10-17", "Id": "default", "Statement": f.perms}).to_string(), "RevisionId": uuid::Uuid::new_v4().to_string()}))
+            }
+            "RemovePermission" => {
+                let sid = crate::s3::pct_decode(path.trim_matches('/').rsplit('/').next().unwrap_or(""));
+                let f = st.f.get_mut(&name).ok_or_else(|| not_found(&name))?;
+                let before = f.perms.len();
+                f.perms.retain(|s| s["Sid"] != sid.as_str());
+                if f.perms.len() == before {
+                    return Err(ApiErr { status: 404, ..err("ResourceNotFoundException", format!("Statement {sid} is not found in resource policy.")) });
+                }
+                (204, json!({}))
             }
             "CreateEventSourceMapping" => {
                 let fname = name_of(crate::need(&j, "FunctionName")?);
