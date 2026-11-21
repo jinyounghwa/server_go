@@ -10,6 +10,7 @@
 - 이후 추가: JSON 상태 스냅샷, 3D(Three.js) 캐릭터 마을(본섬 28개 시설 + 다리 건너 다운타운 + 모노레일 건너 "연대기 섬": 계획서 0~10단계 오벨리스크와 SigV4·FIFO·400KB·SDK 경기장·릴리스·Homebrew·Docker·우분투·검사관 훈련장·Pages 포털·/_ui 전광판, `town.html` 12절), GitHub Pages 마을(`pages.yml`). Pages 마을은 방문자 PC의 로컬 에뮬레이터
   (`127.0.0.1:4566`, `?api=`)에 SSE로 붙어 실제 트래픽을 보여 주고, 연결 전에만 목업 트래픽을 돌린다(5초마다 재시도).
 - `v0.1.0` 릴리스 완료(2026-11-21): 바이너리 3종 + SHA256SUMS, Homebrew sha256 반영.
+- `v0.1.1` 릴리스 완료(2026-11-21): SIGTERM·Ctrl-C 뒤 최대 2초 안에 종료(v0.1.0은 열린 연결 때문에 안 끝날 수 있었음). Homebrew 포뮬러 0.1.1 반영.
   macOS 러너는 `macos-latest`를 쓴다(버전 고정 러너 macos-13·14는 폐지됨).
 - Netlify 배포는 GitHub Pages로 대체됨(필요하면 사용자 계정 연결).
 - 이름은 `rocalcloud`(r로 시작, 사용자가 정함), 라이선스 Apache-2.0. 이름에 AWS/Amazon 금지.
@@ -109,9 +110,7 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
 ## 7. 다음에 할 일 (2026-11-21 기준, 우선순위 순)
 계획서 4장 체크리스트는 전부 완료. 아래는 그 뒤에 남은 일이다.
 
-1. **v0.1.1 릴리스 (가장 급함).** v0.1.0 바이너리는 SIGTERM·Ctrl-C를 받아도 graceful shutdown이 열린 연결을 기다리며
-   끝나지 않을 수 있다(우분투에서 실제로 남은 프로세스를 확인했다). 2초 강제 종료로 고친 커밋은 `main`에만 있다.
-   `core/Cargo.toml` 버전을 올리고 태그 `v0.1.1` → release.yml → Homebrew 포뮬러 sha256 갱신.
+1. ~~v0.1.1 릴리스~~ 완료(2026-11-21).
 2. **우분투 전체 검증 1회.** 3D 개편과 종료 수정 뒤 `tools/ubuntu_verify.sh`를 끝까지 돌리지 않았다
    (CI와 같은 순서의 Python 스위트 두 모드만 통과 확인). 끝나면 `pgrep rocalcloud`·`docker ps -a`가 0인지 본다.
 3. **CI 경고 정리.** Node 20 액션 폐지 경고: `actions/checkout@v5`, `actions/setup-node@v5`, `astral-sh/setup-uv` 최신으로.
