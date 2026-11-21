@@ -764,7 +764,14 @@ def test_step_functions():
     assert c["status"] == "SUCCEEDED" and len(json.loads(c["output"])) == 3 and took < 4, (c, took)  # serial would take 6 s
     t0 = time.time(); s = finish(sf.start_execution(stateMachineArn=sm5, input='[1, 2]')["executionArn"])
     assert s["status"] == "SUCCEEDED" and time.time() - t0 >= 2, s
-    for m in (sm, sm2, sm3, sm4, sm5):
+    # A failing branch stops its siblings: the 30 s wait is abandoned and the execution fails quickly.
+    stop = {"StartAt": "P", "States": {"P": {"Type": "Parallel", "End": True, "Branches": [
+        {"StartAt": "Boom", "States": {"Boom": {"Type": "Fail", "Error": "Branch.Failed"}}},
+        {"StartAt": "Slow", "States": {"Slow": {"Type": "Wait", "Seconds": 30, "End": True}}}]}}}
+    sm6 = sf.create_state_machine(name=f"stop{run}", definition=json.dumps(stop), roleArn="arn:aws:iam::000000000000:role/x")["stateMachineArn"]
+    t0 = time.time(); f6 = finish(sf.start_execution(stateMachineArn=sm6)["executionArn"])
+    assert (f6["status"], f6["error"]) == ("FAILED", "Branch.Failed") and time.time() - t0 < 5, f6
+    for m in (sm, sm2, sm3, sm4, sm5, sm6):
         sf.delete_state_machine(stateMachineArn=m)
     for f in ("price", "flaky"):
         lam.delete_function(FunctionName=f"{f}{run}")

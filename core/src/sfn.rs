@@ -1,6 +1,6 @@
 // Step Functions (JSON 1.0) with an Amazon States Language interpreter.
 // Parallel branches and Map items run concurrently (Map honours MaxConcurrency).
-// ponytail: when one branch fails the others run to completion instead of being stopped; JSONPath supports $.a.b[0] only; no JSONata,
+// A failing branch or item stops the rest. ponytail: JSONPath supports $.a.b[0] only; no JSONata,
 // task tokens, activities, Express sync starts or state TimeoutSeconds.
 use crate::{epoch, err, need, ApiErr, App, ACCOUNT, REGION};
 use serde_json::{json, Map, Value};
@@ -333,10 +333,10 @@ fn run_states<'a>(app: &'a Arc<App>, exec: &'a str, def: &'a Value, input: Value
                     Err(e) => Err(e),
                 },
                 "Parallel" => match params(&eff) {
-                    // Branches run concurrently; output keeps branch order and the first failing branch (in order) wins.
+                    // Branches run concurrently; the first branch to fail stops the others (their futures are dropped).
                     Ok(p) => {
                         let runs = st["Branches"].as_array().into_iter().flatten().map(|b| run_states(app, exec, b, p.clone(), ctx.clone()));
-                        futures_util::future::join_all(runs).await.into_iter().collect::<Result<Vec<_>, _>>().map(Value::Array)
+                        futures_util::future::try_join_all(runs).await.map(Value::Array)
                     }
                     Err(e) => Err(e),
                 },
@@ -358,9 +358,9 @@ fn run_states<'a>(app: &'a Arc<App>, exec: &'a str, def: &'a Value, input: Value
                                 Ok(inputs) => {
                                     let limit = st["MaxConcurrency"].as_u64().filter(|n| *n > 0).map_or(inputs.len().max(1), |n| n as usize);
                                     let runs = inputs.into_iter().map(|v| run_states(app, exec, &proc_def, v, ctx.clone()));
-                                    use futures_util::StreamExt;
-                                    futures_util::stream::iter(runs).buffered(limit).collect::<Vec<_>>().await
-                                        .into_iter().collect::<Result<Vec<_>, _>>().map(Value::Array)
+                                    use futures_util::{StreamExt, TryStreamExt};
+                                    // A failing item stops the Map: remaining items are not started and running ones are dropped.
+                                    futures_util::stream::iter(runs).buffered(limit).try_collect::<Vec<_>>().await.map(Value::Array)
                                 }
                             }
                         }
