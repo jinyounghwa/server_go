@@ -120,7 +120,7 @@ SQS 메시지 속성, Step Functions 동시 실행·실패 중단, ALB 경로·�
    연대기 섬 숫자(SDK 테스트 28/5/4개, 시나리오 21개, GPU 65°C)는 `town.html` 12절에 손으로 적은 값이니 바뀌면 같이 고친다.
 2. ~~EventBridge `cron()`(UTC, L·W·#은 거부)·InputTransformer·InputPath `[0]`~~ 완료(2026-11-22).
 3. ~~Kinesis → Lambda 이벤트 소스 매핑~~ 완료(2026-11-22, `lambda.rs` `poll_kinesis`: 샤드별 순서, 실패 배치는 재시도하며 샤드를 막고 `MaximumRetryAttempts` 뒤 건너뜀).
-4. **DynamoDB 경로 `list[0]`**(`ddb.rs` 168행): 업데이트·조건·프로젝션 식에서 리스트 인덱스.
+4. ~~DynamoDB 경로 `a.b[0]`~~ 완료(2026-11-22): 업데이트(SET 끝 너머는 추가, REMOVE는 원래 인덱스 기준)·조건·프로젝션(중첩 경로 유지).
 5. **Lambda 버전·별칭**(`lambda.rs`): PublishVersion·CreateAlias와 `:alias` 호출.
 6. **IAM 조건 연산자**(`iam.rs` 116행): Numeric*·Date*·IpAddress, ForAnyValue/ForAllValues.
 7. (선택) 배달 정책을 AWS처럼 엄격하게: 대상에 정책이 없으면 거부(`iam.rs` `service_may`). 기존 사용자 흐름이 깨지므로 설정 스위치로만.

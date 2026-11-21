@@ -50,6 +50,18 @@ def test_dynamodb():
                   ExpressionAttributeValues={":p": {"S": "u1"}, ":a": {"N": "1"}, ":b": {"N": "3"}}, ScanIndexForward=False)
     assert [i["sk"]["N"] for i in q["Items"]] == ["3", "2", "1"], q
 
+    # list[index] document paths in update, condition and projection expressions
+    lk = {"pk": {"S": "lists"}, "sk": {"N": "1"}}
+    ddb.put_item(TableName=t, Item={**lk, "tags": {"L": [{"S": "a"}, {"S": "b"}, {"S": "c"}]}, "doc": {"M": {"rows": {"L": [{"M": {"n": {"N": "1"}}}]}}}})
+    ddb.update_item(TableName=t, Key=lk, UpdateExpression="SET tags[0] = :x, doc.rows[0].n = doc.rows[0].n + :one REMOVE tags[2]",
+                    ConditionExpression="tags[1] = :b", ExpressionAttributeValues={":x": {"S": "z"}, ":one": {"N": "1"}, ":b": {"S": "b"}})
+    got = ddb.get_item(TableName=t, Key=lk, ProjectionExpression="tags[1], doc.rows[0].n")["Item"]
+    assert got == {"tags": {"L": [{"S": "b"}]}, "doc": {"M": {"rows": {"L": [{"M": {"n": {"N": "2"}}}]}}}}, got
+    assert ddb.get_item(TableName=t, Key=lk)["Item"]["tags"] == {"L": [{"S": "z"}, {"S": "b"}]}
+    assert code(ddb.update_item, TableName=t, Key=lk, UpdateExpression="SET tags[0] = :x", ConditionExpression="tags[5] = :x",
+                ExpressionAttributeValues={":x": {"S": "z"}}) == "ConditionalCheckFailedException"
+    ddb.delete_item(TableName=t, Key=lk)
+
     # pagination via paginator (Limit + LastEvaluatedKey)
     pages = ddb.get_paginator("query").paginate(TableName=t, KeyConditionExpression="#p = :p",
                                                  ExpressionAttributeNames={"#p": "pk"}, ExpressionAttributeValues={":p": {"S": "u1"}},

@@ -165,7 +165,7 @@ fn tokens(s: &str) -> Vec<String> {
 
 const COND_FNS: &[&str] = &["attribute_exists", "attribute_not_exists", "attribute_type", "begins_with", "contains"];
 
-// ponytail: paths support dotted map access only (no list[index]).
+// Document paths: a.b[0].c, with #names; a list index is kept as a "[n]" segment.
 struct P<'a> {
     t: Vec<String>,
     i: usize,
@@ -201,15 +201,25 @@ impl<'a> P<'a> {
         self.t.get(self.i + 1).is_some_and(|s| s == "(")
     }
     fn path(&self, t: &str) -> Result<Vec<String>, ApiErr> {
-        t.split('.')
-            .map(|p| {
-                if p.starts_with('#') {
-                    self.names.and_then(|m| m.get(p)).and_then(Value::as_str).map(String::from).ok_or_else(|| verr(format!("Expression attribute name {p} is not defined")))
-                } else {
-                    Ok(p.to_string())
-                }
-            })
-            .collect()
+        let mut out = vec![];
+        for part in t.split('.') {
+            let (name, idx) = part.split_at(part.find('[').unwrap_or(part.len()));
+            if name.is_empty() {
+                return Err(verr(format!("Invalid document path: {t}")));
+            }
+            out.push(if name.starts_with('#') {
+                self.names.and_then(|m| m.get(name)).and_then(Value::as_str).map(String::from).ok_or_else(|| verr(format!("Expression attribute name {name} is not defined")))?
+            } else {
+                name.to_string()
+            });
+            let mut rest = idx;
+            while !rest.is_empty() {
+                let close = rest.find(']').filter(|c| rest.starts_with('[') && rest[1..*c].parse::<usize>().is_ok()).ok_or_else(|| verr(format!("Invalid document path: {t}")))?;
+                out.push(rest[..=close].to_string());
+                rest = &rest[close + 1..];
+            }
+        }
+        Ok(out)
     }
     fn opd(&mut self) -> Result<Opd, ApiErr> {
         if self.kw("size") && self.call_next() {
@@ -351,10 +361,33 @@ fn parse_update(expr: &str, req: &Value) -> Result<Vec<Upd>, ApiErr> {
     Ok(out)
 }
 
+fn index(k: &str) -> Option<usize> {
+    k.strip_prefix('[')?.strip_suffix(']')?.parse().ok()
+}
+
 fn get<'a>(item: &'a Item, p: &[String]) -> Option<&'a Value> {
     let mut v = item.get(&p[0])?;
     for k in &p[1..] {
-        v = v.get("M")?.get(k)?;
+        v = match index(k) {
+            Some(i) => v.get("L")?.get(i)?,
+            None => v.get("M")?.get(k)?,
+        };
+    }
+    Some(v)
+}
+
+fn child_mut<'a>(v: &'a mut Value, k: &str) -> Option<&'a mut Value> {
+    match index(k) {
+        Some(i) => v.get_mut("L")?.as_array_mut()?.get_mut(i),
+        None => v.get_mut("M")?.as_object_mut()?.get_mut(k),
+    }
+}
+
+// The container holding the last path segment (None for a top-level attribute or a missing parent).
+fn parent_mut<'a>(item: &'a mut Item, p: &[String]) -> Option<&'a mut Value> {
+    let mut v = item.get_mut(&p[0])?;
+    for k in &p[1..p.len() - 1] {
+        v = child_mut(v, k)?;
     }
     Some(v)
 }
@@ -458,24 +491,46 @@ fn eval_t(t: &T, it: &Item) -> Option<Value> {
     }
 }
 
+// SET a.b[i] = v: past the end of a list appends, as in DynamoDB.
 fn set_path(item: &mut Item, p: &[String], v: Value) -> Result<(), ApiErr> {
-    let mut m = item;
-    for k in &p[..p.len() - 1] {
-        m = m.get_mut(k).and_then(|x| x.get_mut("M")).and_then(Value::as_object_mut).ok_or_else(|| verr("The document path provided in the update expression is invalid for update"))?;
+    if p.len() == 1 {
+        item.insert(p[0].clone(), v);
+        return Ok(());
     }
-    m.insert(p[p.len() - 1].clone(), v);
+    let bad = || verr("The document path provided in the update expression is invalid for update");
+    let parent = parent_mut(item, p).ok_or_else(bad)?;
+    let last = &p[p.len() - 1];
+    match index(last) {
+        Some(i) => {
+            let l = parent.get_mut("L").and_then(Value::as_array_mut).ok_or_else(bad)?;
+            if i < l.len() { l[i] = v } else { l.push(v) }
+        }
+        None => {
+            parent.get_mut("M").and_then(Value::as_object_mut).ok_or_else(bad)?.insert(last.clone(), v);
+        }
+    }
     Ok(())
 }
 
 fn remove_path(item: &mut Item, p: &[String]) {
-    let mut m = item;
-    for k in &p[..p.len() - 1] {
-        match m.get_mut(k).and_then(|x| x.get_mut("M")).and_then(Value::as_object_mut) {
-            Some(x) => m = x,
-            None => return,
+    if p.len() == 1 {
+        item.remove(&p[0]);
+        return;
+    }
+    let Some(parent) = parent_mut(item, p) else { return };
+    let last = &p[p.len() - 1];
+    match index(last) {
+        Some(i) => {
+            if let Some(l) = parent.get_mut("L").and_then(Value::as_array_mut).filter(|l| i < l.len()) {
+                l.remove(i);
+            }
+        }
+        None => {
+            if let Some(m) = parent.get_mut("M").and_then(Value::as_object_mut) {
+                m.remove(last);
+            }
         }
     }
-    m.remove(&p[p.len() - 1]);
 }
 
 // Set union (add) or difference (!add) for SS/NS/BS.
@@ -494,6 +549,7 @@ fn set_op(cur: &Value, v: &Value, add: bool) -> Option<Value> {
 
 fn apply(ups: &[Upd], old: &Item, new: &mut Item) -> Result<(), ApiErr> {
     let bad = || verr("An operand in the update expression has an incorrect data type or refers to a missing attribute");
+    let mut removes = vec![];
     for u in ups {
         match u {
             Upd::Set(p, a, rest) => {
@@ -507,7 +563,7 @@ fn apply(ups: &[Upd], old: &Item, new: &mut Item) -> Result<(), ApiErr> {
                 };
                 set_path(new, p, v)?;
             }
-            Upd::Remove(p) => remove_path(new, p),
+            Upd::Remove(p) => removes.push(p),
             Upd::Add(p, v) => {
                 let nv = match get(old, p) {
                     None => v.clone(),
@@ -529,6 +585,11 @@ fn apply(ups: &[Upd], old: &Item, new: &mut Item) -> Result<(), ApiErr> {
                 }
             }
         }
+    }
+    // REMOVE a[0], a[2] names indexes of the original list: drop higher indexes first.
+    removes.sort_by_key(|p| std::cmp::Reverse(p.last().and_then(|k| index(k))));
+    for p in removes {
+        remove_path(new, p);
     }
     Ok(())
 }
@@ -584,15 +645,37 @@ fn update(t: &mut Table, r: &Value) -> Result<(Option<Item>, Item), ApiErr> {
     Ok((old, new))
 }
 
+// Puts a projected value back under its path: maps keep their keys, list elements are compacted in order.
+// ponytail: two projected paths under the same list element (a[0].x, a[0].y) become two elements.
+fn graft(out: &mut Item, p: &[String], v: Value) {
+    let shell = |k: &String| if index(k).is_some() { json!({"L": []}) } else { json!({"M": {}}) };
+    if p.len() == 1 {
+        out.insert(p[0].clone(), v);
+        return;
+    }
+    let mut cur = out.entry(p[0].clone()).or_insert_with(|| shell(&p[1]));
+    for (n, k) in p[1..].iter().enumerate() {
+        let next = p.get(n + 2);
+        let val = next.map_or_else(|| v.clone(), shell);
+        cur = if index(k).is_some() {
+            let Some(l) = cur.get_mut("L").and_then(Value::as_array_mut) else { return };
+            l.push(val);
+            l.last_mut().unwrap()
+        } else {
+            let Some(m) = cur.get_mut("M").and_then(Value::as_object_mut) else { return };
+            m.entry(k.clone()).or_insert(val)
+        };
+    }
+}
+
 fn project(item: &Item, r: &Value) -> Result<Item, ApiErr> {
     let Some(pe) = r["ProjectionExpression"].as_str() else { return Ok(item.clone()) };
     let p = P::new("", r);
     let mut out = Item::new();
     for part in pe.split(',') {
-        // ponytail: projection keeps whole top-level attributes, not nested sub-paths.
-        let top = p.path(part.trim())?.remove(0);
-        if let Some(v) = item.get(&top) {
-            out.insert(top, v.clone());
+        let path = p.path(part.trim())?;
+        if let Some(v) = get(item, &path) {
+            graft(&mut out, &path, v.clone());
         }
     }
     Ok(out)
@@ -865,5 +948,26 @@ impl Db {
             }
             self.tables.insert(name.into(), Table { desc: t["desc"].clone(), hash: hash.into(), range, items });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_index_paths() {
+        let item: Item = serde_json::from_value(json!({"id": {"S": "1"}, "tags": {"L": [{"S": "a"}, {"S": "b"}, {"S": "c"}]},
+            "m": {"M": {"rows": {"L": [{"M": {"n": {"N": "1"}}}, {"M": {"n": {"N": "2"}}}]}}}})).unwrap();
+        let req = json!({"ExpressionAttributeNames": {"#t": "tags"}, "ExpressionAttributeValues": {":x": {"S": "z"}, ":b": {"S": "b"}, ":two": {"N": "2"}}});
+        assert!(eval(&parse_cond("#t[1] = :b AND m.rows[1].n = :two", &req).unwrap(), &item));
+        assert!(!eval(&parse_cond("attribute_exists(#t[5])", &req).unwrap(), &item));
+        let mut new = item.clone();
+        apply(&parse_update("SET #t[0] = :x, #t[9] = :x, m.rows[0].n = m.rows[0].n + :two REMOVE #t[1], #t[2]", &req).unwrap(), &item, &mut new).unwrap();
+        assert_eq!(new["tags"], json!({"L": [{"S": "z"}, {"S": "z"}]}), "set, append past end, then remove original [1] and [2]");
+        assert_eq!(new["m"]["M"]["rows"]["L"][0], json!({"M": {"n": {"N": "3"}}}));
+        let p = project(&item, &json!({"ProjectionExpression": "tags[2], m.rows[1].n"})).unwrap();
+        assert_eq!(Value::Object(p), json!({"tags": {"L": [{"S": "c"}]}, "m": {"M": {"rows": {"L": [{"M": {"n": {"N": "2"}}}]}}}}));
+        assert!(parse_cond("tags[x] = :b", &req).is_err() && parse_cond("[0] = :b", &req).is_err());
     }
 }
