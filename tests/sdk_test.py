@@ -665,6 +665,23 @@ def test_eventbridge():
     got = sorted(json.loads(m["Body"])["id"] for m in sqs.receive_message(QueueUrl=big, MaxNumberOfMessages=10)["Messages"])
     assert got == [2, 3], got
 
+    # InputTransformer: values from the event into a JSON template (strings inside quotes, raw JSON outside).
+    shaped = sqs.create_queue(QueueName=f"shaped{run}")["QueueUrl"]
+    eb.put_rule(Name="shape", EventBusName=bus, EventPattern=json.dumps({"source": ["shop"]}))
+    eb.put_targets(Rule="shape", EventBusName=bus, Targets=[{"Id": "s", "Arn": arn(shaped), "InputTransformer": {
+        "InputPathsMap": {"id": "$.detail.id", "total": "$.detail.total"},
+        "InputTemplate": '{"text": "order <id> = <total>", "total": <total>, "rule": "<aws.events.rule-name>"}'}}])
+    assert code(eb.put_targets, Rule="shape", EventBusName=bus, Targets=[{"Id": "x", "Arn": arn(shaped), "InputTransformer": {"InputPathsMap": {"a": "detail"}, "InputTemplate": "<a>"}}]) == "ValidationException"
+    eb.put_events(Entries=[{"EventBusName": bus, "Source": "shop", "DetailType": "Order", "Detail": json.dumps({"id": 7, "total": 42})}])
+    body = json.loads(sqs.receive_message(QueueUrl=shaped)["Messages"][0]["Body"])
+    assert body == {"text": "order 7 = 42", "total": 42, "rule": "shape"}, body
+    eb.remove_targets(Rule="shape", EventBusName=bus, Ids=["s"]); eb.delete_rule(Name="shape", EventBusName=bus); sqs.delete_queue(QueueUrl=shaped)
+    # cron(): accepted (UTC, one day field must be "?"), malformed ones rejected.
+    eb.put_rule(Name=f"nightly{run}", ScheduleExpression="cron(0 3 ? * MON-FRI *)")
+    assert eb.describe_rule(Name=f"nightly{run}")["ScheduleExpression"] == "cron(0 3 ? * MON-FRI *)"
+    assert code(eb.put_rule, Name=f"bad{run}", ScheduleExpression="cron(0 3 * * * *)") == "ValidationException"
+    eb.delete_rule(Name=f"nightly{run}")
+
     eb.put_rule(Name=f"every{run}", ScheduleExpression="rate(1 second)")
     eb.put_targets(Rule=f"every{run}", Targets=[{"Id": "t", "Arn": arn(tick)}])
     time.sleep(2.5)

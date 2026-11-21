@@ -84,7 +84,7 @@ Status as of **2026-11-21**: `[x]` completed, `[~]` partially implemented or int
 ### 3. Tier-2 Services
 - [x] API Gateway (HTTP APIs v2, Lambda proxy 2.0, routes & stages)
 - [x] Lambda (local `python*` / `nodejs*` process execution, timeouts, env vars, SQS triggers, CloudWatch Logs)
-- [x] EventBridge (buses, pattern matching rules, `rate()` schedules, targets)
+- [x] EventBridge (buses, pattern matching rules, `rate()`·`cron()` schedules, targets with Input/InputPath/InputTransformer)
 - [x] Step Functions (ASL interpreter with Pass, Task, Choice, Wait, Succeed, Fail, Parallel, Map, Retry/Catch, intrinsics)
 - [x] Cognito (user pools, app clients, auth flows, RS256 JWTs + JWKS endpoint)
 - [x] SES (v1 Query & v2 REST, local GUI mailbox capture)

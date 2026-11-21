@@ -1,7 +1,8 @@
-// EventBridge (JSON 1.1): buses, rules with event patterns or rate() schedules, targets.
-// ponytail: cron() schedules, archives/replay, API destinations and input transformers are not supported.
+// EventBridge (JSON 1.1): buses, rules with event patterns or rate()/cron() schedules (UTC), targets with Input,
+// InputPath or InputTransformer. ponytail: cron L/W/# are rejected; archives/replay and API destinations are not supported.
 use crate::{err, need, ApiErr, ACCOUNT, REGION};
 use serde_json::{json, Value};
+use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub struct Rule {
@@ -78,15 +79,149 @@ fn numeric(arg: &Value, v: Option<f64>) -> bool {
     })
 }
 
-// What a target receives: the event, a constant Input, or a simple $.a.b InputPath.
+// $.a.b[0] style path into the event.
+fn path_get(event: &Value, p: &str) -> Value {
+    p.trim_start_matches('$').split(['.', '[']).filter(|s| !s.is_empty()).fold(event.clone(), |v, k| match k.strip_suffix(']') {
+        Some(i) => i.parse::<usize>().map_or(Value::Null, |i| v[i].clone()),
+        None => v[k].clone(),
+    })
+}
+
+// InputTransformer: <name> placeholders from InputPathsMap (plus aws.events.event / rule-arn / rule-name).
+// Inside a JSON string a placeholder takes the raw text; outside it takes the JSON value.
+fn transform(t: &Value, target: &Value, event: &Value) -> Value {
+    let tpl = t["InputTemplate"].as_str().unwrap_or("");
+    let rule = target["_RuleArn"].as_str().unwrap_or("");
+    let lookup = |k: &str| -> Option<Value> {
+        match k {
+            "aws.events.event" | "aws.events.event.json" => Some(event.clone()),
+            "aws.events.rule-arn" => Some(json!(rule)),
+            "aws.events.rule-name" => Some(json!(rule.rsplit('/').next().unwrap_or(""))),
+            "aws.events.event.ingestion-time" => Some(event["time"].clone()),
+            _ => t["InputPathsMap"][k].as_str().map(|p| path_get(event, p)),
+        }
+    };
+    let (mut out, mut in_str, mut rest) = (String::new(), false, tpl);
+    while let Some(c) = rest.chars().next() {
+        if c == '<' {
+            if let Some(end) = rest.find('>') {
+                if let Some(v) = lookup(&rest[1..end]) {
+                    out += &if in_str {
+                        let raw = v.as_str().map_or_else(|| if v.is_null() { String::new() } else { v.to_string() }, String::from);
+                        let q = json!(raw).to_string();
+                        q[1..q.len() - 1].to_string()
+                    } else {
+                        v.to_string()
+                    };
+                    rest = &rest[end + 1..];
+                    continue;
+                }
+            }
+        }
+        if c == '"' && !out.ends_with('\\') {
+            in_str = !in_str;
+        }
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    serde_json::from_str(&out).unwrap_or(Value::String(out))
+}
+
+// What a target receives: the event, a constant Input, an InputPath, or an InputTransformer result.
 pub fn payload(target: &Value, event: &Value) -> Value {
     if let Some(i) = target["Input"].as_str() {
         return serde_json::from_str(i).unwrap_or(Value::String(i.into()));
     }
     if let Some(p) = target["InputPath"].as_str() {
-        return p.trim_start_matches('$').split('.').filter(|s| !s.is_empty()).fold(event.clone(), |v, k| v[k].clone());
+        return path_get(event, p);
+    }
+    if target["InputTransformer"].is_object() {
+        return transform(&target["InputTransformer"], target, event);
     }
     event.clone()
+}
+
+// One cron field ("*", "?", "5", "1-5", "MON,WED", "0/15", "*/10") as the allowed values in lo..=hi.
+fn cron_field(spec: &str, lo: u32, hi: u32, names: &[&str]) -> Option<Vec<u32>> {
+    let num = |s: &str| -> Option<u32> {
+        let n = names.iter().position(|x| x.eq_ignore_ascii_case(s)).map(|i| i as u32 + lo).or_else(|| s.parse().ok())?;
+        (lo..=hi).contains(&n).then_some(n)
+    };
+    let mut out = vec![];
+    for part in spec.split(',') {
+        let (base, step) = match part.split_once('/') {
+            Some((b, s)) => (b, s.parse::<u32>().ok().filter(|s| *s > 0)?),
+            None => (part, 1),
+        };
+        let (a, b) = match base {
+            "*" | "?" => (lo, hi),
+            _ => match base.split_once('-') {
+                Some((a, b)) => (num(a)?, num(b)?),
+                None => (num(base)?, if part.contains('/') { hi } else { num(base)? }),
+            },
+        };
+        out.extend((a..=b).step_by(step as usize));
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+// cron(minutes hours day-of-month month day-of-week year), UTC; one of the two day fields must be "?".
+struct Cron {
+    min: Vec<u32>,
+    hour: Vec<u32>,
+    dom: Option<Vec<u32>>,
+    month: Vec<u32>,
+    dow: Option<Vec<u32>>,
+    year: Vec<u32>,
+}
+
+fn cron_parse(expr: &str) -> Option<Cron> {
+    let f: Vec<&str> = expr.strip_prefix("cron(")?.strip_suffix(')')?.split_whitespace().collect();
+    if f.len() != 6 || (f[2] == "?") == (f[4] == "?") {
+        return None;
+    }
+    let months = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+    Some(Cron {
+        min: cron_field(f[0], 0, 59, &[])?,
+        hour: cron_field(f[1], 0, 23, &[])?,
+        dom: if f[2] == "?" { None } else { Some(cron_field(f[2], 1, 31, &[])?) },
+        month: cron_field(f[3], 1, 12, &months)?,
+        dow: if f[4] == "?" { None } else { Some(cron_field(f[4], 1, 7, &["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"])?) },
+        year: cron_field(f[5], 1970, 2199, &[])?,
+    })
+}
+
+// First minute strictly after `after` that the cron expression selects (searched up to 5 years ahead).
+fn cron_next(expr: &str, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let c = cron_parse(expr)?;
+    let start = after.with_second(0)?.with_nanosecond(0)? + Duration::minutes(1);
+    let first_day = start.date_naive();
+    for d in 0..(366 * 5) {
+        let day = first_day + Duration::days(d);
+        let dow = day.weekday().num_days_from_sunday() + 1;
+        if !c.year.contains(&(day.year() as u32)) || !c.month.contains(&day.month())
+            || c.dom.as_ref().is_some_and(|v| !v.contains(&day.day())) || c.dow.as_ref().is_some_and(|v| !v.contains(&dow)) {
+            continue;
+        }
+        for h in &c.hour {
+            for m in &c.min {
+                let t = day.and_hms_opt(*h, *m, 0)?.and_utc();
+                if t >= start {
+                    return Some(t);
+                }
+            }
+        }
+    }
+    None
+}
+
+// Seconds until the next run of a rate() or cron() schedule.
+pub fn next_delay(expr: &str) -> Option<std::time::Duration> {
+    if let Some(s) = rate_secs(expr) {
+        return Some(std::time::Duration::from_secs(s));
+    }
+    let now = Utc::now();
+    (cron_next(expr, now)? - now).to_std().ok()
 }
 
 // Seconds between runs for rate(N unit). None for anything else.
@@ -126,10 +261,10 @@ impl Events {
         v
     }
 
-    // (interval seconds, generation) of a rate() rule.
-    pub fn schedule_of(&self, bus: &str, name: &str) -> Option<(u64, u64)> {
+    // (schedule expression, generation) of a scheduled rule.
+    pub fn schedule_of(&self, bus: &str, name: &str) -> Option<(String, u64)> {
         let r = self.rules.get(&(bus.into(), name.into()))?;
-        Some((rate_secs(r.schedule.as_deref()?)?, r.generation))
+        Some((r.schedule.clone()?, r.generation))
     }
 
     // Targets (with rule identity) that a scheduled rule should fire now, if it is still current.
@@ -138,7 +273,8 @@ impl Events {
         if r.generation != generation {
             return None; // replaced or deleted: stop the ticker
         }
-        Some(r.enabled.then(|| (r.targets.clone(), rule_arn(bus, name))))
+        let arn = rule_arn(bus, name);
+        Some(r.enabled.then(|| (r.targets.iter().map(|t| { let mut t = t.clone(); t["_RuleArn"] = json!(arn); t }).collect(), arn.clone())))
     }
 
     // Returns the response plus (target, event) pairs to dispatch.
@@ -173,8 +309,8 @@ impl Events {
                     return Err(err("ValidationException", "Parameter(s) EventPattern or ScheduleExpression must be specified."));
                 }
                 if let Some(s) = &schedule {
-                    if rate_secs(s).is_none() {
-                        return Err(err("ValidationException", format!("Unsupported ScheduleExpression {s} (only rate(...) locally)")));
+                    if rate_secs(s).is_none() && cron_parse(s).is_none() {
+                        return Err(err("ValidationException", "Parameter ScheduleExpression is not valid."));
                     }
                 }
                 self.generation += 1;
@@ -209,6 +345,11 @@ impl Events {
                 let n = need(r, "Rule")?;
                 let rule = self.rules.get_mut(&(bus, n.into())).ok_or_else(|| not_found(n))?;
                 for t in r["Targets"].as_array().into_iter().flatten() {
+                    let it = &t["InputTransformer"];
+                    if !it.is_null() && (it["InputTemplate"].as_str().is_none()
+                        || it["InputPathsMap"].as_object().is_some_and(|m| m.len() > 100 || m.values().any(|p| !p.as_str().is_some_and(|p| p.starts_with('$'))))) {
+                        return Err(err("ValidationException", "InputTransformer needs an InputTemplate and InputPathsMap values that are $ paths (at most 100)."));
+                    }
                     rule.targets.retain(|x| x["Id"] != t["Id"]);
                     rule.targets.push(t.clone());
                 }
@@ -261,7 +402,7 @@ impl Events {
         self.rules
             .iter()
             .map(|((b, n), r)| {
-                let rows: Vec<Value> = r.targets.iter().map(|t| json!([t["Id"], t["Arn"], t["Input"].as_str().or(t["InputPath"].as_str()).unwrap_or("이벤트 전체")])).collect();
+                let rows: Vec<Value> = r.targets.iter().map(|t| json!([t["Id"], t["Arn"], t["Input"].as_str().or(t["InputPath"].as_str()).or(t["InputTransformer"]["InputTemplate"].as_str()).unwrap_or("이벤트 전체")])).collect();
                 let when = r.pattern.as_ref().map_or_else(|| r.schedule.clone().unwrap_or_default(), |p| p.to_string());
                 json!({"name": if b == "default" { n.clone() } else { format!("{b}/{n}") }, "count": rows.len(),
                        "sub": format!("{} · {when}", if r.enabled { "켜짐" } else { "꺼짐" }), "cols": ["대상 ID", "ARN", "입력"], "rows": rows})
@@ -286,5 +427,28 @@ mod tests {
         assert_eq!(rate_secs("rate(5 minutes)"), Some(300));
         assert_eq!(rate_secs("cron(0 12 * * ? *)"), None);
         assert_eq!(payload(&json!({"InputPath": "$.detail.tier"}), &ev), json!("gold"));
+        assert_eq!(payload(&json!({"InputPath": "$.detail.tags[1]"}), &ev), json!("b"));
+        let t = json!({"_RuleArn": "arn:aws:events:us-east-1:000000000000:rule/shop/big", "InputTransformer": {
+            "InputPathsMap": {"tier": "$.detail.tier", "total": "$.detail.total", "tags": "$.detail.tags"},
+            "InputTemplate": "{\"msg\": \"<tier> order of <total>\", \"total\": <total>, \"tags\": <tags>, \"rule\": \"<aws.events.rule-name>\"}"}});
+        assert_eq!(payload(&t, &ev), json!({"msg": "gold order of 120", "total": 120, "tags": ["a", "b"], "rule": "big"}));
+        let plain = json!({"InputTransformer": {"InputPathsMap": {"t": "$.detail.tier"}, "InputTemplate": "\"Tier is <t>\""}});
+        assert_eq!(payload(&plain, &ev), json!("Tier is gold"));
+    }
+
+    #[test]
+    fn cron_schedules() {
+        let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+        let next = |e: &str, s: &str| cron_next(e, at(s)).map(|t| t.to_rfc3339());
+        assert_eq!(next("cron(0 12 * * ? *)", "2026-11-22T11:59:30Z").as_deref(), Some("2026-11-22T12:00:00+00:00"));
+        assert_eq!(next("cron(0 12 * * ? *)", "2026-11-22T12:00:00Z").as_deref(), Some("2026-11-23T12:00:00+00:00"));
+        assert_eq!(next("cron(0/15 * * * ? *)", "2026-11-22T10:07:00Z").as_deref(), Some("2026-11-22T10:15:00+00:00"));
+        // 2026-11-22 is a Sunday: next MON-FRI 09:30 is Monday the 23rd.
+        assert_eq!(next("cron(30 9 ? * MON-FRI *)", "2026-11-22T10:00:00Z").as_deref(), Some("2026-11-23T09:30:00+00:00"));
+        assert_eq!(next("cron(0 0 1 JAN ? 2027)", "2026-11-22T00:00:00Z").as_deref(), Some("2027-01-01T00:00:00+00:00"));
+        assert_eq!(next("cron(0 0 31 2 ? *)", "2026-11-22T00:00:00Z"), None, "Feb 31 never comes");
+        for bad in ["cron(0 12 * * * *)", "cron(0 12 ? * ? *)", "cron(61 * * * ? *)", "cron(0 12 L * ? *)", "cron(0 12 * *)"] {
+            assert!(cron_parse(bad).is_none(), "{bad}");
+        }
     }
 }

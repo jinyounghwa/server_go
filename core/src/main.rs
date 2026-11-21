@@ -728,10 +728,11 @@ fn send_to_target(app: &Arc<App>, rid: &str, arn: &str, payload: Value, from: &s
 
 // Ticker for a rate() rule; it stops when the rule is replaced or deleted.
 fn start_schedule(app: Arc<App>, bus: String, name: String) {
-    let Some((secs, generation)) = app.eb.lock().unwrap().schedule_of(&bus, &name) else { return };
+    let Some((expr, generation)) = app.eb.lock().unwrap().schedule_of(&bus, &name) else { return };
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            let Some(wait) = events::next_delay(&expr) else { return };
+            tokio::time::sleep(wait).await;
             let due = app.eb.lock().unwrap().scheduled(&bus, &name, generation);
             match due {
                 None => return,

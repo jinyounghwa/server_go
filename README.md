@@ -97,7 +97,7 @@ All options can be set via environment variables or a `KEY=VALUE` file pointed t
 | **KMS** | Keys, aliases, Encrypt/Decrypt with encryption context, `GenerateDataKey`, enable/disable, scheduled deletion *(local obfuscation only, not real cryptography)* |
 | **CloudWatch Logs** | Log groups, streams, `PutLogEvents`, `GetLogEvents`, `FilterLogEvents` (plain terms), retention |
 | **Lambda** | `python*` / `nodejs*` functions run as local processes; `Invoke` (sync, Event, DryRun, log tail), timeouts, errors, env vars, execution-role credentials, SQS event source mappings, logs to CloudWatch Logs |
-| **EventBridge** | Buses, rules (event patterns incl. prefix/numeric/exists/anything-but, `rate()` schedules), SQS/SNS/Lambda targets, `Input`/`InputPath` |
+| **EventBridge** | Buses, rules (event patterns incl. prefix/numeric/exists/anything-but, `rate()`/`cron()` schedules in UTC), SQS/SNS/Lambda targets, `Input`/`InputPath`/`InputTransformer` |
 | **Step Functions** | ASL interpreter: Pass, Task (`lambda:invoke`, `sqs:sendMessage`, `sns:publish`, `dynamodb:*`), Choice, Wait, Succeed, Fail, Parallel, Map, Retry/Catch, Parameters/ResultSelector/ResultPath/OutputPath, intrinsics (`Format`, `StringToJson`, `JsonToString`, `Array`, `UUID`, `MathAdd`), execution history, `StopExecution` |
 | **API Gateway (HTTP APIs)** | `apigatewayv2` APIs, Lambda proxy integrations (payload 2.0), routes with `{params}` and `{proxy+}`, stages, quick create; invoke at `/_api/{apiId}/[{stage}/]path` |
 | **Cognito** | User pools, app clients (with secrets), SignUp/Confirm, ForgotPassword, `USER_PASSWORD_AUTH`, refresh tokens, `NEW_PASSWORD_REQUIRED`, admin user APIs, RS256 JWTs with JWKS at `/_cognito/{poolId}/.well-known/jwks.json`; verification codes emit `CodeSent` events |
