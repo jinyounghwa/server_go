@@ -27,5 +27,6 @@ cd core && ENFORCE_IAM=1 cargo run --release        # 127.0.0.1:4566
 - 자체 검사: `POST /_inspect/run {}`(헤더 필수). 실패는 `results[].repro`로 재현.
 
 ## 하지 말 것
-- 상태는 메모리에만 있다. 남기려면 `RC_STATE_FILE`과 `POST /_admin/snapshot/save`.
+- 상태는 기본 인메모리다. 남기려면 `RC_STATE_FILE`+`POST /_admin/snapshot/save` 또는 `RC_SQLITE_FILE`+`POST /_admin/sqlite/save`.
 - 지원하지 않는 API는 `UnknownOperationException`/501로 답한다. 흉내 낸 응답을 기대하지 말 것.
+- **맥 경량화 유지**: 맥에 `core/target`, `tests/rust/target`, `gui/target`, `tests/js/node_modules`를 남겨 두지 않는다. 무거운 빌드·테스트·Docker 검증은 우분투(`ubuntu:~/work/projects/rocalcloud/`, `tools/ubuntu_verify.sh`)에서 실행한다.

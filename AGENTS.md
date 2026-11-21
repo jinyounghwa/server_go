@@ -66,10 +66,13 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
 - 화면 확인은 Playwright + 설치된 Chrome: `uv run --with playwright python script.py` 안에서 `launch(channel="chrome")`.
   사용자의 Chrome 설정(Apple Events JS 등)은 바꾸지 않는다.
 
-## 4. 우분투 원격 PC (사용자 장비, 한도 엄수)
+## 4. 우분투 원격 PC 및 맥 경량화 원칙 (사용자 장비, 한도 엄수)
 
-- `ssh ubuntu` (192.168.0.105). 코드는 맥에서 쓰고 `rsync -az --exclude target core tests ubuntu:~/work/projects/rocalcloud/`.
-- 빌드: `ssh ubuntu 'cd ~/work/projects/rocalcloud/core && nice -n 10 ~/.cargo/bin/cargo build --release -j 8'`.
+- **맥 경량화 원칙 (필수)**: 맥에는 소스 코드만 가볍게 유지한다(~4 MB). `core/target`·`tests/rust/target`·`gui/target`·`tests/js/node_modules` 같은 무거운 빌드 산출물(수 GB)은 맥에 남기지 않고 우분투에서만 빌드·캐시한다. 맥에서 불가피하게 빌드했다면 작업 후 정리한다.
+- `ssh ubuntu` (192.168.0.105). 코드는 맥에서 쓰고 `rsync -az --exclude target --exclude node_modules --exclude __pycache__ core tests tools gui README.md local-cloud-emulator-plan.md AGENTS.md CONTRIBUTING.md SKILL.md Dockerfile ubuntu:~/work/projects/rocalcloud/`.
+- 원클릭 빌드·검증: `ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'` (`nice -n 10`, `-j 8` 한도 준수, 단위 테스트·릴리스 빌드·`sdk_compare`·`partial_fail_check`·`mem_bench`·`db_query`·컨테이너 0개 확인까지 수행).
+- 수동 빌드: `ssh ubuntu 'cd ~/work/projects/rocalcloud/core && nice -n 10 ~/.cargo/bin/cargo build --release -j 8'`.
+- `Cargo.lock`이 우분투에서 갱신되면 `scp ubuntu:~/work/projects/rocalcloud/core/Cargo.lock core/Cargo.lock`으로 맥에 반영해 커밋한다.
 - 사양 한도 문서: 우분투 `~/work/docs/SPEC.md`. **한도를 넘는 작업은 먼저 사용자에게 묻는다.**
   RAM 작업당 8 GiB, CPU 8스레드, 스왑 금지, GPU 80°C 금지, 전력 제한 180 W 변경 금지.
 - 설치됨(사용자 승인): rustup(홈), docker.io(사용자는 docker 그룹), Ollama 0.40.16 + `qwen3.5:9b`.
