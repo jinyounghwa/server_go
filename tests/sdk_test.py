@@ -150,6 +150,21 @@ def test_sqs():
     msgs = sqs.receive_message(QueueUrl=q, MaxNumberOfMessages=10)["Messages"]
     assert [m["Body"] for m in msgs] == ["m0", "m1", "m2"]
     sqs.delete_message_batch(QueueUrl=q, Entries=[{"Id": m["MessageId"], "ReceiptHandle": m["ReceiptHandle"]} for m in msgs])
+
+    # Message attributes: boto3 verifies MD5OfMessageAttributes on send and receive.
+    attrs = {"Kind": {"DataType": "String", "StringValue": "order"}, "Qty": {"DataType": "Number", "StringValue": "42"},
+             "Blob": {"DataType": "Binary", "BinaryValue": b"\x00\x01"}}
+    sqs.send_message(QueueUrl=q, MessageBody="with-attrs", MessageAttributes=attrs)
+    m = sqs.receive_message(QueueUrl=q, MessageAttributeNames=["Kind"])["Messages"][0]
+    assert list(m["MessageAttributes"]) == ["Kind"], m
+    sqs.change_message_visibility(QueueUrl=q, ReceiptHandle=m["ReceiptHandle"], VisibilityTimeout=0)
+    m = sqs.receive_message(QueueUrl=q, MessageAttributeNames=["All"])["Messages"][0]
+    assert m["MessageAttributes"]["Blob"]["BinaryValue"] == b"\x00\x01" and m["MessageAttributes"]["Qty"]["StringValue"] == "42"
+    sqs.delete_message(QueueUrl=q, ReceiptHandle=m["ReceiptHandle"])
+    assert "MessageAttributes" not in sqs.receive_message(QueueUrl=q).get("Messages", [{}])[0]
+    for bad in [{"AWS.x": {"DataType": "String", "StringValue": "v"}}, {"n": {"DataType": "Number", "StringValue": "x"}},
+                {f"k{i}": {"DataType": "String", "StringValue": "v"} for i in range(11)}]:
+        assert code(sqs.send_message, QueueUrl=q, MessageBody="x", MessageAttributes=bad) == "InvalidParameterValue", bad
     time.sleep(1.1)
     a = sqs.get_queue_attributes(QueueUrl=q, AttributeNames=["All"])["Attributes"]
     assert a["ApproximateNumberOfMessages"] == "0", a

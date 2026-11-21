@@ -1,4 +1,5 @@
 use crate::{err, ApiErr, App, ACCOUNT, REGION};
+use base64::Engine;
 use md5::{Digest, Md5};
 use serde_json::{json, Value};
 use std::{
@@ -8,7 +9,8 @@ use std::{
 
 // FIFO: MessageGroupId is required, a group with a message in flight is held back (strict per-group order),
 // and duplicates (MessageDeduplicationId or ContentBasedDeduplication) within 5 minutes return the first MessageId.
-// ponytail: message attributes are not stored; FIFO high-throughput mode and per-message DelaySeconds rules are not emulated.
+// Message attributes are validated (≤10, AWS naming rules, String/Number/Binary types) and returned with the AWS MD5.
+// ponytail: SNS→SQS delivery does not forward attributes; FIFO high-throughput mode and per-message DelaySeconds rules are not emulated.
 const DEDUP_WINDOW: Duration = Duration::from_secs(300);
 
 struct Msg {
@@ -18,6 +20,7 @@ struct Msg {
     id: String,
     body: String,
     md5: String,
+    mattrs: Value,
     visible_at: Instant,
     receipt: Option<String>,
     receives: u64,
@@ -55,6 +58,61 @@ fn str_map(v: &Value) -> BTreeMap<String, String> {
         .map(|m| m.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect())
         .unwrap_or_default()
 }
+fn bad(m: impl Into<String>) -> ApiErr {
+    err("InvalidParameterValue", m.into())
+}
+
+// Validates message attributes and returns (attributes, AWS MD5 of them, bytes they add to the message size).
+fn msg_attrs(v: &Value) -> Result<(Value, Option<String>, usize), ApiErr> {
+    let Some(m) = v.as_object().filter(|m| !m.is_empty()) else { return Ok((json!({}), None, 0)) };
+    if m.len() > 10 {
+        return Err(bad(format!("Number of message attributes [{}] exceeds the allowed maximum [10].", m.len())));
+    }
+    let mut names: Vec<&String> = m.keys().collect();
+    names.sort();
+    let (mut buf, mut size, mut out) = (Vec::new(), 0, serde_json::Map::new());
+    for n in names {
+        let a = &m[n];
+        let low = n.to_ascii_lowercase();
+        let name_ok = !n.is_empty() && n.len() <= 256 && n.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
+            && !n.starts_with('.') && !n.ends_with('.') && !n.contains("..") && !low.starts_with("aws.") && !low.starts_with("amazon.");
+        if !name_ok {
+            return Err(bad(format!("Message attribute name '{n}' is invalid.")));
+        }
+        let t = a["DataType"].as_str().unwrap_or("");
+        let missing = || bad(format!("Message attribute '{n}' must contain a non-empty value of message attribute type '{t}'."));
+        let (kind, val) = match t.split('.').next().unwrap_or("") {
+            "String" | "Number" => (1u8, a["StringValue"].as_str().ok_or_else(missing)?.as_bytes().to_vec()),
+            "Binary" => (2u8, base64::engine::general_purpose::STANDARD.decode(a["BinaryValue"].as_str().ok_or_else(missing)?).map_err(|_| missing())?),
+            _ => return Err(bad(format!("The type of message attribute '{n}' is invalid. You must use only the following supported type prefixes: Binary, Number, String."))),
+        };
+        if val.is_empty() || t.len() > 256 {
+            return Err(missing());
+        }
+        if t.starts_with("Number") && std::str::from_utf8(&val).ok().and_then(|s| s.parse::<f64>().ok()).is_none() {
+            return Err(bad(format!("Can't cast the value of message (user) attribute '{n}' to a number.")));
+        }
+        for part in [n.as_bytes(), t.as_bytes()] {
+            buf.extend((part.len() as u32).to_be_bytes());
+            buf.extend(part);
+        }
+        buf.push(kind);
+        buf.extend((val.len() as u32).to_be_bytes());
+        buf.extend(&val);
+        size += n.len() + t.len() + val.len();
+        let key = if kind == 1 { "StringValue" } else { "BinaryValue" };
+        out.insert(n.clone(), json!({"DataType": t, key: a[key]}));
+    }
+    Ok((Value::Object(out), Some(format!("{:x}", Md5::digest(&buf))), size))
+}
+
+// MessageAttributeNames: "All" / ".*", "prefix.*", or exact names.
+fn pick_attrs(all: &Value, want: &Value) -> Value {
+    let pats: Vec<&str> = want.as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    let keep = |k: &str| pats.iter().any(|p| *p == "All" || *p == ".*" || *p == k || p.strip_suffix(".*").is_some_and(|pre| k.starts_with(&format!("{pre}."))));
+    Value::Object(all.as_object().into_iter().flatten().filter(|(k, _)| keep(k)).map(|(k, v)| (k.clone(), v.clone())).collect())
+}
+
 fn entries(r: &Value) -> impl Iterator<Item = &Value> {
     r["Entries"].as_array().into_iter().flatten()
 }
@@ -76,7 +134,8 @@ pub async fn handle(app: &App, op: &str, body: &[u8], host: &str) -> Result<Valu
 fn send(q: &mut Queue, e: &Value) -> Result<Value, ApiErr> {
     let body = s(e, "MessageBody")?.to_string();
     let max: usize = q.attrs["MaximumMessageSize"].parse().unwrap_or(262144);
-    if body.len() > max {
+    let (mattrs, attr_md5, attr_size) = msg_attrs(&e["MessageAttributes"])?;
+    if body.len() + attr_size > max {
         return Err(err("InvalidParameterValue", format!("Message must be shorter than {max} bytes.")));
     }
     let delay = e["DelaySeconds"].as_u64().unwrap_or_else(|| q.attrs["DelaySeconds"].parse().unwrap_or(0));
@@ -91,7 +150,11 @@ fn send(q: &mut Queue, e: &Value) -> Result<Value, ApiErr> {
         let now = Instant::now();
         q.seen.retain(|_, (t, ..)| now.duration_since(*t) < DEDUP_WINDOW);
         if let Some((_, id, seq)) = q.seen.get(&d) {
-            return Ok(json!({"MessageId": id, "MD5OfMessageBody": format!("{:x}", Md5::digest(body.as_bytes())), "SequenceNumber": seq.to_string()}));
+            let mut dup = json!({"MessageId": id, "MD5OfMessageBody": format!("{:x}", Md5::digest(body.as_bytes())), "SequenceNumber": seq.to_string()});
+            if let Some(a) = &attr_md5 {
+                dup["MD5OfMessageAttributes"] = json!(a);
+            }
+            return Ok(dup);
         }
         (Some(g.to_string()), Some(d))
     } else {
@@ -105,6 +168,7 @@ fn send(q: &mut Queue, e: &Value) -> Result<Value, ApiErr> {
         id: uuid::Uuid::new_v4().to_string(),
         md5: format!("{:x}", Md5::digest(body.as_bytes())),
         body,
+        mattrs,
         visible_at: Instant::now() + Duration::from_secs(delay),
         receipt: None,
         receives: 0,
@@ -112,6 +176,9 @@ fn send(q: &mut Queue, e: &Value) -> Result<Value, ApiErr> {
         first: None,
     };
     let mut out = json!({"MessageId": m.id, "MD5OfMessageBody": m.md5});
+    if let Some(a) = attr_md5 {
+        out["MD5OfMessageAttributes"] = json!(a);
+    }
     if let Some(d) = &m.dedup {
         out["SequenceNumber"] = json!(m.seq.to_string());
         q.seen.insert(d.clone(), (Instant::now(), m.id.clone(), m.seq));
@@ -236,6 +303,11 @@ fn call(qs: &mut Queues, op: &str, r: &Value, host: &str) -> Result<Value, ApiEr
                 m.receipt = Some(rh.clone());
                 let first = *m.first.get_or_insert(now_ms());
                 let mut j = json!({"MessageId": m.id, "ReceiptHandle": rh, "MD5OfBody": m.md5, "Body": m.body});
+                let picked = pick_attrs(&m.mattrs, &r["MessageAttributeNames"]);
+                if let Ok((a, Some(md5), _)) = msg_attrs(&picked) {
+                    j["MessageAttributes"] = a;
+                    j["MD5OfMessageAttributes"] = json!(md5);
+                }
                 if want_attrs {
                     j["Attributes"] = json!({
                         "ApproximateReceiveCount": m.receives.to_string(),
@@ -289,14 +361,27 @@ fn call(qs: &mut Queues, op: &str, r: &Value, host: &str) -> Result<Value, ApiEr
     }
 }
 
+// Lambda's SQS event shape for message attributes.
+fn lambda_attrs(v: &Value) -> Value {
+    Value::Object(v.as_object().into_iter().flatten().map(|(k, a)| {
+        let mut o = json!({"dataType": a["DataType"], "stringListValues": [], "binaryListValues": []});
+        for (from, to) in [("StringValue", "stringValue"), ("BinaryValue", "binaryValue")] {
+            if !a[from].is_null() {
+                o[to] = a[from].clone();
+            }
+        }
+        (k.clone(), o)
+    }).collect())
+}
+
 impl Queues {
     // Delivery from another service (SNS, S3 notifications). False if the queue is gone.
     // Receive for an event source mapping, shaped as Lambda SQS records.
     pub fn receive_batch(&mut self, name: &str, max: u64) -> Vec<Value> {
-        let r = call(self, "ReceiveMessage", &json!({"QueueUrl": name, "MaxNumberOfMessages": max, "AttributeNames": ["All"]}), "local");
+        let r = call(self, "ReceiveMessage", &json!({"QueueUrl": name, "MaxNumberOfMessages": max, "AttributeNames": ["All"], "MessageAttributeNames": ["All"]}), "local");
         r.ok().and_then(|v| v["Messages"].as_array().cloned()).unwrap_or_default().into_iter().map(|m| json!({
             "messageId": m["MessageId"], "receiptHandle": m["ReceiptHandle"], "body": m["Body"], "md5OfBody": m["MD5OfBody"],
-            "attributes": m["Attributes"], "messageAttributes": {}})).collect()
+            "attributes": m["Attributes"], "messageAttributes": lambda_attrs(&m["MessageAttributes"])})).collect()
     }
     pub fn delete_receipt(&mut self, name: &str, receipt: &str) {
         if let Some(q) = self.q.get_mut(name) {
@@ -334,7 +419,7 @@ impl Queues {
         let qs: Vec<Value> = self.q.iter().map(|(n, q)| {
             let msgs: Vec<Value> = q.msgs.iter().map(|m| json!({
                 "id": m.id, "body": m.body, "md5": m.md5, "receives": m.receives, "sent": m.sent as u64,
-                "group": m.group, "dedup": m.dedup, "seq": m.seq,
+                "group": m.group, "dedup": m.dedup, "seq": m.seq, "mattrs": m.mattrs,
             })).collect();
             json!({"name": n, "attrs": q.attrs, "msgs": msgs})
         }).collect();
@@ -356,6 +441,7 @@ impl Queues {
                     seq: m["seq"].as_u64().unwrap_or(i as u64 + 1),
                     id: m["id"].as_str().map(String::from).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     body, md5, visible_at: now, receipt: None,
+                    mattrs: msg_attrs(&m["mattrs"]).map(|(a, ..)| a).unwrap_or_else(|_| json!({})),
                     receives: m["receives"].as_u64().unwrap_or(0),
                     sent: m["sent"].as_u64().map_or_else(now_ms, |x| x as u128),
                     first: None,
@@ -364,5 +450,29 @@ impl Queues {
             let seq = msgs.iter().map(|m| m.seq).max().unwrap_or(0);
             self.q.insert(name.into(), Queue { attrs, msgs, seen: BTreeMap::new(), seq });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const EXPECTED_KIND_ORDER: &str = "9e7e72847e5db084ff08f403da3c182b";
+    #[test]
+    fn message_attribute_md5_and_rules() {
+        // Reference value from the AWS SQS developer guide algorithm, computed independently with Python.
+        let (a, md5, size) = msg_attrs(&json!({"Kind": {"DataType": "String", "StringValue": "order"}})).unwrap();
+        assert_eq!(md5.as_deref(), Some(EXPECTED_KIND_ORDER));
+        assert_eq!(size, 4 + 6 + 5);
+        assert_eq!(a["Kind"]["StringValue"], "order");
+        for bad_name in ["AWS.x", "amazon.y", ".a", "a.", "a..b", "a b", ""] {
+            assert!(msg_attrs(&json!({bad_name: {"DataType": "String", "StringValue": "v"}})).is_err(), "{bad_name}");
+        }
+        assert!(msg_attrs(&json!({"n": {"DataType": "Number", "StringValue": "abc"}})).is_err());
+        assert!(msg_attrs(&json!({"n": {"DataType": "Date", "StringValue": "1"}})).is_err());
+        assert!(msg_attrs(&json!({"n": {"DataType": "String", "StringValue": ""}})).is_err());
+        let eleven: serde_json::Map<String, Value> = (0..11).map(|i| (format!("k{i}"), json!({"DataType": "String", "StringValue": "v"}))).collect();
+        assert!(msg_attrs(&Value::Object(eleven)).is_err());
+        let picked = pick_attrs(&json!({"a.b": 1, "a.c": 2, "ab": 3, "x": 4}), &json!(["a.*", "x"]));
+        assert_eq!(picked, json!({"a.b": 1, "a.c": 2, "x": 4}));
     }
 }

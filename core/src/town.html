@@ -617,7 +617,7 @@ const B = [
   {id: "sqlite",   name: "SQLite 쿼리도서관", sub: "SQL · Snapshots",      district: "데이터 지구", kind: "library",   color: 0x10b981, hex: "#34d399", svc: ["sqlite", "admin"], x: -11, z: -29, roadZ: -20},
 
   // --- NE: Compute & Messaging (z = -10 & -29) ---
-  {id: "sqs",      name: "SQS 중앙우체국",    sub: "Standard · FIFO · DLQ", district: "컴퓨트 지구", kind: "post",      color: 0xc84b31, hex: "#f87171", svc: ["sqs"],            x: 11,  z: -10, roadZ: 0},
+  {id: "sqs",      name: "SQS 중앙우체국",    sub: "FIFO · DLQ · 속성", district: "컴퓨트 지구", kind: "post",      color: 0xc84b31, hex: "#f87171", svc: ["sqs"],            x: 11,  z: -10, roadZ: 0},
   {id: "sns",      name: "SNS 방송송신탑",    sub: "Pub/Sub · Filter",     district: "컴퓨트 지구", kind: "tower",     color: 0x8b5cf6, hex: "#c084fc", svc: ["sns"],            x: 20,  z: -10, roadZ: 0},
   {id: "lambda",   name: "Lambda 공방",       sub: "Python · Node.js",     district: "컴퓨트 지구", kind: "workshop",  color: 0xd97706, hex: "#fbbf24", svc: ["lambda"],         x: 33,  z: -10, roadZ: 0},
   {id: "apigw",    name: "API Gateway 관문",  sub: "HTTP API v2 · Proxy",  district: "컴퓨트 지구", kind: "terminal",  color: 0xec4899, hex: "#f472b6", svc: ["apigateway"],     x: 43,  z: -10, roadZ: 0},
@@ -1922,7 +1922,7 @@ const keyMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, emissive: 0x2dd
 const keyRing = new THREE.Mesh(new THREE.TorusGeometry(2.1, 0.22, 12, 40), keyMat); keyRing.position.set(-60, 4.6, 154); scene.add(keyRing);
 const keyCore = new THREE.Mesh(new THREE.OctahedronGeometry(0.8), keyMat); keyCore.position.copy(keyRing.position); scene.add(keyCore);
 
-landmark("fifo", "SQS FIFO 컨베이어", "MessageGroupId · 중복 제거", "#f87171", -44, 154, "같은 MessageGroupId 메시지는 보낸 순서대로, 같은 중복 제거 ID는 5분 동안 한 번만 전달됩니다. SQS 요청이 오면 벨트가 빨라집니다.", 14, 5, 4, 5.6);
+landmark("fifo", "SQS FIFO 컨베이어", "MessageGroupId · 중복 제거 · 속성", "#f87171", -44, 154, "같은 MessageGroupId 메시지는 보낸 순서대로, 같은 중복 제거 ID는 5분 동안 한 번만 전달됩니다. 메시지 속성(String·Number·Binary, 최대 10개)은 AWS와 같은 MD5로 검증됩니다. SQS 요청이 오면 벨트가 빨라집니다.", 14, 5, 4, 5.6);
 hp("metal", Bx(12, 0.9, 2.4), 0x334155, -44, 1.1, 154);
 for (const sx of [-6.6, 6.6]) hp("matte", Bx(2.2, 3.6, 3), 0xc84b31, -44 + sx, 1.8, 154);
 for (let k = -5; k <= 5; k++) hp("metal", Bx(0.25, 0.9, 0.25), 0x64748b, -44 + k, 0.45, 155.1);
