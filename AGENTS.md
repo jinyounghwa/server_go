@@ -10,6 +10,7 @@
 - 이후 추가: JSON 상태 스냅샷, 3D(Three.js) 캐릭터 마을(본섬 28개 시설 + 다리 건너 다운타운 + 모노레일 건너 "연대기 섬": 계획서 0~10단계 오벨리스크와 SigV4·FIFO·400KB·SDK 경기장·릴리스·Homebrew·Docker·우분투·검사관 훈련장·Pages 포털·/_ui 전광판, `town.html` 12절), GitHub Pages 마을(`pages.yml`). Pages 마을은 방문자 PC의 로컬 에뮬레이터
   (`127.0.0.1:4566`, `?api=`)에 SSE로 붙어 실제 트래픽을 보여 주고, 연결 전에는 목업 트래픽을 돌린다. Pages에서는 자동 연결·재시도를 하지 않고 🔌 연결 버튼을 눌렀을 때만 붙는다(실패한 연결마다 브라우저가 ERR_CONNECTION_REFUSED를 콘솔에 남기기 때문). `/_town`(같은 출처)은 자동 연결.
 - `v0.1.0` 릴리스 완료(2026-11-21): 바이너리 3종 + SHA256SUMS, Homebrew sha256 반영.
+- `v0.1.3` 릴리스 완료(2026-11-21): SNS·Lambda 리소스 정책, ALB 리스너 규칙, aws-chunked 서명 검증. release.yml도 Node 24 액션으로. Homebrew 0.1.3.
 - `v0.1.2` 릴리스 완료(2026-11-21): 버킷·큐 정책, SQS 메시지 속성, Step Functions 동시 실행. Homebrew 0.1.2.
 - `v0.1.1` 릴리스 완료(2026-11-21): SIGTERM·Ctrl-C 뒤 최대 2초 안에 종료(v0.1.0은 열린 연결 때문에 안 끝날 수 있었음). Homebrew 포뮬러 0.1.1 반영.
   macOS 러너는 `macos-latest`를 쓴다(버전 고정 러너 macos-13·14는 폐지됨).
@@ -114,8 +115,7 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
 SQS 메시지 속성·SNS raw 배달 속성 전달, S3 버킷 정책·SQS 큐 정책 평가(`iam.rs` `authorize_with`), 검사 시나리오 21개,
 Step Functions Parallel·Map 동시 실행, 이벤트 `auth.source`와 마을 📜 정책 거부 표시, GUI 정책·메시지 속성 표시.
 
-1. ~~v0.1.2 릴리스~~ 완료(2026-11-21). release.yml은 아직 Node 20 액션(upload/download-artifact v4, action-gh-release v2)을 쓴다.
-   최신은 upload v7·download v8·gh-release v3. 태그로만 돌아 미리 검증할 수 없으니 다음 릴리스 때 올리고 결과를 확인한다.
+1. ~~v0.1.2·v0.1.3 릴리스~~ 완료(2026-11-21). release.yml 액션도 최신(Node 24)으로 바꿔 v0.1.3에서 통과 확인.
 2. ~~SNS 토픽 정책·Lambda 함수 정책~~(완료). IAM 액션 이름도 `lambda:InvokeFunction`으로 맞췄다(전에는 `lambda:Invoke`).
 3. ~~Step Functions Parallel·Map 실패 시 나머지 중단~~(완료).
 4. ~~ALB 경로·호스트 규칙~~(완료) → ~~aws-chunked 조각 서명 검증~~(완료). 각각 sdk_test.py에 정상·오류 경로 테스트를 같이 넣는다.
