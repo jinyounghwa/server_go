@@ -1,6 +1,6 @@
 // SigV4 signing and (optional, VERIFY_SIGV4=1) verification. HMAC-SHA256 is built on sha2.
-// ponytail: aws-chunked bodies are trusted by their declared x-amz-content-sha256 (chunk signatures are not checked),
-// and SigV4a / clock-skew limits are not checked.
+// Signed aws-chunked bodies (STREAMING-AWS4-HMAC-SHA256-PAYLOAD) have every chunk signature checked, and a hex
+// x-amz-content-sha256 must match the body. ponytail: trailer signatures, SigV4a and clock-skew limits are not checked.
 use axum::http::{HeaderMap, Method, Uri};
 use sha2::{Digest, Sha256};
 
@@ -54,6 +54,31 @@ fn canonical_query(q: &str) -> String {
 fn canonical_uri(path: &str, service: &str) -> String {
     let p = if path.is_empty() { "/" } else { path };
     if service == "s3" { p.to_string() } else { enc(p, true) }
+}
+
+fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
+    [date, region, service, "aws4_request"].iter().fold(format!("AWS4{secret}").into_bytes(), |k, p| hmac(&k, p.as_bytes()).to_vec())
+}
+
+// Walks "size;chunk-signature=sig\r\ndata\r\n" chunks, each signed over the previous signature, up to the final 0-size chunk.
+fn verify_chunks(body: &[u8], seed: &str, key: &[u8], amz_date: &str, scope: &str) -> Result<(), String> {
+    let (mut rest, mut prev, empty) = (body, seed.to_string(), sha256_hex(b""));
+    loop {
+        let nl = rest.windows(2).position(|w| w == b"\r\n").ok_or("chunk header is missing")?;
+        let line = std::str::from_utf8(&rest[..nl]).map_err(|_| "chunk header is not text")?;
+        let (size, sig) = line.split_once(";chunk-signature=").ok_or("chunk signature is missing")?;
+        let n = usize::from_str_radix(size.trim(), 16).map_err(|_| "chunk size is invalid")?;
+        let data = rest.get(nl + 2..nl + 2 + n).ok_or("chunk is shorter than its declared size")?;
+        let sts = format!("AWS4-HMAC-SHA256-PAYLOAD\n{amz_date}\n{scope}\n{prev}\n{empty}\n{}", sha256_hex(data));
+        if hex(&hmac(key, sts.as_bytes())) != sig.trim() {
+            return Err("chunk signature does not match".into());
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        prev = sig.trim().to_string();
+        rest = rest.get(nl + 2 + n + 2..).ok_or("chunk is not terminated")?;
+    }
 }
 
 pub fn signature(secret: &str, date: &str, region: &str, service: &str, amz_date: &str, creq: &str) -> String {
@@ -110,6 +135,13 @@ pub fn verify(method: &Method, uri: &Uri, h: &HeaderMap, body: &[u8], secret_of:
     if signature(&secret, parts[1], parts[2], parts[3], &amz_date, &creq) != sig {
         return Err(("SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided.".into()));
     }
+    if payload.starts_with("STREAMING-AWS4-HMAC-SHA256-PAYLOAD") {
+        let scope = format!("{}/{}/{}/aws4_request", parts[1], parts[2], parts[3]);
+        verify_chunks(body, &sig, &signing_key(&secret, parts[1], parts[2], parts[3]), &amz_date, &scope)
+            .map_err(|m| ("SignatureDoesNotMatch", format!("aws-chunked body rejected: {m}")))?;
+    } else if payload.len() == 64 && payload.bytes().all(|b| b.is_ascii_hexdigit()) && !payload.eq_ignore_ascii_case(&sha256_hex(body)) {
+        return Err(("XAmzContentSHA256Mismatch", "The provided 'x-amz-content-sha256' header does not match what was computed.".into()));
+    }
     Ok(())
 }
 
@@ -136,6 +168,26 @@ pub fn sign(method: &str, path_query: &str, host: &str, extra: &[(&str, &str)], 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aws_chunked_example_and_tamper() {
+        let key = signing_key("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "20130524", "us-east-1", "s3");
+        let (d, sc) = ("20130524T000000Z", "20130524/us-east-1/s3/aws4_request");
+        let seed = "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9";
+        let mut body = Vec::new();
+        for (n, sig) in [(65536, "ad80c730a21e5b8d04586a2213dd63b9a0e99e0e2307b0ade35a65485a288648"),
+                         (1024, "0055627c9e194cb4542bae2aa5492e3c1575bbb81b612b7d234b86a503ef5497"),
+                         (0, "b6c6ea8a5354eaf15b3cb7646744f4275b71ea724fed81ceb9323e279d449df9")] {
+            body.extend(format!("{n:x};chunk-signature={sig}\r\n").into_bytes());
+            body.extend(vec![b'a'; n]);
+            body.extend(b"\r\n");
+        }
+        assert!(verify_chunks(&body, seed, &key, d, sc).is_ok());
+        let mut bad = body.clone();
+        bad[200] = b'b';
+        assert!(verify_chunks(&bad, seed, &key, d, sc).is_err());
+        assert!(verify_chunks(&body[..body.len() - 120], seed, &key, d, sc).is_err(), "truncated body");
+    }
 
     // AWS SigV4 test suite "get-vanilla".
     #[test]
