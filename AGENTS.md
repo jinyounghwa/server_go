@@ -123,12 +123,13 @@ Step Functions Parallel·Map 동시 실행, 이벤트 `auth.source`와 마을 �
    WebGL 2가 없으면 안내 문구, 느리면 GTAO → 해상도 → 그림자·블룸 → 해상도 0.6 → 반사 바다·후처리 순으로 끈다(GPU 없는 소프트웨어 렌더링 3→7fps).
    남은 점검: 실제 휴대폰·실제 Safari(이번은 에뮬레이션), 실기기 GPU가 약한 노트북. 연대기 섬 숫자(SDK 테스트 28/5/4개, 시나리오 21개, GPU 65°C)는
    `town.html` 12절에 손으로 적은 값이다(검사관 훈련장 기둥 수는 `RANGE_CAT` 길이를 따른다).
-6. (선택) `?api=`로 IPv6 `[::1]`: CSP가 IPv6 리터럴을 못 받으므로 요청이 있을 때만.
+6. ~~(2026-11-22) ALB 요청별 규칙, aws-chunked 트레일러 서명, 서비스 주체 배달 정책 판정~~ 완료.
+7. (선택) `?api=`로 IPv6 `[::1]`: CSP가 IPv6 리터럴을 못 받으므로 요청이 있을 때만.
 
 큰 변경 뒤에는 4절 방법으로 우분투 전체 검증을 돌린다.
 
 ## 8. 알려진 한계 (요약)
 상태는 기본 인메모리(JSON 스냅샷 `RC_STATE_FILE` 또는 SQLite `RC_SQLITE_FILE`로 영속 저장 가능), SigV4 서명은 `VERIFY_SIGV4=1`일 때만 검증(SigV2 거부,
-aws-chunked 조각 서명·트레일러 서명 검증, 트레일러 체크섬 값 자체는 다시 계산하지 않음), 리소스 기반 정책은 S3 버킷·SQS 큐·SNS 토픽·Lambda 함수(AddPermission)를 평가하지만 서비스 주체(sns.amazonaws.com 등)의 내부 호출은 정책으로 막지 않음, KMS는 진짜 암호 아님,
+aws-chunked 조각 서명·트레일러 서명 검증, 트레일러 체크섬 값 자체는 다시 계산하지 않음), 리소스 기반 정책은 S3 버킷·SQS 큐·SNS 토픽·Lambda 함수(AddPermission)를 평가, SNS·EventBridge·S3의 배달도 `ENFORCE_IAM=1`이면 대상 정책을 서비스 주체(`sns.amazonaws.com` 등)와 `aws:SourceArn`으로 판정(대상에 정책이 없으면 허용, AWS는 거부), KMS는 진짜 암호 아님,
 ALB 리스너 규칙(path-pattern·host-header)은 요청마다 고르되 규칙이 있는 리스너는 `Connection: close`로 요청당 연결 하나, Query 프로토콜 구버전 SQS 미지원,
 ECS 태스크가 에뮬레이터를 부르려면 `BIND=0.0.0.0:4566` 필요. 세부는 각 파일의 `ponytail:` 주석.

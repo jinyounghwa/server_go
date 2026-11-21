@@ -1027,6 +1027,29 @@ def test_ecs_alb():
     assert "rocalcloud-ecs" not in left, left
 
 
+def test_service_principal_policy():
+    """SNS delivery to SQS is checked against the queue policy as sns.amazonaws.com, with aws:SourceArn."""
+    sns = boto3.client("sns", **kw)
+    t = sns.create_topic(Name=f"gate{run}")["TopicArn"]
+    other = sns.create_topic(Name=f"gate2{run}")["TopicArn"]
+    u = sqs.create_queue(QueueName=f"gate{run}")["QueueUrl"]
+    qa = sqs.get_queue_attributes(QueueUrl=u, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    for topic in (t, other):
+        sns.subscribe(TopicArn=topic, Protocol="sqs", Endpoint=qa, Attributes={"RawMessageDelivery": "true"})
+    pol = lambda effect: json.dumps({"Statement": [{"Effect": effect, "Principal": {"Service": "sns.amazonaws.com"}, "Action": "sqs:SendMessage",
+                                                    "Resource": qa, "Condition": {"ArnEquals": {"aws:SourceArn": t}}}]})
+    recv = lambda: [m["Body"] for m in sqs.receive_message(QueueUrl=u, MaxNumberOfMessages=10).get("Messages", [])]
+    sns.publish(TopicArn=t, Message="open")  # no queue policy: accepted (lenient)
+    assert recv() == ["open"]
+    sqs.set_queue_attributes(QueueUrl=u, Attributes={"Policy": pol("Allow")})
+    sns.publish(TopicArn=t, Message="allowed"); sns.publish(TopicArn=other, Message="wrong source")
+    assert recv() == ["allowed"]
+    sqs.set_queue_attributes(QueueUrl=u, Attributes={"Policy": pol("Deny")})
+    sns.publish(TopicArn=t, Message="denied")
+    assert recv() == []
+    sqs.delete_queue(QueueUrl=u); sns.delete_topic(TopicArn=t); sns.delete_topic(TopicArn=other)
+
+
 def test_alb_rules():
     """Listener rules route by path and Host to different target groups (real local HTTP servers as targets)."""
     import http.server, socket, threading, urllib.request

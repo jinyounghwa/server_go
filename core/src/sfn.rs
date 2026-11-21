@@ -243,7 +243,7 @@ async fn task(app: &Arc<App>, resource: &str, p: Value) -> Result<Value, Fail> {
             Ok(json!({"MessageId": uuid::Uuid::new_v4().to_string()}))
         }
         "sns:publish" => {
-            crate::send_to_target(app, "states", p["TopicArn"].as_str().unwrap_or(""), Value::String(text(&p["Message"])), "states");
+            crate::send_to_target(app, "states", p["TopicArn"].as_str().unwrap_or(""), Value::String(text(&p["Message"])), "states", "");
             Ok(json!({"MessageId": uuid::Uuid::new_v4().to_string()}))
         }
         s if s.starts_with("dynamodb:") => {

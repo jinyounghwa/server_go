@@ -559,7 +559,7 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
             let r = serde_json::from_slice::<Value>(&body).map_err(|e| err("SerializationException", e.to_string())).and_then(|j| {
                 let (v, sends) = app.eb.lock().unwrap().handle(&op, &j)?;
                 for (t, payload) in sends {
-                    send_to_target(&app, &rid, t["Arn"].as_str().unwrap_or(""), payload, "events");
+                    send_to_target(&app, &rid, t["Arn"].as_str().unwrap_or(""), payload, "events", t["_RuleArn"].as_str().unwrap_or(""));
                 }
                 if op == "PutRule" {
                     start_schedule(app.clone(), events::bus_of(&j), j["Name"].as_str().unwrap_or("").into());
@@ -608,8 +608,9 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
         (Svc::Sns(q), None) => {
             let r = app.sns.lock().unwrap().handle(&q);
             let r = r.map(|(v, deliveries)| {
+                let topic = q.get("TopicArn").cloned().unwrap_or_default();
                 for d in deliveries {
-                    deliver(&app, &rid, &d, "sns");
+                    deliver(&app, &rid, &d, "sns", &topic);
                 }
                 v
             });
@@ -674,15 +675,39 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
 
 // Deliver an S3 bucket notification to SQS, SNS or Lambda.
 fn s3_note(app: &Arc<App>, rid: &str, n: s3::Note) {
-    send_to_target(app, rid, &n.target, serde_json::from_str(&n.body).unwrap_or_default(), "s3");
+    let body: Value = serde_json::from_str(&n.body).unwrap_or_default();
+    let bucket = body["Records"][0]["s3"]["bucket"]["arn"].as_str().unwrap_or("").to_string();
+    send_to_target(app, rid, &n.target, body, "s3", &bucket);
 }
 
-// Send a payload to an SQS queue, SNS topic or Lambda function by ARN.
-fn send_to_target(app: &Arc<App>, rid: &str, arn: &str, payload: Value, from: &str) {
+// With ENFORCE_IAM=1, a delivery from SNS, EventBridge or S3 must pass the target's resource policy (queue, function
+// or topic policy) as that service's principal. Step Functions and others act with identity and are not gated here.
+fn service_gate(app: &Arc<App>, rid: &str, from: &str, target: &str, src: &str) -> bool {
+    if !*ENFORCE || !matches!(from, "sns" | "events" | "s3") {
+        return true;
+    }
+    let (kind, action, doc) = if target.starts_with("arn:aws:lambda:") {
+        ("function policy", "lambda:InvokeFunction", app.lambda.lock().unwrap().policy(&lambda::name_of(target)))
+    } else if target.starts_with("arn:aws:sns:") {
+        ("topic policy", "sns:Publish", app.sns.lock().unwrap().policy(target))
+    } else {
+        ("queue policy", "sqs:SendMessage", app.sqs.lock().unwrap().policy(target.rsplit(':').next().unwrap_or("")))
+    };
+    let Err(reason) = iam::service_may(doc.as_ref(), &format!("{from}.amazonaws.com"), action, target, src) else { return true };
+    emit(app, json!({"ts": chrono::Utc::now().to_rfc3339(), "request_id": rid, "service": from, "op": "Deliver", "target": target, "status": 403,
+                     "auth": {"decision": "explicitDeny", "reason": reason, "enforced": true, "source": kind}}));
+    false
+}
+
+// Send a payload to an SQS queue, SNS topic or Lambda function by ARN. `src` is the sender's ARN (rule, bucket, topic).
+fn send_to_target(app: &Arc<App>, rid: &str, arn: &str, payload: Value, from: &str, src: &str) {
     let text = match &payload {
         Value::String(s) => s.clone(),
         v => v.to_string(),
     };
+    if !arn.starts_with("arn:aws:sqs:") && !service_gate(app, rid, from, arn, src) {
+        return;
+    }
     if arn.starts_with("arn:aws:lambda:") {
         let (app, name, from) = (app.clone(), lambda::name_of(arn), from.to_string());
         tokio::spawn(async move { lambda::invoke_logged(&app, &name, payload, &from).await });
@@ -694,10 +719,10 @@ fn send_to_target(app: &Arc<App>, rid: &str, arn: &str, payload: Value, from: &s
         }
         let r = app.sns.lock().unwrap().handle(&q);
         for d in r.map(|(_, ds)| ds).unwrap_or_default() {
-            deliver(app, rid, &d, "sns");
+            deliver(app, rid, &d, "sns", arn);
         }
     } else {
-        deliver(app, rid, &sns::Delivery { protocol: "sqs".into(), endpoint: arn.into(), body: text, attrs: Value::Null }, from);
+        deliver(app, rid, &sns::Delivery { protocol: "sqs".into(), endpoint: arn.into(), body: text, attrs: Value::Null }, from, src);
     }
 }
 
@@ -714,7 +739,7 @@ fn start_schedule(app: Arc<App>, bus: String, name: String) {
                 Some(Some((targets, rule_arn))) => {
                     let ev = events::envelope("aws.events", "Scheduled Event", json!({}), json!([rule_arn]));
                     for t in targets {
-                        send_to_target(&app, "schedule", t["Arn"].as_str().unwrap_or(""), events::payload(&t, &ev), "events");
+                        send_to_target(&app, "schedule", t["Arn"].as_str().unwrap_or(""), events::payload(&t, &ev), "events", &rule_arn);
                     }
                 }
             }
@@ -723,7 +748,10 @@ fn start_schedule(app: Arc<App>, bus: String, name: String) {
 }
 
 // Push a message to its subscriber and report it as its own event.
-fn deliver(app: &Arc<App>, rid: &str, d: &sns::Delivery, from: &str) {
+fn deliver(app: &Arc<App>, rid: &str, d: &sns::Delivery, from: &str, src: &str) {
+    if matches!(d.protocol.as_str(), "sqs" | "lambda") && !service_gate(app, rid, from, &d.endpoint, src) {
+        return;
+    }
     let ok = match d.protocol.as_str() {
         "sqs" => app.sqs.lock().unwrap().deliver(d.endpoint.rsplit(':').next().unwrap_or(""), d.body.clone(), &d.attrs),
         "lambda" => {

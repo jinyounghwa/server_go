@@ -237,9 +237,14 @@ impl Events {
                         continue;
                     };
                     let ev = envelope(src, dt, detail, e["Resources"].clone().as_array().map_or(json!([]), |a| json!(a)));
-                    for ((rb, _), rule) in &self.rules {
+                    for ((rb, rn), rule) in &self.rules {
                         if *rb == b && rule.enabled && rule.pattern.as_ref().is_some_and(|p| matches(p, &ev)) {
-                            out.extend(rule.targets.iter().map(|t| (t.clone(), payload(t, &ev))));
+                            out.extend(rule.targets.iter().map(|t| {
+                                let mut t = t.clone();
+                                t["_RuleArn"] = json!(rule_arn(&b, rn));
+                                let p = payload(&t, &ev);
+                                (t, p)
+                            }));
                         }
                     }
                     self.sent += 1;
