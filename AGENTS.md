@@ -1,4 +1,4 @@
-# rocalcloud — 인수인계 지침 (2026-11-21)
+# rocalcloud — 인수인계 지침 (2026-11-22)
 
 다음 작업자(모델)가 바로 이어서 코딩할 수 있도록 현재 상태, 규칙, 남은 일을 정리한 문서다.
 계획 원본은 `local-cloud-emulator-plan.md`. 이 문서와 충돌하면 계획서가 목표, 이 문서가 현재 사실이다.
@@ -111,22 +111,22 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
   `VERIFY_SIGV4=1`이면 서명 없는 요청도 루트로 서명한다. 서명 없이 보내야 하는 검사는 `x-rc-unsigned` 헤더를 단다.
 - 새 시나리오: `sc_x()` 함수 → `run_inner()`의 `plan` 목록과 `match id`에 추가 → `make_result()`로 결과.
 
-## 7. 다음에 할 일 (2026-11-21 저녁 기준, 우선순위 순)
-계획서 4장 체크리스트는 전부 완료. 2026-11-21에 끝낸 것: v0.1.1 릴리스, 우분투 전체 검증 통과, CI 액션 Node 20 탈출,
-SQS 메시지 속성·SNS raw 배달 속성 전달, S3 버킷 정책·SQS 큐 정책 평가(`iam.rs` `authorize_with`), 검사 시나리오 21개,
-Step Functions Parallel·Map 동시 실행, 이벤트 `auth.source`와 마을 📜 정책 거부 표시, GUI 정책·메시지 속성 표시.
+## 7. 다음에 할 일 (2026-11-22 기준, 우선순위 순)
+계획서 4장 체크리스트는 전부 완료, 최신 릴리스는 `v0.1.4`(Homebrew 반영). 지난 할 일 목록(v0.1.1~v0.1.4 릴리스, 버킷·큐·토픽·함수 정책,
+SQS 메시지 속성, Step Functions 동시 실행·실패 중단, ALB 경로·호스트 규칙(요청별), aws-chunked 조각·트레일러 서명, 서비스 주체 배달 정책,
+3D 마을 브라우저·휴대폰 점검)은 모두 끝났다. 남은 한계는 각 파일의 `ponytail:` 주석(`grep -rn ponytail core/src`)이 목록이다.
 
-1. ~~v0.1.2·v0.1.3 릴리스~~ 완료(2026-11-21). release.yml 액션도 최신(Node 24)으로 바꿔 v0.1.3에서 통과 확인.
-2. ~~SNS 토픽 정책·Lambda 함수 정책~~(완료). IAM 액션 이름도 `lambda:InvokeFunction`으로 맞췄다(전에는 `lambda:Invoke`).
-3. ~~Step Functions Parallel·Map 실패 시 나머지 중단~~(완료).
-4. ~~ALB 경로·호스트 규칙~~(완료) → ~~aws-chunked 조각 서명 검증~~(완료). 각각 sdk_test.py에 정상·오류 경로 테스트를 같이 넣는다.
-5. ~~3D 마을 점검~~(2026-11-21, 우분투 Playwright: Chromium·Firefox·WebKit·iPhone 13·Pixel 7). 휴대폰은 피드를 접고 라벨을 숨긴 채 시작,
-   WebGL 2가 없으면 안내 문구, 느리면 GTAO → 해상도 → 그림자·블룸 → 해상도 0.6 → 반사 바다·후처리 순으로 끈다(GPU 없는 소프트웨어 렌더링 3→7fps).
-   남은 점검: 실제 휴대폰·실제 Safari(이번은 에뮬레이션), 실기기 GPU가 약한 노트북. 연대기 섬 숫자(SDK 테스트 28/5/4개, 시나리오 21개, GPU 65°C)는
-   `town.html` 12절에 손으로 적은 값이다(검사관 훈련장 기둥 수는 `RANGE_CAT` 길이를 따른다).
-6. ~~(2026-11-22) ALB 요청별 규칙, aws-chunked 트레일러 서명, 서비스 주체 배달 정책 판정~~ 완료.
-7. (선택) `?api=`로 IPv6 `[::1]`: CSP가 IPv6 리터럴을 못 받으므로 요청이 있을 때만.
+1. **실기기 점검**(사용자 도움 필요): 실제 휴대폰·실제 Safari·GPU가 약한 노트북에서 Pages 마을을 연다. 지금까지는 우분투 Playwright 에뮬레이션만 했다.
+   연대기 섬 숫자(SDK 테스트 28/5/4개, 시나리오 21개, GPU 65°C)는 `town.html` 12절에 손으로 적은 값이니 바뀌면 같이 고친다.
+2. **EventBridge 보강**(`events.rs` ponytail): `cron()` 스케줄과 InputTransformer. 실제 코드에서 자주 쓰는데 지금은 `rate()`·Input·InputPath만 된다.
+3. **Kinesis → Lambda 이벤트 소스 매핑**(`kinesis.rs`): SQS 매핑(`lambda.rs`)과 같은 방식으로 붙인다.
+4. **DynamoDB 경로 `list[0]`**(`ddb.rs` 168행): 업데이트·조건·프로젝션 식에서 리스트 인덱스.
+5. **Lambda 버전·별칭**(`lambda.rs`): PublishVersion·CreateAlias와 `:alias` 호출.
+6. **IAM 조건 연산자**(`iam.rs` 116행): Numeric*·Date*·IpAddress, ForAnyValue/ForAllValues.
+7. (선택) 배달 정책을 AWS처럼 엄격하게: 대상에 정책이 없으면 거부(`iam.rs` `service_may`). 기존 사용자 흐름이 깨지므로 설정 스위치로만.
+8. (선택) `?api=`로 IPv6 `[::1]`: CSP가 IPv6 리터럴을 못 받으므로 요청이 있을 때만.
 
+각 항목은 sdk_test.py에 정상·오류 경로 테스트를 같이 넣고, 끝나면 마을(`town.html`)·GUI·문서를 같이 갱신한다.
 큰 변경 뒤에는 4절 방법으로 우분투 전체 검증을 돌린다.
 
 ## 8. 알려진 한계 (요약)

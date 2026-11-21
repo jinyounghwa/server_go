@@ -347,7 +347,7 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
                 (200, config(&name, f))
             }
             // Resource-based policy: statements are evaluated for IAM-signed calls (see iam::authorize_with).
-            // ponytail: service principals (sns.amazonaws.com …) are stored but internal triggers are not authorized by them.
+            // Service principals (sns.amazonaws.com …) gate SNS/EventBridge/S3 triggers with ENFORCE_IAM=1 (main.rs service_gate).
             "AddPermission" => {
                 let f = st.f.get_mut(&name).ok_or_else(|| not_found(&name))?;
                 let sid = crate::need(&j, "StatementId")?;

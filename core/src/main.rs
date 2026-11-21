@@ -96,7 +96,7 @@ pub fn unb64(s: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(s).ok()
 }
 
-// ponytail: in-memory state only; SQLite + snapshots come with the persistence sprint.
+// State is in memory; RC_STATE_FILE (JSON snapshot) or RC_SQLITE_FILE persists it.
 pub struct App {
     pub ddb: Mutex<ddb::Db>,
     pub s3: Mutex<s3::Store>,
@@ -148,7 +148,7 @@ fn json_reply(prefix: &str, r: Result<Value, ApiErr>) -> Response {
 }
 
 // Access key id and service name from SigV4 (header or presigned query).
-// ponytail: signatures are parsed, not verified.
+// Only parsing here; VERIFY_SIGV4=1 checks the signature in sigv4::verify.
 fn sigv4(h: &HeaderMap, uri: &Uri) -> (String, String) {
     let cred = h
         .get("authorization")
