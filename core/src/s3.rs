@@ -552,7 +552,7 @@ impl Store {
     pub fn admin(&self) -> serde_json::Value {
         self.buckets
             .iter()
-            .map(|(n, b)| serde_json::json!({"name": n, "count": b.objs.len(),
+            .map(|(n, b)| serde_json::json!({"name": n, "count": b.objs.len(), "policy": b.policy,
                 "objects": b.objs.iter().take(100).map(|(k, o)| serde_json::json!({"key": k, "size": o.data.len(), "type": o.ctype, "modified": iso(&o.modified)})).collect::<Vec<_>>()}))
             .collect()
     }

@@ -20,6 +20,8 @@
 body { margin: 0; height: 100vh; display: grid; grid-template-rows: 44px 1fr 38%; background: var(--bg); color: var(--text); }
 header { display: flex; align-items: center; gap: 14px; padding: 0 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
 header b { font-size: 14px; letter-spacing: .02em; }
+header > * { white-space: nowrap; flex-shrink: 0; }
+header { overflow-x: auto; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); display: inline-block; margin-right: 6px; }
 .dot.on { background: var(--ok); }
 .spacer { flex: 1; }
@@ -146,6 +148,8 @@ function renderNav() {
     + sec("iamuser", "IAM 사용자") + sec("iamrole", "IAM 역할") + sec("vpc", "VPC");
 }
 
+// Resource policy (bucket/queue), shown escaped; IAM evaluates it together with identity policies.
+const policyBlock = (title, p) => `<h4>${title}</h4>` + (p ? `<pre>${esc(JSON.stringify(p, null, 2))}</pre>` : `<div class="muted">없음 — 신원 기반 정책만 적용됩니다</div>`);
 function table(cols, rows) {
   if (!rows.length) return `<div class="hint">비어 있습니다.</div>`;
   return `<table><thead><tr>${cols.map(c => `<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>` +
@@ -163,7 +167,7 @@ function renderDetail() {
     r.items.forEach(i => Object.keys(i).forEach(k => cols.includes(k) || cols.push(k)));
     body = `<div class="sub">키: ${esc(r.keys.join(", "))} · 항목 ${r.count}개${more}</div>` + table(cols, r.items.map(i => cols.map(c => av(i[c]))));
   } else if (sel.svc === "s3") {
-    body = `<div class="sub">객체 ${r.count}개${more}</div>` + table(["키", "크기", "타입", "수정 시각"], r.objects.map(o => [o.key, o.size, o.type, o.modified]));
+    body = `<div class="sub">객체 ${r.count}개${more}</div>` + table(["키", "크기", "타입", "수정 시각"], r.objects.map(o => [o.key, o.size, o.type, o.modified])) + policyBlock("버킷 정책", r.policy);
   } else if (r.cols) {
     body = (r.sub ? `<div class="sub">${esc(r.sub)}</div>` : "") + table(r.cols, r.rows);
   } else if (sel.svc === "iamuser" || sel.svc === "iamrole") {
@@ -188,7 +192,7 @@ function renderDetail() {
       + `<h4>보안 그룹</h4>` + table(["ID", "이름", "인바운드", "아웃바운드"], r.security_groups.map(g => [g.id, g.name, g.ingress.join("\n") || "없음", g.egress.join("\n") || "없음"]))
       + `<h4>인스턴스</h4>` + table(["ID", "사설 IP", "공인 IP", "서브넷", "보안 그룹", "상태"], r.instances.map(i => [i.id, i.ip, i.public || "", i.subnet, i.sgs.join(", "), i.state]));
   } else {
-    body = `<div class="sub">메시지 ${r.count}개${more} · 엿보기만 하며 수신 횟수는 바뀌지 않습니다</div>` + table(["ID", "본문", "상태", "수신 횟수"], r.messages.map(m => [m.id, m.body, m.state, m.receives]));
+    body = `<div class="sub">메시지 ${r.count}개${more} · 엿보기만 하며 수신 횟수는 바뀌지 않습니다</div>` + table(["ID", "본문", "메시지 속성", "상태", "수신 횟수"], r.messages.map(m => [m.id, m.body, m.attrs || "", m.state, m.receives])) + policyBlock("큐 정책", r.policy);
   }
   $("detail").innerHTML = `<h2>${esc(r.name)}</h2>` + body;
 }

@@ -419,8 +419,9 @@ impl Queues {
         let now = Instant::now();
         self.q
             .iter()
-            .map(|(n, q)| json!({"name": n, "count": q.msgs.len(),
+            .map(|(n, q)| json!({"name": n, "count": q.msgs.len(), "policy": q.attrs.get("Policy").and_then(|p| serde_json::from_str::<Value>(p).ok()),
                 "messages": q.msgs.iter().take(100).map(|m| json!({"id": m.id, "body": m.body, "receives": m.receives,
+                    "attrs": m.mattrs.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>().join(", ")).unwrap_or_default(),
                     "state": if m.visible_at <= now { "visible" } else if m.receipt.is_some() { "inflight" } else { "delayed" }})).collect::<Vec<_>>()}))
             .collect()
     }
