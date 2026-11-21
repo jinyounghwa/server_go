@@ -460,6 +460,9 @@ fn exec(
         }
         "PutBucketPolicy" => {
             let bk = st.buckets.get_mut(b).ok_or_else(no_bucket)?;
+            if body.len() > 20 * 1024 {
+                return Err(fail(400, "PolicyTooLarge", "Policy exceeds the maximum allowed document size (20 KB)."));
+            }
             let doc: serde_json::Value = serde_json::from_slice(&body).map_err(|_| fail(400, "MalformedPolicy", "Policies must be valid JSON and the first byte must be '{'"))?;
             crate::iam::validate_resource_policy(&doc).map_err(|m| fail(400, "MalformedPolicy", &m))?;
             bk.policy = Some(doc);

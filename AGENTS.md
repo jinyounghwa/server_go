@@ -119,7 +119,7 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
    (SDK 테스트 28/5/4개, 시나리오 21개, GPU 65°C)는 `town.html` 12절에 손으로 적은 값이라 테스트가 늘면 같이 고친다.
    맥에서 에뮬레이터를 띄운 `/_town` 실시간 모드는 이번 3D 개편 뒤 아직 직접 보지 않았다.
 5. **알려진 한계(8절) 중 효과 큰 순서.** ~~SQS 메시지 속성~~(완료) → ~~S3 버킷 정책~~(완료, `iam.rs` `authorize_with`) → ~~SQS 큐 정책~~(완료) →
-   Step Functions Parallel 진짜 병렬 → ALB 경로 규칙 → aws-chunked 조각 서명 검증. 각각 sdk_test.py에 정상·오류 경로 테스트를 같이 넣는다.
+   ~~Step Functions Parallel·Map 동시 실행~~(완료) → ALB 경로 규칙 → aws-chunked 조각 서명 검증. 각각 sdk_test.py에 정상·오류 경로 테스트를 같이 넣는다.
 6. (선택) `?api=`로 IPv6 `[::1]`을 쓰려면 CSP `connect-src`가 IPv6 리터럴을 못 받으므로 별도 방법이 필요하다. 요청이 있을 때만.
 
 큰 변경 뒤에는 4절 방법으로 우분투 전체 검증을 돌린다.
@@ -127,5 +127,5 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
 ## 8. 알려진 한계 (요약)
 상태는 기본 인메모리(JSON 스냅샷 `RC_STATE_FILE` 또는 SQLite `RC_SQLITE_FILE`로 영속 저장 가능), SigV4 서명은 `VERIFY_SIGV4=1`일 때만 검증(SigV2 거부,
 aws-chunked 조각 서명은 미검증), SNS 토픽·Lambda 리소스 기반 정책 미평가(S3 버킷·SQS 큐 정책은 평가), KMS는 진짜 암호 아님,
-ALB는 L4 라운드로빈(경로 규칙 없음), Step Functions 병렬 가지가 순차 실행, Query 프로토콜 구버전 SQS 미지원,
+ALB는 L4 라운드로빈(경로 규칙 없음), Step Functions Parallel에서 한 가지가 실패해도 나머지는 끝까지 실행, Query 프로토콜 구버전 SQS 미지원,
 ECS 태스크가 에뮬레이터를 부르려면 `BIND=0.0.0.0:4566` 필요. 세부는 각 파일의 `ponytail:` 주석.

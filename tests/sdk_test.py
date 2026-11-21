@@ -721,7 +721,19 @@ def test_step_functions():
     e = sf.start_execution(stateMachineArn=sm3)["executionArn"]
     sf.stop_execution(executionArn=e, error="Manual")
     assert sf.describe_execution(executionArn=e)["status"] == "ABORTED"
-    for m in (sm, sm2, sm3):
+    # Parallel branches and Map items run concurrently: three 1 s waits finish in about 1 s, and MaxConcurrency=1 serialises.
+    w1 = {"StartAt": "W", "States": {"W": {"Type": "Wait", "Seconds": 1, "End": True}}}
+    conc = {"StartAt": "P", "States": {
+        "P": {"Type": "Parallel", "Branches": [w1, w1, w1], "Next": "M"},
+        "M": {"Type": "Map", "ItemsPath": "$", "ItemProcessor": w1, "End": True}}}
+    serial = {"StartAt": "M", "States": {"M": {"Type": "Map", "ItemsPath": "$", "MaxConcurrency": 1, "ItemProcessor": w1, "End": True}}}
+    sm4 = sf.create_state_machine(name=f"conc{run}", definition=json.dumps(conc), roleArn="arn:aws:iam::000000000000:role/x")["stateMachineArn"]
+    sm5 = sf.create_state_machine(name=f"serial{run}", definition=json.dumps(serial), roleArn="arn:aws:iam::000000000000:role/x")["stateMachineArn"]
+    t0 = time.time(); c = finish(sf.start_execution(stateMachineArn=sm4)["executionArn"]); took = time.time() - t0
+    assert c["status"] == "SUCCEEDED" and len(json.loads(c["output"])) == 3 and took < 4, (c, took)  # serial would take 6 s
+    t0 = time.time(); s = finish(sf.start_execution(stateMachineArn=sm5, input='[1, 2]')["executionArn"])
+    assert s["status"] == "SUCCEEDED" and time.time() - t0 >= 2, s
+    for m in (sm, sm2, sm3, sm4, sm5):
         sf.delete_state_machine(stateMachineArn=m)
     for f in ("price", "flaky"):
         lam.delete_function(FunctionName=f"{f}{run}")

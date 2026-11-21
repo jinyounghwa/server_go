@@ -1,5 +1,6 @@
 // Step Functions (JSON 1.0) with an Amazon States Language interpreter.
-// ponytail: Parallel/Map branches run one after another; JSONPath supports $.a.b[0] only; no JSONata,
+// Parallel branches and Map items run concurrently (Map honours MaxConcurrency).
+// ponytail: when one branch fails the others run to completion instead of being stopped; JSONPath supports $.a.b[0] only; no JSONata,
 // task tokens, activities, Express sync starts or state TimeoutSeconds.
 use crate::{epoch, err, need, ApiErr, App, ACCOUNT, REGION};
 use serde_json::{json, Map, Value};
@@ -332,19 +333,10 @@ fn run_states<'a>(app: &'a Arc<App>, exec: &'a str, def: &'a Value, input: Value
                     Err(e) => Err(e),
                 },
                 "Parallel" => match params(&eff) {
+                    // Branches run concurrently; output keeps branch order and the first failing branch (in order) wins.
                     Ok(p) => {
-                        let mut out = vec![];
-                        let mut failed = None;
-                        for b in st["Branches"].as_array().into_iter().flatten() {
-                            match run_states(app, exec, b, p.clone(), ctx.clone()).await {
-                                Ok(v) => out.push(v),
-                                Err(e) => {
-                                    failed = Some(e);
-                                    break;
-                                }
-                            }
-                        }
-                        failed.map_or(Ok(Value::Array(out)), Err)
+                        let runs = st["Branches"].as_array().into_iter().flatten().map(|b| run_states(app, exec, b, p.clone(), ctx.clone()));
+                        futures_util::future::join_all(runs).await.into_iter().collect::<Result<Vec<_>, _>>().map(Value::Array)
                     }
                     Err(e) => Err(e),
                 },
@@ -354,23 +346,23 @@ fn run_states<'a>(app: &'a Arc<App>, exec: &'a str, def: &'a Value, input: Value
                     match items.as_ref().and_then(Value::as_array) {
                         None => Err(fail("States.Runtime", "Map ItemsPath did not select an array")),
                         Some(items) => {
-                            let mut out = vec![];
-                            let mut failed = None;
-                            for (i, item) in items.iter().enumerate() {
+                            let sel = st.get("ItemSelector").or(st.get("Parameters"));
+                            let inputs: Result<Vec<Value>, Fail> = items.iter().enumerate().map(|(i, item)| {
                                 let mut mctx = sctx.clone();
                                 mctx["Map"] = json!({"Item": {"Index": i, "Value": item}});
-                                let sel = st.get("ItemSelector").or(st.get("Parameters"));
-                                let item_in = match sel.map(|s| template(s, &eff, &mctx)) {
-                                    Some(Err(e)) => { failed = Some(e); break }
-                                    Some(Ok(v)) => v,
-                                    None => item.clone(),
-                                };
-                                match run_states(app, exec, &proc_def, item_in, ctx.clone()).await {
-                                    Ok(v) => out.push(v),
-                                    Err(e) => { failed = Some(e); break }
+                                sel.map_or(Ok(item.clone()), |s| template(s, &eff, &mctx))
+                            }).collect();
+                            match inputs {
+                                Err(e) => Err(e),
+                                // Items run concurrently up to MaxConcurrency (0 or absent = no limit); results keep item order.
+                                Ok(inputs) => {
+                                    let limit = st["MaxConcurrency"].as_u64().filter(|n| *n > 0).map_or(inputs.len().max(1), |n| n as usize);
+                                    let runs = inputs.into_iter().map(|v| run_states(app, exec, &proc_def, v, ctx.clone()));
+                                    use futures_util::StreamExt;
+                                    futures_util::stream::iter(runs).buffered(limit).collect::<Vec<_>>().await
+                                        .into_iter().collect::<Result<Vec<_>, _>>().map(Value::Array)
                                 }
                             }
-                            failed.map_or(Ok(Value::Array(out)), Err)
                         }
                     }
                 }
