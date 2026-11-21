@@ -10,6 +10,7 @@
 - 이후 추가: JSON 상태 스냅샷, 3D(Three.js) 캐릭터 마을(본섬 28개 시설 + 다리 건너 다운타운 + 모노레일 건너 "연대기 섬": 계획서 0~10단계 오벨리스크와 SigV4·FIFO·400KB·SDK 경기장·릴리스·Homebrew·Docker·우분투·검사관 훈련장·Pages 포털·/_ui 전광판, `town.html` 12절), GitHub Pages 마을(`pages.yml`). Pages 마을은 방문자 PC의 로컬 에뮬레이터
   (`127.0.0.1:4566`, `?api=`)에 SSE로 붙어 실제 트래픽을 보여 주고, 연결 전에는 목업 트래픽을 돌린다. Pages에서는 자동 연결·재시도를 하지 않고 🔌 연결 버튼을 눌렀을 때만 붙는다(실패한 연결마다 브라우저가 ERR_CONNECTION_REFUSED를 콘솔에 남기기 때문). `/_town`(같은 출처)은 자동 연결.
 - `v0.1.0` 릴리스 완료(2026-11-21): 바이너리 3종 + SHA256SUMS, Homebrew sha256 반영.
+- `v0.1.4` 릴리스(2026-11-22): ALB 요청별 규칙 라우팅, aws-chunked 트레일러 서명 검증, SNS·EventBridge·S3 배달의 대상 정책 판정(서비스 주체).
 - `v0.1.3` 릴리스 완료(2026-11-21): SNS·Lambda 리소스 정책, ALB 리스너 규칙, aws-chunked 서명 검증. release.yml도 Node 24 액션으로. Homebrew 0.1.3.
 - `v0.1.2` 릴리스 완료(2026-11-21): 버킷·큐 정책, SQS 메시지 속성, Step Functions 동시 실행. Homebrew 0.1.2.
 - `v0.1.1` 릴리스 완료(2026-11-21): SIGTERM·Ctrl-C 뒤 최대 2초 안에 종료(v0.1.0은 열린 연결 때문에 안 끝날 수 있었음). Homebrew 포뮬러 0.1.1 반영.
