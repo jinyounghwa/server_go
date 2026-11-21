@@ -20,7 +20,7 @@ jobs:
             target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -30,7 +30,7 @@ jobs:
       - name: Package tarball
         run: |
           tar -C core/target/${{ matrix.target }}/release -czf rocalcloud-${{ matrix.target }}.tar.gz rocalcloud
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: rocalcloud-${{ matrix.target }}
           path: rocalcloud-${{ matrix.target }}.tar.gz
@@ -39,12 +39,12 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
       - name: Generate checksums
         run: sha256sum rocalcloud-*.tar.gz > SHA256SUMS.txt
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             rocalcloud-*.tar.gz
