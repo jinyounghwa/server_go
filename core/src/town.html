@@ -163,7 +163,7 @@ canvas#c:active { cursor: grabbing; }
     </div>
     <div class="status-row"><span id="dot" class="sdot"></span><span id="mode">연결 중…</span></div>
     <div id="connect" hidden>
-      내 컴퓨터의 rocalcloud에 연결하면 실제 요청이 이 도시에 나타납니다. 실행하면 자동으로 연결됩니다.
+      내 컴퓨터의 rocalcloud에 연결하면 실제 요청이 이 도시에 나타납니다. 실행한 뒤 아래 <b>🔌 연결</b>을 누르세요.
       <code>docker run --rm -p 127.0.0.1:4566:4566 rocalcloud</code>
       <span>다른 주소는 <code>?api=http://127.0.0.1:4566</code></span>
     </div>
@@ -2369,9 +2369,7 @@ function resumeLive() {
 $("btn_reconnect").onclick = () => resumeLive();
 $("btn_close_tab").onclick = () => { window.close(); $("close_hint").hidden = false; };
 
-// Each failed attempt is logged by the browser as ERR_CONNECTION_REFUSED, so back off (5s → 60s) and skip hidden tabs.
-let retryDelay = 5000;
-document.addEventListener("visibilitychange", () => { if (!document.hidden && !es && !townStopped && !params.has("demo") && demoTimer) { retryDelay = 5000; live(); } });
+// Pages never connects on its own: every failed attempt is logged by the browser as ERR_CONNECTION_REFUSED.
 function live() {
   if (townStopped) return;
   stopDemo();
@@ -2379,7 +2377,7 @@ function live() {
   es = new EventSource(API + "/_events");
   let opened = false;
   es.onopen = () => {
-    opened = true; retryDelay = 5000; setMode("live", sameOrigin ? "실시간 연결됨" : "실시간 연결됨 · " + API);
+    opened = true; setMode("live", sameOrigin ? "실시간 연결됨" : "실시간 연결됨 · " + API);
     $("connect").hidden = true; $("gui").hidden = false;
   };
   es.onmessage = m => { try { handle(JSON.parse(m.data)); } catch {} };
@@ -2389,10 +2387,8 @@ function live() {
       shutdownTown("로컬 에뮬레이터가 종료되어 마을도 함께 종료되었습니다.");
       return;
     }
-    startDemo("에뮬레이터 연결 대기 중 · 메가 시티 데모");
+    startDemo("연결 실패 · 에뮬레이터를 켠 뒤 🔌 연결");
     $("connect").hidden = sameOrigin; $("gui").hidden = true;
-    retryTimer = setTimeout(() => { if (!document.hidden) live(); }, retryDelay);
-    retryDelay = Math.min(60000, retryDelay * 2);
   };
 }
 
@@ -2420,7 +2416,7 @@ const SCRIPT = [
 function startDemo(why) {
   if (es) { es.close(); es = null; }
   setMode("demo", why || "3D 메가 시티 데모");
-  $("demo").textContent = "실시간";
+  $("demo").textContent = sameOrigin ? "실시간" : "🔌 연결";
   let i = 0; clearInterval(demoTimer);
   const tick = () => {
     if (paused || townStopped) return;
@@ -2437,7 +2433,8 @@ $("pause").onclick = () => { paused = !paused; $("pause").textContent = paused ?
 $("speed").oninput = e => speed = +e.target.value;
 
 if (params.has("demo")) { $("gui").hidden = true; startDemo("3D 메가 시티 데모 (목업 트래픽)"); }
-else live();
+else if (sameOrigin) live();
+else { startDemo("메가 시티 데모 · 🔌 연결로 내 에뮬레이터에 붙기"); $("connect").hidden = false; $("gui").hidden = true; }
 </script>
 </body>
 </html>
