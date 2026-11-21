@@ -1197,19 +1197,82 @@ function land(b, out, e) {
   spawnPop(new THREE.Vector3(b.x, 6.4, b.z), out);
 }
 
+// Helper: append roundabout arc around the central fountain (0, 0, r=4.8) so vans never drive through it.
+function pushMainX(pts, xFrom, xTo, zLane) {
+  const R = 4.8;
+  const crosses = (xFrom < -R && xTo > R) || (xFrom > R && xTo < -R);
+  if (!crosses) { pts.push(new THREE.Vector3(xTo, 0.14, zLane)); return; }
+  const dir = xTo > xFrom ? 1 : -1;
+  pts.push(new THREE.Vector3(-dir * R, 0.14, zLane));
+  // Right-hand traffic around the roundabout: eastbound takes south arc (+z), westbound takes north arc (-z).
+  const steps = 6;
+  for (let k = 1; k < steps; k++) {
+    const a = dir > 0 ? Math.PI - (k / steps) * Math.PI : (k / steps) * Math.PI;
+    pts.push(new THREE.Vector3(Math.cos(a) * R, 0.14, dir * Math.sin(a) * R));
+  }
+  pts.push(new THREE.Vector3(dir * R, 0.14, zLane));
+  pts.push(new THREE.Vector3(xTo, 0.14, zLane));
+}
+
 function buildRouteTo(to) {
-  const start = new THREE.Vector3(-60, 0.14, 0);
+  const lane = 0.85;
+  const start = new THREE.Vector3(-56, 0.14, lane);
+  const pts = [start];
   if (to.roadZ === 0) {
-    return [start, new THREE.Vector3(to.door.x, 0.14, 0), to.door.clone()];
+    pushMainX(pts, -56, to.door.x, lane);
+    pts.push(to.door.clone());
+    return pts;
   }
   const crossX = to.x < -12 ? -24 : (to.x > 13 ? 26 : 0);
-  return [
-    start,
-    new THREE.Vector3(crossX, 0.14, 0),
-    new THREE.Vector3(crossX, 0.14, to.roadZ),
-    new THREE.Vector3(to.door.x, 0.14, to.roadZ),
-    to.door.clone(),
-  ];
+  if (crossX === 0) {
+    // Go to west edge of roundabout, curve cleanly to north or south exit.
+    pts.push(new THREE.Vector3(-4.8, 0.14, lane));
+    const signZ = to.roadZ < 0 ? -1 : 1;
+    for (let k = 1; k <= 3; k++) {
+      const a = Math.PI - signZ * (k / 4) * (Math.PI / 2);
+      pts.push(new THREE.Vector3(Math.cos(a) * 4.8, 0.14, Math.sin(a) * 4.8));
+    }
+    pts.push(new THREE.Vector3(0, 0.14, signZ * 5.2));
+  } else {
+    pushMainX(pts, -56, crossX, lane);
+  }
+  pts.push(new THREE.Vector3(crossX, 0.14, to.roadZ));
+  pts.push(new THREE.Vector3(to.door.x, 0.14, to.roadZ));
+  pts.push(to.door.clone());
+  return pts;
+}
+
+function buildReturnRoute(to) {
+  const lane = -0.85;
+  const pts = [to.door.clone()];
+  if (to.roadZ === 0) {
+    pts.push(new THREE.Vector3(to.door.x, 0.14, lane));
+    pushMainX(pts, to.door.x, -56, lane);
+    return pts;
+  }
+  const crossX = to.x < -12 ? -24 : (to.x > 13 ? 26 : 0);
+  pts.push(new THREE.Vector3(to.door.x, 0.14, to.roadZ));
+  pts.push(new THREE.Vector3(crossX, 0.14, to.roadZ));
+  if (crossX === 0) {
+    const signZ = to.roadZ < 0 ? -1 : 1;
+    pts.push(new THREE.Vector3(0, 0.14, signZ * 5.2));
+    for (let k = 1; k <= 3; k++) {
+      const a = signZ * (Math.PI / 2) + signZ * (k / 4) * (Math.PI / 2);
+      pts.push(new THREE.Vector3(Math.cos(a) * 4.8, 0.14, Math.sin(a) * 4.8));
+    }
+    pts.push(new THREE.Vector3(-4.8, 0.14, lane));
+    pts.push(new THREE.Vector3(-56, 0.14, lane));
+  } else {
+    pts.push(new THREE.Vector3(crossX, 0.14, lane));
+    pushMainX(pts, crossX, -56, lane);
+  }
+  return pts;
+}
+
+function pathLen(pts) {
+  let len = 0;
+  for (let i = 1; i < pts.length; i++) len += pts[i].distanceTo(pts[i - 1]);
+  return len;
 }
 
 function spawn(e) {
@@ -1236,18 +1299,18 @@ function spawn(e) {
   const blocked = out === "deny" || out === "defend";
   const isInsp = e.service === "inspector";
   const pts = blocked
-    ? [new THREE.Vector3(-60, 0.14, 0), new THREE.Vector3(GATE_X - 1.8, 0.14, 0)]
+    ? [new THREE.Vector3(-56, 0.14, 0.85), new THREE.Vector3(GATE_X - 1.8, 0.14, 0.85)]
     : buildRouteTo(to);
-  let len = 0;
-  for (let i = 1; i < pts.length; i++) len += pts[i].distanceTo(pts[i - 1]);
+  const len = pathLen(pts);
   const mesh = isInsp
     ? buildGuardOrInspector(0x6b21a8, false, true)
     : buildDeliveryVan((byService[e.service] || to).color, out === "zap");
   mesh.position.copy(pts[0]);
+  mesh.scale.setScalar(0.01);
   scene.add(mesh);
   walkers.push({
     mesh, pts, len, t: 0, dur: reduce ? 0.05 : Math.max(1.1, len / 24),
-    to, out, e, isInsp, leaving: false, done: false,
+    to, out, e, isInsp, phase: "to", dwell: 0, done: false,
   });
 }
 
@@ -1540,13 +1603,60 @@ treeSpots.forEach(([x, , z], i) => {
 });
 [trunkInst, pineInst, oakInst].forEach(m => m.instanceMatrix.needsUpdate = true);
 
-// --- City life: traffic (4 instanced meshes), birds, sailboats, an airship ---
-const LANES = [
-  [[-48, 0], [-7, 0], 1.2], [[7, 0], [48, 0], 1.2], [[-43, -20], [44, -20], 0.95], [[-43, 20], [51, 20], 0.95],
-  [[-24, -20], [-24, 20], 0.9], [[26, -20], [26, 20], 0.9], [[0, -20], [0, -7], 0.9], [[0, 7], [0, 20], 0.9],
-  [[BRIDGE_X, -20], [BRIDGE_X, DT.cz - hwZ(BRIDGE_X)], 1.3], [[BRIDGE_X, -20], [BRIDGE_X, DT.cz - hwZ(BRIDGE_X)], 1.3],
-  ...dtLanes,
-].map(([a, b, off]) => ({ a: new THREE.Vector2(...a), b: new THREE.Vector2(...b), off }));
+// --- City life: closed-loop traffic (no popping at road ends!), birds, water-bound sailboats, airship ---
+function makeClosedLoop(rawPts, off = 0.95) {
+  // Smooth corners with quadratic fillets so cars turn cleanly instead of snapping 90 deg or vanishing at dead ends.
+  const n = rawPts.length, pts = [];
+  for (let i = 0; i < n; i++) {
+    const prev = new THREE.Vector2(...rawPts[(i - 1 + n) % n]);
+    const curr = new THREE.Vector2(...rawPts[i]);
+    const next = new THREE.Vector2(...rawPts[(i + 1) % n]);
+    const v1 = prev.clone().sub(curr), v2 = next.clone().sub(curr);
+    const l1 = v1.length(), l2 = v2.length();
+    const r = Math.min(2.6, l1 * 0.35, l2 * 0.35);
+    const pA = curr.clone().addScaledVector(v1.normalize(), r);
+    const pB = curr.clone().addScaledVector(v2.normalize(), r);
+    for (let k = 0; k <= 4; k++) {
+      const t = k / 4, u = 1 - t;
+      pts.push(new THREE.Vector2(
+        u * u * pA.x + 2 * u * t * curr.x + t * t * pB.x,
+        u * u * pA.y + 2 * u * t * curr.y + t * t * pB.y
+      ));
+    }
+  }
+  const cum = [0];
+  for (let i = 0; i < pts.length; i++) cum.push(cum[i] + pts[i].distanceTo(pts[(i + 1) % pts.length]));
+  return { pts, cum, total: cum[pts.length], off };
+}
+
+function sampleLoop(loop, dist, dir) {
+  const s = ((dist % loop.total) + loop.total) % loop.total;
+  let lo = 0, hi = loop.pts.length - 1;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (loop.cum[mid + 1] < s) lo = mid + 1; else hi = mid; }
+  const a = loop.pts[lo], b = loop.pts[(lo + 1) % loop.pts.length];
+  const seg = loop.cum[lo + 1] - loop.cum[lo] || 1;
+  const f = (s - loop.cum[lo]) / seg;
+  const x0 = a.x + (b.x - a.x) * f, z0 = a.y + (b.y - a.y) * f;
+  const dx = ((b.x - a.x) / seg) * dir, dz = ((b.y - a.y) / seg) * dir;
+  // Right-hand lane offset perpendicular to travel direction.
+  return { x: x0 - dz * loop.off, z: z0 + dx * loop.off, dx, dz };
+}
+
+const LOOPS = [
+  // 1. Main island outer ring (NW <-> NE <-> SE <-> SW)
+  makeClosedLoop([[-24, -20], [26, -20], [26, 20], [-24, 20]], 0.9),
+  // 2. Main island <-> Cable-stayed bridge <-> Downtown grand loop!
+  makeClosedLoop([[26, -20], [BRIDGE_X, -20], [BRIDGE_X, -108], [BRIDGE_X, -136], [12, -136], [12, -108], [BRIDGE_X, -108], [BRIDGE_X, -20], [26, -20], [26, 20], [0, 20], [0, 7], [-5, 5], [-7, 0], [-5, -5], [0, -7], [0, -20]], 1.05),
+  // 3. Downtown central rectangle
+  makeClosedLoop([[-8, -108], [66, -108], [66, -136], [-8, -136]], 0.9),
+  // 4. Downtown east loop
+  makeClosedLoop([[12, -122], [84, -122], [84, -108], [12, -108]], 0.9),
+  // 5. Downtown west loop
+  makeClosedLoop([[-8, -122], [30, -122], [30, -136], [-8, -136]], 0.9),
+  // 6. Heritage island promenade U-turn loop
+  makeClosedLoop([[-66, 132.8], [54, 132.8], [56, 134], [54, 135.2], [-66, 135.2], [-68, 134]], 0.25),
+];
+
 function carGeo(parts) { return mergeGeometries(parts.map(([w, h, d, y, z]) => new THREE.BoxGeometry(w, h, d).translate(0, y, z))); }
 const CAR_N = 54;
 const carBody = new THREE.InstancedMesh(carGeo([[0.92, 0.42, 1.95, 0.34, 0]]), mStd({ metalness: 0.55, roughness: 0.3 }), CAR_N);
@@ -1559,22 +1669,30 @@ const carTail = new THREE.InstancedMesh(carGeo([[0.8, 0.1, 0.06, 0.42, -0.98]]),
 carBody.castShadow = carCabin.castShadow = true;
 const CAR_COLORS = [0xf8fafc, 0x111827, 0xdc2626, 0x2563eb, 0x9ca3af, 0xf59e0b, 0x0f766e, 0x7c3aed];
 const cars = Array.from({ length: CAR_N }, (_, i) => {
+  const loop = LOOPS[i % LOOPS.length];
   carBody.setColorAt(i, new THREE.Color(CAR_COLORS[i % CAR_COLORS.length]));
-  return { lane: LANES[i % LANES.length], t: rnd(), dir: i % 2 ? 1 : -1, v: 5 + rnd() * 5 };
+  const dir = (i % LOOPS.length === 5) ? 1 : (i % 2 ? 1 : -1);
+  return { loop, s: rnd() * loop.total, dir, v: 6 + rnd() * 5.5 };
 });
 scene.add(carBody, carCabin, carHead, carTail);
 function updateCars(dt) {
+  dummy.rotation.order = "YXZ";
   cars.forEach((c, i) => {
-    const L = c.lane, len = L.a.distanceTo(L.b);
-    c.t = (c.t + dt * c.v / len) % 1;
-    const f = c.dir > 0 ? c.t : 1 - c.t;
-    const x0 = L.a.x + (L.b.x - L.a.x) * f, z0 = L.a.y + (L.b.y - L.a.y) * f;
-    const dx = (L.b.x - L.a.x) / len * c.dir, dz = (L.b.y - L.a.y) / len * c.dir;
-    const x = x0 - dz * L.off, z = z0 + dx * L.off;
-    dummy.position.set(x, onBridge(x, z) ? bridgeY(z) + 0.12 : 0.13, z);
-    dummy.rotation.set(0, Math.atan2(dx, dz), 0); dummy.scale.setScalar(1); dummy.updateMatrix();
+    c.s = (c.s + dt * c.v * c.dir + c.loop.total) % c.loop.total;
+    const p = sampleLoop(c.loop, c.s, c.dir);
+    const onB = onBridge(p.x, p.z);
+    const y = onB ? bridgeY(p.z) + 0.12 : 0.13;
+    let pitch = 0;
+    if (onB) {
+      const yNext = bridgeY(p.z + p.dz * 1.2), yPrev = bridgeY(p.z - p.dz * 1.2);
+      pitch = -Math.atan2(yNext - yPrev, 2.4);
+    }
+    dummy.position.set(p.x, y, p.z);
+    dummy.rotation.set(pitch, Math.atan2(p.dx, p.dz), 0);
+    dummy.scale.setScalar(1); dummy.updateMatrix();
     for (const m of [carBody, carCabin, carHead, carTail]) m.setMatrixAt(i, dummy.matrix);
   });
+  dummy.rotation.order = "XYZ";
   for (const m of [carBody, carCabin, carHead, carTail]) m.instanceMatrix.needsUpdate = true;
 }
 
@@ -1585,10 +1703,11 @@ const wingL = new THREE.InstancedMesh(wingGeo(-1), birdMat, BIRD_N), wingR = new
 const birds = Array.from({ length: BIRD_N }, () => ({ ox: (rnd() - 0.5) * 9, oy: (rnd() - 0.5) * 3, oz: (rnd() - 0.5) * 9, ph: rnd() * 6 }));
 scene.add(wingL, wingR);
 function updateBirds(t) {
-  const ang = t * 0.11, cx = Math.cos(ang) * 55 - 5, cz = Math.sin(ang) * 40 - 30, hd = Math.atan2(-Math.sin(ang), Math.cos(ang));
+  const ang = t * 0.11, cx = Math.cos(ang) * 55 - 5, cz = Math.sin(ang) * 40 - 30;
+  const hd = Math.atan2(-Math.sin(ang) * 55, Math.cos(ang) * 40);
   birds.forEach((b, i) => {
     const flap = Math.sin(t * 9 + b.ph) * 0.65;
-    dummy.position.set(cx + b.ox, 26 + b.oy + Math.sin(t + b.ph) * 0.6, cz + b.oz); dummy.scale.setScalar(1);
+    dummy.position.set(cx + b.ox, 38 + b.oy + Math.sin(t + b.ph) * 0.6, cz + b.oz); dummy.scale.setScalar(1);
     dummy.rotation.order = "YXZ";
     dummy.rotation.set(0, hd, flap); dummy.updateMatrix(); wingL.setMatrixAt(i, dummy.matrix);
     dummy.rotation.set(0, hd, -flap); dummy.updateMatrix(); wingR.setMatrixAt(i, dummy.matrix);
@@ -1597,23 +1716,38 @@ function updateBirds(t) {
   wingL.instanceMatrix.needsUpdate = wingR.instanceMatrix.needsUpdate = true;
 }
 
+// Sailboats strictly on open-water & strait courses that never intersect any island, pier, bridge or monorail!
 const sailGeo = new THREE.BufferGeometry();
 sailGeo.setAttribute("position", new THREE.Float32BufferAttribute([0, 0.6, 0.1, 0, 5.2, 0.1, 0, 0.6, -2.6], 3)); sailGeo.computeVertexNormals();
-const boats = [];
-for (let i = 0; i < 7; i++) {
+const BOAT_COURSES = [
+  // Outer ocean ring completely outside all 3 islands (main ±66/±46, downtown z:-156..-88, heritage z:108..176)
+  { cx: 8,   cz: 8,   rx: 138, rz: 202, sp: 0.022 },
+  { cx: 8,   cz: 8,   rx: 158, rz: 218, sp: -0.019 },
+  { cx: 8,   cz: 8,   rx: 176, rz: 234, sp: 0.016 },
+  // North strait (between main island z=-46 and downtown z=-88, west of bridge x=48)
+  { cx: -46, cz: -68, rx: 46,  rz: 11,  sp: 0.048 },
+  { cx: -46, cz: -68, rx: 34,  rz: 8,   sp: -0.055 },
+  // South strait (between main island/harbor z<=49 and heritage island z>=108, east of monorail x=-4)
+  { cx: 60,  cz: 79,  rx: 38,  rz: 12,  sp: 0.046 },
+  { cx: 60,  cz: 79,  rx: 26,  rz: 9,   sp: -0.052 },
+];
+const boats = BOAT_COURSES.map((course, i) => {
   const g = new THREE.Group();
   g.add(mkBox(1.1, 0.55, 3.4, mStd({ color: i % 2 ? 0xf8fafc : 0x1e3a8a, roughness: 0.4 }), 0, 0.2, 0));
   g.add(mkCyl(0.05, 0.06, 5, 6, mStd({ color: 0xe5e7eb }), 0, 2.9, 0.15));
   const sail = new THREE.Mesh(sailGeo, mStd({ color: [0xffffff, 0xfef3c7, 0xfecaca, 0xe0f2fe][i % 4], side: THREE.DoubleSide, roughness: 0.9 }));
   sail.castShadow = true; g.add(sail);
-  scene.add(g); boats.push({ g, r: 95 + i * 13, sp: 0.03 + rnd() * 0.025, a: rnd() * Math.PI * 2, cz: -40 });
-}
+  scene.add(g);
+  return { g, ...course, a: (i / BOAT_COURSES.length) * Math.PI * 2 };
+});
 function updateBoats(dt, t) {
   boats.forEach((b, i) => {
     b.a += dt * b.sp;
-    const x = Math.cos(b.a) * b.r, z = b.cz + Math.sin(b.a) * b.r * 0.75;
-    b.g.position.set(x, -1.75 + Math.sin(t * 1.3 + i) * 0.12, z);
-    b.g.rotation.set(Math.sin(t + i) * 0.04, Math.atan2(-Math.sin(b.a), Math.cos(b.a) * 0.75) + Math.PI, Math.sin(t * 0.8 + i) * 0.06);
+    const x = b.cx + Math.cos(b.a) * b.rx, z = b.cz + Math.sin(b.a) * b.rz;
+    const vx = -Math.sin(b.a) * b.rx * b.sp, vz = Math.cos(b.a) * b.rz * b.sp;
+    b.g.position.set(x, -1.78 + Math.sin(t * 1.3 + i) * 0.1, z);
+    b.g.rotation.order = "YXZ";
+    b.g.rotation.set(Math.sin(t + i) * 0.035, Math.atan2(vx, vz), Math.sin(t * 0.8 + i) * 0.05);
   });
 }
 
@@ -1638,9 +1772,10 @@ banner.position.set(2.66, 0, 0); banner.rotation.y = Math.PI / 2; blimp.add(bann
 const banner2 = banner.clone(); banner2.position.x = -2.66; banner2.rotation.y = -Math.PI / 2; blimp.add(banner2);
 scene.add(blimp);
 function updateBlimp(t) {
-  const a = t * 0.045, x = DT.cx + Math.cos(a) * 62, z = DT.cz + 20 + Math.sin(a) * 58;
-  blimp.position.set(x, 50 + Math.sin(t * 0.4) * 1.5, z);
-  blimp.rotation.y = Math.atan2(-Math.sin(a), Math.cos(a));
+  const a = t * 0.04, rx = 92, rz = 68;
+  const x = DT.cx + Math.cos(a) * rx, z = DT.cz + 10 + Math.sin(a) * rz;
+  blimp.position.set(x, 76 + Math.sin(t * 0.4) * 1.5, z);
+  blimp.rotation.y = Math.atan2(-Math.sin(a) * rx, Math.cos(a) * rz);
 }
 
 // Downtown & landmark labels.
@@ -1914,24 +2049,27 @@ screenMesh.position.set(-18, 7.4, 115.6); screenMesh.rotation.y = Math.PI; scene
 hp("matte", Bx(12.6, 7.3, 0.4), 0x0f172a, -18, 7.4, 115.9);
 for (const sx of [-4.5, 4.5]) hp("metal", Bx(0.5, 4, 0.5), 0x334155, -18 + sx, 2, 116);
 
-// --- Event monorail from the main island's south avenue ---
+// --- Double-track event monorail from the main island's south avenue (two separate tracks so pods never collide) ---
 landmark("rail", "이벤트 모노레일", "SSE /_events", "#22d3ee", -4, 116, "모든 요청은 {service, op, status, auth}로 SSE에 실려 나갑니다. 최근 1000건은 해설 에이전트가 읽습니다.", 7, 9, 9, 9.6);
 const RAIL_Y = 6.4;
-hp("metal", Bx(0.9, 0.5, 92), 0xcbd5e1, -4, RAIL_Y, 72);
-for (let z = 32; z <= 112; z += 10) hp("matte", Cy(0.4, 0.55, RAIL_Y + 2.5, 10), 0xe5e7eb, -4, (RAIL_Y - 2.5) / 2, z);
-for (const [pz, len] of [[27, 6], [116, 8]]) {
-  hp("matte", Bx(5, 0.5, len), 0x94a3b8, -4, RAIL_Y - 0.4, pz);
-  for (const sx of [-1.9, 1.9]) for (const sz of [-1, 1]) hp("matte", Cy(0.32, 0.42, RAIL_Y + 2, 10), 0xe5e7eb, -4 + sx, (RAIL_Y - 0.65 - 2.5) / 2 + 0.1, pz + sz * (len / 2 - 0.7));
-  hp("glow", Bx(5.05, 0.12, len), 0x22d3ee, -4, RAIL_Y - 0.1, pz);
-  hp("matte", Bx(5.6, 0.25, len), 0xf1f5f9, -4, RAIL_Y + 3.2, pz);
-  for (const sx of [-2.5, 2.5]) hp("metal", Bx(0.2, 3.4, 0.2), 0x64748b, -4 + sx, RAIL_Y + 1.5, pz);
+for (const rx of [-5.1, -2.9]) hp("metal", Bx(0.65, 0.48, 92), 0xcbd5e1, rx, RAIL_Y, 72);
+for (let z = 32; z <= 112; z += 10) {
+  hp("matte", Cy(0.42, 0.58, RAIL_Y + 2.5, 10), 0xe5e7eb, -4, (RAIL_Y - 2.5) / 2, z);
+  hp("metal", Bx(3.0, 0.32, 0.5), 0x94a3b8, -4, RAIL_Y - 0.35, z);
 }
-const pods = [0, Math.PI].map(ph => {
+for (const [pz, len] of [[27, 6], [116, 8]]) {
+  hp("matte", Bx(5.4, 0.5, len), 0x94a3b8, -4, RAIL_Y - 0.4, pz);
+  for (const sx of [-2.1, 2.1]) for (const sz of [-1, 1]) hp("matte", Cy(0.32, 0.42, RAIL_Y + 2, 10), 0xe5e7eb, -4 + sx, (RAIL_Y - 0.65 - 2.5) / 2 + 0.1, pz + sz * (len / 2 - 0.7));
+  hp("glow", Bx(5.45, 0.12, len), 0x22d3ee, -4, RAIL_Y - 0.1, pz);
+  hp("matte", Bx(6.0, 0.25, len), 0xf1f5f9, -4, RAIL_Y + 3.2, pz);
+  for (const sx of [-2.6, 2.6]) hp("metal", Bx(0.2, 3.4, 0.2), 0x64748b, -4 + sx, RAIL_Y + 1.5, pz);
+}
+const pods = [[0, -5.1], [Math.PI, -2.9]].map(([ph, x]) => {
   const g = new THREE.Group(); scene.add(g);
-  g.add(mkBox(1.7, 1.4, 4.4, mStd({ color: 0xf8fafc, metalness: 0.4, roughness: 0.3 }), 0, 0.95, 0));
-  g.add(mkBox(1.75, 0.45, 3.6, mStd({ color: 0x0f172a, metalness: 0.8, roughness: 0.1 }), 0, 1.2, 0));
-  g.add(mkBox(1.76, 0.1, 4.42, new THREE.MeshBasicMaterial({ color: 0x22d3ee, toneMapped: false }), 0, 0.5, 0));
-  return { g, ph };
+  g.add(mkBox(1.55, 1.35, 4.4, mStd({ color: 0xf8fafc, metalness: 0.4, roughness: 0.3 }), 0, 0.95, 0));
+  g.add(mkBox(1.6, 0.42, 3.6, mStd({ color: 0x0f172a, metalness: 0.8, roughness: 0.1 }), 0, 1.2, 0));
+  g.add(mkBox(1.62, 0.1, 4.42, new THREE.MeshBasicMaterial({ color: 0x22d3ee, toneMapped: false }), 0, 0.5, 0));
+  return { g, ph, x };
 });
 
 // --- Promenade lamps & trees ---
@@ -2024,12 +2162,18 @@ function updateHeritage(dt, t, now) {
   fifoBoxes.instanceMatrix.needsUpdate = true;
   scale.rotation.z = Math.sin(t * 0.8) * 0.05 + 0.16 + Math.sin(t * 9) * scaleKick * 0.12;
   pans.forEach(p => p.rotation.z = -scale.rotation.z);
-  const cyc = t % 40, up = cyc > 30 ? (cyc - 30) / 6 : 0;
-  rocket.position.y = 0.9 + (up < 1 ? up * up * 120 : 400); flame.visible = cyc > 28.5 && up < 1;
-  flame.scale.set(1, 1 + Math.sin(t * 40) * 0.15 + up * 1.5, 1);
+  // Rocket: launch (30..35s), hold aloft (35..36.2s), retro-propulsive vertical landing (36.2..39.6s) — never teleports!
+  const cyc = t % 40;
+  let ry = 0.9, burning = false;
+  if (cyc > 28.8 && cyc <= 30) { burning = true; }
+  else if (cyc > 30 && cyc <= 35) { const u = (cyc - 30) / 5; ry = 0.9 + u * u * 115; burning = true; }
+  else if (cyc > 35 && cyc <= 36.2) { ry = 115.9; }
+  else if (cyc > 36.2 && cyc <= 39.6) { const d = 1 - (cyc - 36.2) / 3.4; ry = 0.9 + d * d * 115; burning = true; }
+  rocket.position.y = ry; flame.visible = burning;
+  flame.scale.set(1, 1 + Math.sin(t * 40) * 0.15 + (ry > 2 ? 1.1 : 0.3), 1);
   fan.rotation.y += dt * 6;
   portal.rotation.y = Math.PI + Math.sin(t * 0.3) * 0.35;
-  pods.forEach(p => { const z = 27 + (0.5 - 0.5 * Math.cos(t * 0.22 + p.ph)) * 89; p.g.position.set(-4, RAIL_Y + 0.25, z); });
+  pods.forEach(p => { const z = 27 + (0.5 - 0.5 * Math.cos(t * 0.22 + p.ph)) * 89; p.g.position.set(p.x, RAIL_Y + 0.25, z); });
   const camD = camera.position.distanceTo(hTmp.set(HI.cx, 0, HI.cz));
   for (const b of Object.values(HB)) if (b.ly) {
     const p = project(hTmp.set(b.x, b.ly, b.z));
@@ -2211,7 +2355,18 @@ function animate(now) {
   guardMesh.userData.armR.rotation.x = -guardState.pass * 1.4;
 
   for (let i = walkers.length - 1; i >= 0; i--) {
-    const w = walkers[i]; w.t += dt;
+    const w = walkers[i];
+    if (w.phase === "dwell") {
+      w.dwell -= dt;
+      if (w.dwell <= 0) {
+        w.pts = buildReturnRoute(w.to);
+        w.len = pathLen(w.pts);
+        w.t = 0; w.dur = reduce ? 0.05 : Math.max(1.0, w.len / 26);
+        w.phase = "back";
+      }
+      continue;
+    }
+    w.t += dt;
     let d = w.len * Math.min(1, w.t / w.dur);
     let cur = w.pts[w.pts.length - 1], dir = new THREE.Vector3(1, 0, 0);
     for (let j = 1; j < w.pts.length; j++) {
@@ -2225,23 +2380,30 @@ function animate(now) {
     }
     w.mesh.position.copy(cur);
     w.mesh.rotation.y = Math.atan2(dir.x, dir.z);
+    // Smooth scale-in at entry and scale-out at gate exit so vans never pop abruptly.
+    let sc = 1;
+    if (w.phase === "to" && w.t < 0.28) sc = Math.max(0.01, w.t / 0.28);
+    else if (w.phase === "back" && w.dur - w.t < 0.28) sc = Math.max(0.01, (w.dur - w.t) / 0.28);
+    w.mesh.scale.setScalar(sc);
     if (w.isInsp) {
       const sw = reduce ? 0 : Math.sin(clock * 14 + i) * 0.65;
       w.mesh.userData.legL.rotation.x = sw; w.mesh.userData.legR.rotation.x = -sw;
       w.mesh.userData.armL.rotation.x = -sw * 0.7;
     }
-    if (!w.leaving && Math.abs(cur.x - GATE_X) < 3.6 && w.out !== "deny" && w.out !== "defend") guardState.pass = 1;
+    if (Math.abs(cur.x - GATE_X) < 3.6 && w.out !== "deny" && w.out !== "defend") guardState.pass = 1;
     if (w.t >= w.dur && !w.done) {
-      if ((w.out === "deny" || w.out === "defend") && !w.leaving) {
+      if ((w.out === "deny" || w.out === "defend") && w.phase === "to") {
         guardState.block = 1;
         spawnRing(GATE_X, 0, OUT_COLORS[w.out], 5.2);
         spawnPop(new THREE.Vector3(GATE_X, 5.0, 0), w.out);
-        w.pts = [w.pts[1], new THREE.Vector3(-60, 0.14, 0)];
-        w.len = w.pts[0].distanceTo(w.pts[1]);
-        w.t = 0; w.dur = 0.85; w.leaving = true;
+        w.pts = [w.pts[1], new THREE.Vector3(-56, 0.14, -0.85)];
+        w.len = pathLen(w.pts);
+        w.t = 0; w.dur = 0.85; w.phase = "back";
+      } else if (w.phase === "to") {
+        land(w.to, w.out, w.e);
+        w.phase = "dwell"; w.dwell = reduce ? 0.02 : 0.32;
       } else {
         w.done = true;
-        if (!w.leaving) land(w.to, w.out, w.e);
         scene.remove(w.mesh); walkers.splice(i, 1);
       }
     }
