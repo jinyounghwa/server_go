@@ -1,6 +1,7 @@
 // SigV4 signing and (optional, VERIFY_SIGV4=1) verification. HMAC-SHA256 is built on sha2.
 // Signed aws-chunked bodies (STREAMING-AWS4-HMAC-SHA256-PAYLOAD) have every chunk signature checked, and a hex
-// x-amz-content-sha256 must match the body. ponytail: trailer signatures, SigV4a and clock-skew limits are not checked.
+// x-amz-content-sha256 must match the body. With ...-PAYLOAD-TRAILER the x-amz-trailer-signature over the trailing headers is
+// checked too. ponytail: SigV4a and clock-skew limits are not checked; trailer checksum values are not recomputed.
 use axum::http::{HeaderMap, Method, Uri};
 use sha2::{Digest, Sha256};
 
@@ -61,7 +62,7 @@ fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8>
 }
 
 // Walks "size;chunk-signature=sig\r\ndata\r\n" chunks, each signed over the previous signature, up to the final 0-size chunk.
-fn verify_chunks(body: &[u8], seed: &str, key: &[u8], amz_date: &str, scope: &str) -> Result<(), String> {
+fn verify_chunks(body: &[u8], seed: &str, key: &[u8], amz_date: &str, scope: &str, trailer: bool) -> Result<(), String> {
     let (mut rest, mut prev, empty) = (body, seed.to_string(), sha256_hex(b""));
     loop {
         let nl = rest.windows(2).position(|w| w == b"\r\n").ok_or("chunk header is missing")?;
@@ -74,11 +75,27 @@ fn verify_chunks(body: &[u8], seed: &str, key: &[u8], amz_date: &str, scope: &st
             return Err("chunk signature does not match".into());
         }
         if n == 0 {
-            return Ok(());
+            return if trailer { verify_trailer(&rest[nl + 2..], sig.trim(), key, amz_date, scope) } else { Ok(()) };
         }
         prev = sig.trim().to_string();
         rest = rest.get(nl + 2 + n + 2..).ok_or("chunk is not terminated")?;
     }
+}
+
+// Trailing headers ("name:value\r\n" ... "x-amz-trailer-signature:sig\r\n\r\n") signed over the final chunk signature.
+fn verify_trailer(rest: &[u8], prev: &str, key: &[u8], amz_date: &str, scope: &str) -> Result<(), String> {
+    let text = std::str::from_utf8(rest).map_err(|_| "trailer is not text")?;
+    let mut hs = vec![];
+    let mut sig = None;
+    for l in text.split('\n').map(|l| l.trim_end_matches('\r')).take_while(|l| !l.is_empty()) {
+        let (k, v) = l.split_once(':').ok_or("trailer header is malformed")?;
+        let k = k.trim().to_ascii_lowercase();
+        if k == "x-amz-trailer-signature" { sig = Some(v.trim().to_string()) } else { hs.push(format!("{k}:{}\n", v.trim())) }
+    }
+    let sig = sig.ok_or("trailer signature is missing")?;
+    hs.sort();
+    let sts = format!("AWS4-HMAC-SHA256-TRAILER\n{amz_date}\n{scope}\n{prev}\n{}", sha256_hex(hs.concat().as_bytes()));
+    if hex(&hmac(key, sts.as_bytes())) != sig { Err("trailer signature does not match".into()) } else { Ok(()) }
 }
 
 pub fn signature(secret: &str, date: &str, region: &str, service: &str, amz_date: &str, creq: &str) -> String {
@@ -137,7 +154,7 @@ pub fn verify(method: &Method, uri: &Uri, h: &HeaderMap, body: &[u8], secret_of:
     }
     if payload.starts_with("STREAMING-AWS4-HMAC-SHA256-PAYLOAD") {
         let scope = format!("{}/{}/{}/aws4_request", parts[1], parts[2], parts[3]);
-        verify_chunks(body, &sig, &signing_key(&secret, parts[1], parts[2], parts[3]), &amz_date, &scope)
+        verify_chunks(body, &sig, &signing_key(&secret, parts[1], parts[2], parts[3]), &amz_date, &scope, payload.ends_with("-TRAILER"))
             .map_err(|m| ("SignatureDoesNotMatch", format!("aws-chunked body rejected: {m}")))?;
     } else if payload.len() == 64 && payload.bytes().all(|b| b.is_ascii_hexdigit()) && !payload.eq_ignore_ascii_case(&sha256_hex(body)) {
         return Err(("XAmzContentSHA256Mismatch", "The provided 'x-amz-content-sha256' header does not match what was computed.".into()));
@@ -182,11 +199,21 @@ mod tests {
             body.extend(vec![b'a'; n]);
             body.extend(b"\r\n");
         }
-        assert!(verify_chunks(&body, seed, &key, d, sc).is_ok());
+        assert!(verify_chunks(&body, seed, &key, d, sc, false).is_ok());
         let mut bad = body.clone();
         bad[200] = b'b';
-        assert!(verify_chunks(&bad, seed, &key, d, sc).is_err());
-        assert!(verify_chunks(&body[..body.len() - 120], seed, &key, d, sc).is_err(), "truncated body");
+        assert!(verify_chunks(&bad, seed, &key, d, sc, false).is_err());
+        assert!(verify_chunks(&body[..body.len() - 120], seed, &key, d, sc, false).is_err(), "truncated body");
+        // Signed trailer after the final chunk (format of the AWS SDK for Java's AwsS3V4ChunkSigner.signChecksumChunk).
+        let last = "b6c6ea8a5354eaf15b3cb7646744f4275b71ea724fed81ceb9323e279d449df9";
+        let sts = format!("AWS4-HMAC-SHA256-TRAILER\n{d}\n{sc}\n{last}\n{}", sha256_hex(b"x-amz-checksum-crc32:sOO8/Q==\n"));
+        let tsig = hex(&hmac(&key, sts.as_bytes()));
+        let mut tb = body[..body.len() - 2].to_vec();
+        tb.extend(format!("X-Amz-Checksum-Crc32: sOO8/Q==\r\nx-amz-trailer-signature:{tsig}\r\n\r\n").into_bytes());
+        assert!(verify_chunks(&tb, seed, &key, d, sc, true).is_ok());
+        let forged = String::from_utf8(tb.clone()).unwrap().replace("sOO8/Q==", "AAAAAA==");
+        assert!(verify_chunks(forged.as_bytes(), seed, &key, d, sc, true).is_err(), "changed trailer value");
+        assert!(verify_chunks(&body, seed, &key, d, sc, true).is_err(), "trailer signature missing");
     }
 
     // AWS SigV4 test suite "get-vanilla".
