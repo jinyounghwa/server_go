@@ -6,7 +6,7 @@
 ## 1. 현재 상태
 
 - 계획서 4장 체크리스트를 실제 상태로 표시했다(2026-11-21). 6장 순서 **1~8단계 전부 완료** (코어·22개 서비스·GUI·캐릭터 마을·해설 에이전트·검증 에이전트·Python/JS/Rust 3개 SDK 호환성 스위트·Dockerfile/Homebrew/GitHub Actions CI·Release 패키징·문서 정비).
-- 2026-11-21 추가: S3 버킷 정책(Put/Get/DeleteBucketPolicy, 같은 계정 규칙: 명시적 Deny 우선, 신원·버킷 정책 중 하나의 Allow면 허용, 계정 지정은 위임일 뿐 사용자 허용 아님, 루트는 정책 관리 항상 가능), SQS 메시지 속성(MD5 검증). 선택적 SigV4 검증, SQS FIFO, DynamoDB 400KB 한도, 검사 시나리오 7개, 설정 파일·설정 화면, SKILL.md.
+- 2026-11-21 추가: S3 버킷 정책·SQS 큐 정책(`Policy` 속성, Put/Get/DeleteBucketPolicy, 같은 계정 규칙: 명시적 Deny 우선, 신원·버킷 정책 중 하나의 Allow면 허용, 계정 지정은 위임일 뿐 사용자 허용 아님, 루트는 정책 관리 항상 가능), SQS 메시지 속성(MD5 검증). 선택적 SigV4 검증, SQS FIFO, DynamoDB 400KB 한도, 검사 시나리오 7개, 설정 파일·설정 화면, SKILL.md.
 - 이후 추가: JSON 상태 스냅샷, 3D(Three.js) 캐릭터 마을(본섬 28개 시설 + 다리 건너 다운타운 + 모노레일 건너 "연대기 섬": 계획서 0~10단계 오벨리스크와 SigV4·FIFO·400KB·SDK 경기장·릴리스·Homebrew·Docker·우분투·검사관 훈련장·Pages 포털·/_ui 전광판, `town.html` 12절), GitHub Pages 마을(`pages.yml`). Pages 마을은 방문자 PC의 로컬 에뮬레이터
   (`127.0.0.1:4566`, `?api=`)에 SSE로 붙어 실제 트래픽을 보여 주고, 연결 전에는 목업 트래픽을 돌린다. Pages에서는 자동 연결·재시도를 하지 않고 🔌 연결 버튼을 눌렀을 때만 붙는다(실패한 연결마다 브라우저가 ERR_CONNECTION_REFUSED를 콘솔에 남기기 때문). `/_town`(같은 출처)은 자동 연결.
 - `v0.1.0` 릴리스 완료(2026-11-21): 바이너리 3종 + SHA256SUMS, Homebrew sha256 반영.
@@ -118,7 +118,7 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
 4. **3D 마을 점검.** 저사양 GPU·모바일·Safari·Firefox 화면 확인(지금까지 맥 Chrome만 확인). 연대기 섬의 숫자
    (SDK 테스트 28/5/4개, 시나리오 20개, GPU 65°C)는 `town.html` 12절에 손으로 적은 값이라 테스트가 늘면 같이 고친다.
    맥에서 에뮬레이터를 띄운 `/_town` 실시간 모드는 이번 3D 개편 뒤 아직 직접 보지 않았다.
-5. **알려진 한계(8절) 중 효과 큰 순서.** ~~SQS 메시지 속성~~(완료) → ~~S3 버킷 정책~~(완료, `iam.rs` `authorize_with`) → SQS 큐 정책 평가 →
+5. **알려진 한계(8절) 중 효과 큰 순서.** ~~SQS 메시지 속성~~(완료) → ~~S3 버킷 정책~~(완료, `iam.rs` `authorize_with`) → ~~SQS 큐 정책~~(완료) →
    Step Functions Parallel 진짜 병렬 → ALB 경로 규칙 → aws-chunked 조각 서명 검증. 각각 sdk_test.py에 정상·오류 경로 테스트를 같이 넣는다.
 6. (선택) `?api=`로 IPv6 `[::1]`을 쓰려면 CSP `connect-src`가 IPv6 리터럴을 못 받으므로 별도 방법이 필요하다. 요청이 있을 때만.
 
@@ -126,6 +126,6 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
 
 ## 8. 알려진 한계 (요약)
 상태는 기본 인메모리(JSON 스냅샷 `RC_STATE_FILE` 또는 SQLite `RC_SQLITE_FILE`로 영속 저장 가능), SigV4 서명은 `VERIFY_SIGV4=1`일 때만 검증(SigV2 거부,
-aws-chunked 조각 서명은 미검증), S3 외 리소스 기반 정책(SQS 큐·SNS 토픽·Lambda) 미평가, KMS는 진짜 암호 아님,
+aws-chunked 조각 서명은 미검증), SNS 토픽·Lambda 리소스 기반 정책 미평가(S3 버킷·SQS 큐 정책은 평가), KMS는 진짜 암호 아님,
 ALB는 L4 라운드로빈(경로 규칙 없음), Step Functions 병렬 가지가 순차 실행, SNS→SQS 배달 시 메시지 속성 미전달, Query 프로토콜 구버전 SQS 미지원,
 ECS 태스크가 에뮬레이터를 부르려면 `BIND=0.0.0.0:4566` 필요. 세부는 각 파일의 `ponytail:` 주석.

@@ -218,6 +218,21 @@ def test_iam():
     assert s3.get_object(Bucket=b, Key="secret/k.txt")["Body"].read() == b"no"
     assert code(s3b.get_object, Bucket=b, Key="public/a.txt") == "AccessDenied"
 
+    # Queue policy: same rules for SQS.
+    sqb = boto3.client("sqs", **dict(kw, aws_access_key_id=bk["AccessKeyId"], aws_secret_access_key=bk["SecretAccessKey"]))
+    qu = sqs.create_queue(QueueName=f"qp{run}")["QueueUrl"]
+    qarn = f"arn:aws:sqs:us-east-1:000000000000:qp{run}"
+    assert code(sqb.send_message, QueueUrl=qu, MessageBody="x") == "AccessDenied"
+    assert code(sqs.set_queue_attributes, QueueUrl=qu, Attributes={"Policy": "{not json"}) == "InvalidAttributeValue"
+    qp = {"Statement": [{"Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::000000000000:user/{bob}"}, "Action": "sqs:SendMessage", "Resource": qarn}]}
+    sqs.set_queue_attributes(QueueUrl=qu, Attributes={"Policy": json.dumps(qp)})
+    assert json.loads(sqs.get_queue_attributes(QueueUrl=qu, AttributeNames=["Policy"])["Attributes"]["Policy"]) == qp
+    sqb.send_message(QueueUrl=qu, MessageBody="from-bob")
+    assert code(sqb.receive_message, QueueUrl=qu) == "AccessDenied"
+    sqs.set_queue_attributes(QueueUrl=qu, Attributes={"Policy": ""})
+    assert code(sqb.send_message, QueueUrl=qu, MessageBody="x") == "AccessDenied"
+    sqs.delete_queue(QueueUrl=qu)
+
     sim = iam.simulate_principal_policy(PolicySourceArn=f"arn:aws:iam::000000000000:user/{u}", ActionNames=["s3:GetObject"],
                                         ResourceArns=[f"arn:aws:s3:::{b}/public/a", f"arn:aws:s3:::{b}/secret/a", "arn:aws:s3:::other/x"])
     assert [r["EvalDecision"] for r in sim["EvaluationResults"]] == ["allowed", "explicitDeny", "implicitDeny"], sim

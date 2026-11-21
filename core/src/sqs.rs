@@ -113,6 +113,17 @@ fn pick_attrs(all: &Value, want: &Value) -> Value {
     Value::Object(all.as_object().into_iter().flatten().filter(|(k, _)| keep(k)).map(|(k, v)| (k.clone(), v.clone())).collect())
 }
 
+// A queue policy must be a valid resource policy; an empty string removes it.
+fn check_policy(attrs: &BTreeMap<String, String>) -> Result<(), ApiErr> {
+    match attrs.get("Policy").filter(|p| !p.is_empty()) {
+        None => Ok(()),
+        Some(p) => serde_json::from_str::<Value>(p)
+            .map_err(|e| e.to_string())
+            .and_then(|v| crate::iam::validate_resource_policy(&v))
+            .map_err(|m| err("InvalidAttributeValue", format!("Invalid value for the parameter Policy. Reason: {m}"))),
+    }
+}
+
 fn entries(r: &Value) -> impl Iterator<Item = &Value> {
     r["Entries"].as_array().into_iter().flatten()
 }
@@ -193,6 +204,7 @@ fn call(qs: &mut Queues, op: &str, r: &Value, host: &str) -> Result<Value, ApiEr
         "CreateQueue" => {
             let n = s(r, "QueueName")?;
             let given = str_map(&r["Attributes"]);
+            check_policy(&given)?;
             if let Some(q) = qs.q.get(n) {
                 if given.iter().any(|(k, v)| q.attrs.get(k) != Some(v)) {
                     return Err(err("QueueAlreadyExists", "A queue already exists with the same name and a different value for attribute(s)."));
@@ -232,7 +244,13 @@ fn call(qs: &mut Queues, op: &str, r: &Value, host: &str) -> Result<Value, ApiEr
             Ok(json!({}))
         }
         "SetQueueAttributes" => {
-            queue(qs, r)?.attrs.extend(str_map(&r["Attributes"]));
+            let given = str_map(&r["Attributes"]);
+            check_policy(&given)?;
+            let q = queue(qs, r)?;
+            if given.get("Policy").is_some_and(|p| p.is_empty()) {
+                q.attrs.remove("Policy");
+            }
+            q.attrs.extend(given.into_iter().filter(|(k, v)| !(k == "Policy" && v.is_empty())));
             Ok(json!({}))
         }
         "GetQueueAttributes" => {
@@ -382,6 +400,10 @@ impl Queues {
         r.ok().and_then(|v| v["Messages"].as_array().cloned()).unwrap_or_default().into_iter().map(|m| json!({
             "messageId": m["MessageId"], "receiptHandle": m["ReceiptHandle"], "body": m["Body"], "md5OfBody": m["MD5OfBody"],
             "attributes": m["Attributes"], "messageAttributes": lambda_attrs(&m["MessageAttributes"])})).collect()
+    }
+    // Queue policy (the Policy attribute), consulted by the authorizer.
+    pub fn policy(&self, name: &str) -> Option<Value> {
+        self.q.get(name)?.attrs.get("Policy").and_then(|p| serde_json::from_str(p).ok())
     }
     pub fn delete_receipt(&mut self, name: &str, receipt: &str) {
         if let Some(q) = self.q.get_mut(name) {

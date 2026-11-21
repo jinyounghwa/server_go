@@ -407,15 +407,20 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
     };
 
     // Authorization: the first denied (action, resource) decides; otherwise the last allow explains.
-    let bucket_policy = match &svc {
-        Svc::S3(r) if !r.bucket.is_empty() => app.s3.lock().unwrap().policy(&r.bucket),
+    // Resource-based policy of the target, if any (S3 bucket policy, SQS queue policy).
+    let resource_policy = match &svc {
+        Svc::S3(r) if !r.bucket.is_empty() => app.s3.lock().unwrap().policy(&r.bucket).map(|p| ("bucket policy", p)),
+        Svc::Sqs(_) => serde_json::from_slice::<Value>(&body).ok().and_then(|b| {
+            let name = b["QueueUrl"].as_str()?.rsplit('/').next()?.to_string();
+            app.sqs.lock().unwrap().policy(&name).map(|p| ("queue policy", p))
+        }),
         _ => None,
     };
     let decision = {
         let iam = app.iam.lock().unwrap();
         let mut last = None;
         for (a, r) in checks(&app, &svc, &body) {
-            let d = iam.authorize_with(&principal, &a, &r, bucket_policy.as_ref());
+            let d = iam.authorize_with(&principal, &a, &r, resource_policy.as_ref().map(|(k, p)| (*k, p)));
             let deny = !d.allowed;
             last = Some(d);
             if deny {

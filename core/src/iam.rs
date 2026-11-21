@@ -269,11 +269,12 @@ impl Iam {
     // Same-account evaluation with a resource-based policy (bucket policy): an explicit Deny in either policy wins,
     // otherwise an Allow in either grants. The account root can always manage the bucket policy itself, as in AWS,
     // so a Deny-everyone policy can't lock the bucket for good.
-    // ponytail: only S3 bucket policies are evaluated; SQS/SNS/Lambda resource policies are not stored yet.
-    pub fn authorize_with(&self, p: &Principal, action: &str, resource: &str, rp: Option<&Value>) -> Decision {
+    // The root can likewise always rewrite a queue policy (SetQueueAttributes).
+    // ponytail: S3 bucket and SQS queue policies only; SNS topic and Lambda resource policies are not evaluated.
+    pub fn authorize_with(&self, p: &Principal, action: &str, resource: &str, rp: Option<(&str, &Value)>) -> Decision {
         let id = self.authorize(p, action, resource);
-        let Some(doc) = rp else { return id };
-        if id.kind == "explicitDeny" || (matches!(p, Principal::Root) && action.ends_with("BucketPolicy")) {
+        let Some((kind, doc)) = rp else { return id };
+        if id.kind == "explicitDeny" || (matches!(p, Principal::Root) && (action.ends_with("BucketPolicy") || action == "sqs:SetQueueAttributes")) {
             return id;
         }
         let ctx = req_ctx(p);
@@ -293,17 +294,17 @@ impl Iam {
                 return Decision {
                     allowed: false,
                     kind: "explicitDeny",
-                    reason: format!("User: {} is not authorized to perform: {action} on resource: {resource} with an explicit deny in a resource-based policy (bucket policy, statement {sid})", p.arn()),
-                    matched: vec!["bucket policy".into()],
+                    reason: format!("User: {} is not authorized to perform: {action} on resource: {resource} with an explicit deny in a resource-based policy ({kind}, statement {sid})", p.arn()),
+                    matched: vec![kind.into()],
                 };
             }
             allow.get_or_insert(sid);
         }
         match (id.allowed, allow) {
             (true, _) => id,
-            (false, Some(sid)) => Decision { allowed: true, kind: "allowed", reason: format!("allowed by resource-based policy (bucket policy, statement {sid})"), matched: vec!["bucket policy".into()] },
+            (false, Some(sid)) => Decision { allowed: true, kind: "allowed", reason: format!("allowed by resource-based policy ({kind}, statement {sid})"), matched: vec![kind.into()] },
             (false, None) => Decision {
-                reason: format!("User: {} is not authorized to perform: {action} on resource: {resource} because no identity-based policy or bucket policy allows the {action} action", p.arn()),
+                reason: format!("User: {} is not authorized to perform: {action} on resource: {resource} because no identity-based policy or {kind} allows the {action} action", p.arn()),
                 ..id
             },
         }
@@ -693,17 +694,17 @@ mod tests {
         let obj = "arn:aws:s3:::b/k";
         let pol = |eff: &str, who: Value, act: &str| json!({"Statement": [{"Sid": "S", "Effect": eff, "Principal": who, "Action": act, "Resource": "arn:aws:s3:::b/*"}]});
         assert!(!iam.authorize_with(&bob, "s3:GetObject", obj, None).allowed);
-        assert!(iam.authorize_with(&bob, "s3:GetObject", obj, Some(&pol("Allow", json!({"AWS": user_arn("bob")}), "s3:GetObject"))).allowed);
-        assert!(iam.authorize_with(&bob, "s3:GetObject", obj, Some(&pol("Allow", json!("*"), "s3:Get*"))).allowed);
+        assert!(iam.authorize_with(&bob, "s3:GetObject", obj, Some(("bucket policy", &pol("Allow", json!({"AWS": user_arn("bob")}), "s3:GetObject")))).allowed);
+        assert!(iam.authorize_with(&bob, "s3:GetObject", obj, Some(("bucket policy", &pol("Allow", json!("*"), "s3:Get*")))).allowed);
         // Naming the account delegates to identity policies: bob still has none.
-        assert!(!iam.authorize_with(&bob, "s3:GetObject", obj, Some(&pol("Allow", json!({"AWS": ACCOUNT}), "s3:GetObject"))).allowed);
+        assert!(!iam.authorize_with(&bob, "s3:GetObject", obj, Some(("bucket policy", &pol("Allow", json!({"AWS": ACCOUNT}), "s3:GetObject")))).allowed);
         // Deny applies to everyone it names, root included, except root managing the policy itself.
         let deny_all = pol("Deny", json!("*"), "s3:*");
-        assert_eq!(iam.authorize_with(&Principal::Root, "s3:GetObject", obj, Some(&deny_all)).kind, "explicitDeny");
-        assert!(iam.authorize_with(&Principal::Root, "s3:DeleteBucketPolicy", "arn:aws:s3:::b", Some(&deny_all)).allowed);
-        assert!(!iam.authorize_with(&bob, "s3:DeleteBucketPolicy", "arn:aws:s3:::b", Some(&deny_all)).allowed);
+        assert_eq!(iam.authorize_with(&Principal::Root, "s3:GetObject", obj, Some(("bucket policy", &deny_all))).kind, "explicitDeny");
+        assert!(iam.authorize_with(&Principal::Root, "s3:DeleteBucketPolicy", "arn:aws:s3:::b", Some(("bucket policy", &deny_all))).allowed);
+        assert!(!iam.authorize_with(&bob, "s3:DeleteBucketPolicy", "arn:aws:s3:::b", Some(("bucket policy", &deny_all))).allowed);
         let not_bob = json!({"Statement": [{"Effect": "Deny", "NotPrincipal": {"AWS": user_arn("bob")}, "Action": "s3:*", "Resource": "*"}]});
-        assert_eq!(iam.authorize_with(&Principal::Root, "s3:GetObject", obj, Some(&not_bob)).kind, "explicitDeny");
+        assert_eq!(iam.authorize_with(&Principal::Root, "s3:GetObject", obj, Some(("bucket policy", &not_bob))).kind, "explicitDeny");
         assert!(validate_resource_policy(&json!({"Statement": [{"Effect": "Allow", "Action": "s3:*"}]})).is_err());
         assert!(validate_resource_policy(&json!({"Statement": []})).is_err());
     }
