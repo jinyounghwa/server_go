@@ -1,8 +1,9 @@
 // Application Load Balancer (elbv2, Query): load balancers, target groups, listeners that really listen.
 // Each listener binds 127.0.0.1:{Port} and forwards connections round-robin to healthy ip targets
 // (ECS service tasks register themselves). Listener ports must be >= 1024 locally.
-// Listener rules (path-pattern / host-header, by priority) are matched on the first request of each connection.
-// ponytail: later requests on a keep-alive connection reuse that choice; no TLS, sticky sessions or Lambda targets.
+// Listener rules (path-pattern / host-header, by priority) are matched per request: with rules, the proxy forces
+// `Connection: close` on the request and response, so each request comes on a new connection and is routed fresh.
+// ponytail: one request per connection (no keep-alive reuse) on ruled listeners; no TLS, sticky sessions or Lambda targets.
 use crate::{err, ApiErr, App, ACCOUNT, REGION};
 use serde_json::{json, Value};
 use std::{collections::{BTreeMap, HashMap}, sync::Arc, time::Duration};
@@ -86,6 +87,23 @@ fn request_head(buf: &[u8]) -> (String, String) {
     let host = lines.find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("host")).map(|(_, v)| v.trim().to_string()))
         .unwrap_or_default();
     (path, host.rsplit_once(':').map_or(host.clone(), |(h, p)| if p.bytes().all(|b| b.is_ascii_digit()) { h.to_string() } else { host.clone() }))
+}
+
+// Rewrites an HTTP head so the connection closes after this exchange (drops Connection/Keep-Alive headers).
+fn force_close(head: &[u8]) -> Vec<u8> {
+    let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") else { return head.to_vec() };
+    let text = String::from_utf8_lossy(&head[..end]);
+    let mut out = String::new();
+    for l in text.split("\r\n") {
+        let k = l.split(':').next().unwrap_or("").trim().to_ascii_lowercase();
+        if !matches!(k.as_str(), "connection" | "keep-alive" | "proxy-connection") {
+            out += l;
+            out += "\r\n";
+        }
+    }
+    let mut v = (out + "Connection: close\r\n\r\n").into_bytes();
+    v.extend_from_slice(&head[end + 4..]);
+    v
 }
 
 fn healthy(host: &str, port: u16) -> bool {
@@ -392,12 +410,47 @@ pub fn serve(app: Arc<App>, listener: String, sock: std::net::TcpListener) {
                     }
                 };
                 crate::emit(&app, json!({"ts": chrono::Utc::now().to_rfc3339(), "service": "elbv2", "op": "Forward", "target": target, "status": 200}));
-                if let Ok(mut up) = tokio::net::TcpStream::connect(&target).await {
-                    if !head.is_empty() && up.write_all(&head).await.is_err() {
-                        return;
-                    }
+                let Ok(mut up) = tokio::net::TcpStream::connect(&target).await else { return };
+                if head.is_empty() {
                     let _ = tokio::io::copy_bidirectional(&mut client, &mut up).await;
+                    return;
                 }
+                if up.write_all(&force_close(&head)).await.is_err() {
+                    return;
+                }
+                // Request body upstream while the response comes back with its head rewritten (1xx heads pass as is).
+                let (mut cr, mut cw) = client.split();
+                let (mut ur, mut uw) = up.split();
+                let down = async {
+                    let mut buf = vec![];
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        while buf.len() < 16384 && !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            match ur.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else { break };
+                        if buf.starts_with(b"HTTP/1.1 1") && !buf.starts_with(b"HTTP/1.1 101") {
+                            if cw.write_all(&buf[..end + 4]).await.is_err() {
+                                return;
+                            }
+                            buf.drain(..end + 4);
+                            continue;
+                        }
+                        buf = force_close(&buf);
+                        break;
+                    }
+                    if cw.write_all(&buf).await.is_ok() {
+                        let _ = tokio::io::copy(&mut ur, &mut cw).await;
+                    }
+                };
+                let up_body = async {
+                    let _ = tokio::io::copy(&mut cr, &mut uw).await;
+                    std::future::pending::<()>().await
+                };
+                tokio::select! { _ = down => {}, _ = up_body => {} }
             });
         }
     });
@@ -423,5 +476,7 @@ mod tests {
         let (p, h) = super::request_head(b"GET /api/x?y=1 HTTP/1.1\r\nHost: Admin.Local:8080\r\nAccept: */*\r\n\r\n");
         assert_eq!((p.as_str(), h.as_str()), ("/api/x", "Admin.Local"));
         assert_eq!(super::request_head(b"garbage"), ("/".to_string(), String::new()));
+        let v = super::force_close(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\n\r\nBODY");
+        assert_eq!(v, b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\nBODY");
     }
 }

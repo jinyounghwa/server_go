@@ -1035,6 +1035,7 @@ def test_alb_rules():
             def do_GET(self):
                 b = tag.encode(); self.send_response(200); self.send_header("content-length", str(len(b))); self.end_headers(); self.wfile.write(b)
             def log_message(self, *a): pass
+        H.protocol_version = "HTTP/1.1"  # keep-alive targets
         s = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
         threading.Thread(target=s.serve_forever, daemon=True).start()
         return s
@@ -1057,6 +1058,12 @@ def test_alb_rules():
     assert [r["Priority"] for r in rules] == ["10", "20", "default"] and rules[-1]["IsDefault"], rules
     get = lambda path, host=None: urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers={"Host": host} if host else {}), timeout=5).read()
     assert get("/api/orders?x=1") == b"api" and get("/") == b"web" and get("/apix") == b"web"
+    import http.client  # one client connection, several requests: each is routed by its own path
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    for path, want in (("/api/a", b"api"), ("/b", b"web"), ("/api/c", b"api")):
+        c.request("GET", path); r = c.getresponse()
+        assert r.read() == want and r.getheader("connection") == "close", (path, r.getheaders())
+    c.close()
     try:
         get("/", host="admin.local"); raise AssertionError("fixed 403 expected")
     except urllib.error.HTTPError as e:

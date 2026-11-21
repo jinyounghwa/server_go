@@ -130,5 +130,5 @@ Step Functions Parallel·Map 동시 실행, 이벤트 `auth.source`와 마을 �
 ## 8. 알려진 한계 (요약)
 상태는 기본 인메모리(JSON 스냅샷 `RC_STATE_FILE` 또는 SQLite `RC_SQLITE_FILE`로 영속 저장 가능), SigV4 서명은 `VERIFY_SIGV4=1`일 때만 검증(SigV2 거부,
 aws-chunked 조각 서명은 검증, 트레일러 서명은 미검증), 리소스 기반 정책은 S3 버킷·SQS 큐·SNS 토픽·Lambda 함수(AddPermission)를 평가하지만 서비스 주체(sns.amazonaws.com 등)의 내부 호출은 정책으로 막지 않음, KMS는 진짜 암호 아님,
-ALB 리스너 규칙(path-pattern·host-header)은 연결의 첫 요청으로만 고름(keep-alive 이후 요청은 같은 대상), Query 프로토콜 구버전 SQS 미지원,
+ALB 리스너 규칙(path-pattern·host-header)은 요청마다 고르되 규칙이 있는 리스너는 `Connection: close`로 요청당 연결 하나, Query 프로토콜 구버전 SQS 미지원,
 ECS 태스크가 에뮬레이터를 부르려면 `BIND=0.0.0.0:4566` 필요. 세부는 각 파일의 `ponytail:` 주석.
