@@ -73,6 +73,7 @@ All options can be set via environment variables or a `KEY=VALUE` file pointed t
 | `RC_ROOT_SECRET` | `test` | Secret key used for unregistered (root) access keys when `VERIFY_SIGV4=1` |
 | `RC_CONFIG` | *(unset)* | Path to a `KEY=VALUE` configuration file (`#` comments supported) |
 | `RC_STATE_FILE` | *(unset)* | JSON snapshot file auto-loaded on startup and written via `POST /_admin/snapshot/save` |
+| `RC_SQLITE_FILE` | `:memory:` | SQLite DB file for persistent service state, snapshot history, and event log (`/_admin/sqlite/*`, `/_admin/sql`) |
 | `RC_TOWN_ORIGIN` | `https://jinyounghwa.github.io` | Single CORS origin allowed to read scrubbed `/_events` for GitHub Pages; set `off` to disable |
 | `RC_LLM_URL` | `http://127.0.0.1:11434` | Local Ollama endpoint for the explanation and verification agents |
 | `RC_LLM_MODEL` | `qwen3.5:9b` | Model name used by Ollama |
@@ -189,6 +190,25 @@ cd tests/js && npm install && npm test
 cd tests/rust && cargo run
 ```
 
+## Diagnostic & DB Query Tools (`tools/`)
+
+```sh
+# Unified DB query CLI (SQLite / DynamoDB / RDS / Redis)
+uv run --with boto3 tools/db_query.py sqlite "SELECT service, count(*) FROM events GROUP BY service"
+uv run --with boto3 tools/db_query.py ddb tables
+uv run --with boto3 --with pg8000 --with pymysql tools/db_query.py rds list
+uv run --with boto3 --with redis tools/db_query.py redis list
+
+# Cross-SDK response auto-comparison (Python boto3 vs JS @aws-sdk v3)
+uv run --with boto3 tools/sdk_compare.py
+
+# Partial failure & chaos recovery diagnostic
+uv run --with boto3 tools/partial_fail_check.py --rates 0.2,0.5 --samples 60
+
+# Process RSS memory growth & throughput benchmark
+uv run --with boto3 tools/mem_bench.py --cycles 300 --payload-kb 4
+```
+
 ---
 
 ## Built-in Endpoints
@@ -202,6 +222,8 @@ cd tests/rust && cargo run
 | `GET /_admin/state` | Current resource summaries across all 22+ services |
 | `GET /_admin/snapshot` / `POST /_admin/snapshot` | Export or restore JSON state snapshots (`POST` requires `x-rocalcloud`) |
 | `POST /_admin/snapshot/save` | Persist current state to `RC_STATE_FILE` (requires `x-rocalcloud`) |
+| `GET /_admin/sqlite/snapshots`, `POST /_admin/sqlite/save`, `POST /_admin/sqlite/restore` | List, save, and restore SQLite-backed state snapshots (`POST` requires `x-rocalcloud`) |
+| `POST /_admin/sql` | Execute read-only `SELECT` / `WITH` / `PRAGMA table_info` SQL queries on the SQLite store (requires `x-rocalcloud`) |
 | `POST /_admin/reset` | Wipe all in-memory state and clean up Docker containers (requires `x-rocalcloud`) |
 | `GET /_admin/chaos` / `POST /_admin/chaos` | Inspect or configure chaos fault injection rules (`POST` requires `x-rocalcloud`) |
 | `GET /_admin/reach` | Step-by-step VPC reachability check (`?from=internet\|<id>&to=...&protocol=tcp&port=443`) |

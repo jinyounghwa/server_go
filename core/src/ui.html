@@ -90,6 +90,7 @@ pre { margin: 4px 0 10px; padding: 8px 10px; background: var(--panel); border: 1
   <form class="ask" id="askform"><input id="q" placeholder="에이전트에게 묻기 (예: 최근 오류 왜 났어?)" aria-label="에이전트에게 질문"><button>묻기</button></form>
   <span class="muted" id="llm"></span>
   <button id="inspectbtn">검사</button>
+  <button id="dbbtn">DB 쿼리</button>
   <button id="settingsbtn">설정</button>
   <a href="/_admin/snapshot" download="rocalcloud-snapshot.json" style="color:inherit">스냅샷 저장</a>
   <button id="snapload">스냅샷 복원</button><input id="snapfile" type="file" accept="application/json" hidden>
@@ -323,8 +324,70 @@ async function showSettings(msg) {
        <span class="muted">${esc(msg || "")}</span></p>`);
 }
 $("settingsbtn").onclick = () => showSettings();
+// ---------- DB query console: read-only SQLite SQL + snapshots ----------
+const SQL_PRESETS = [
+  ["최근 이벤트 20건", "SELECT id, substr(ts,12,8) AS time, service, op, status, round(ms,1) AS ms, decision, error_code FROM events ORDER BY id DESC LIMIT 20"],
+  ["서비스별 통계", "SELECT service, count(*) AS total, sum(CASE WHEN status >= 400 THEN 1 ELSE 0 END) AS errors, round(avg(ms),2) AS avg_ms FROM events GROUP BY service ORDER BY total DESC"],
+  ["오류·거부 목록", "SELECT id, substr(ts,12,8) AS time, service, op, status, decision, error_code FROM events WHERE status >= 400 OR decision IS NOT NULL ORDER BY id DESC LIMIT 50"],
+  ["스냅샷 이력", "SELECT id, saved_at, label, length(payload) AS bytes FROM snapshots ORDER BY id DESC LIMIT 20"],
+  ["서비스 상태", "SELECT service, updated_at, length(payload) AS bytes FROM service_state ORDER BY service"],
+];
+let dbSql = SQL_PRESETS[0][1], dbRes = null, dbErr = "", dbMeta = null;
+async function showDbQuery() {
+  dbMeta = await fetch("/_admin/sqlite/snapshots").then(r => r.json()).catch(() => null);
+  const metaText = dbMeta
+    ? `저장소: ${esc(dbMeta.path)} (${dbMeta.persistent ? "디스크 영속" : "인메모리"}) · 누적 이벤트 ${dbMeta.event_count}건 · 스냅샷 ${(dbMeta.snapshots || []).length}개`
+    : "SQLite 정보를 불러올 수 없습니다.";
+  const presets = SQL_PRESETS.map(([name], i) => `<button data-sqlpreset="${i}">${esc(name)}</button>`).join(" ");
+  const snaps = dbMeta && dbMeta.snapshots && dbMeta.snapshots.length
+    ? `<h4>SQLite 스냅샷 이력</h4>` + table(["ID", "시각", "라벨", "크기", "동작"],
+        dbMeta.snapshots.map(s => [s.id, s.saved_at, s.label, s.size_bytes + " B", `<button data-sqlrestore="${s.id}">복원</button>`]))
+    : "";
+  const out = dbErr
+    ? `<pre class="deny">${esc(dbErr)}</pre>`
+    : dbRes
+      ? `<div class="muted" style="margin:6px 0">${dbRes.row_count}행 · ${dbRes.elapsed_ms}ms${dbRes.truncated ? " (상한 도달로 잘림)" : ""}</div>` +
+        table(dbRes.columns, dbRes.rows.map(r => r.map(v => v === null ? "NULL" : (typeof v === "object" ? JSON.stringify(v) : String(v)))))
+      : `<div class="hint">프리셋을 고르거나 SELECT 쿼리를 입력해 실행하세요.</div>`;
+  showAgent(`<h2>DB 쿼리 콘솔 (SQLite)</h2><div class="sub">${metaText}</div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">${presets}</div>
+    <textarea id="sqlinput" rows="4" style="width:100%;font-family:ui-monospace,monospace">${esc(dbSql)}</textarea>
+    <p style="display:flex;gap:8px;align-items:center">
+      <button id="sqlrun">SQL 실행 (읽기 전용)</button>
+      <input id="sqllabel" placeholder="스냅샷 라벨 (예: before-test)" style="font:inherit;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--text)">
+      <button id="sqlsave">SQLite 스냅샷 저장</button>
+    </p>
+    ${out}${snaps}`);
+}
+$("dbbtn").onclick = () => showDbQuery();
 document.addEventListener("click", async ev => {
   const id = ev.target.id;
+  if (ev.target.dataset && ev.target.dataset.sqlpreset != null) {
+    dbSql = SQL_PRESETS[+ev.target.dataset.sqlpreset][1];
+    dbErr = "";
+    const r = await fetch("/_admin/sql", {method: "POST", headers: H, body: JSON.stringify({sql: dbSql, limit: 200})});
+    if (r.ok) dbRes = await r.json(); else { dbRes = null; dbErr = await r.text(); }
+    return showDbQuery();
+  }
+  if (id === "sqlrun") {
+    dbSql = $("sqlinput").value; dbErr = "";
+    const r = await fetch("/_admin/sql", {method: "POST", headers: H, body: JSON.stringify({sql: dbSql, limit: 200})});
+    if (r.ok) dbRes = await r.json(); else { dbRes = null; dbErr = await r.text(); }
+    return showDbQuery();
+  }
+  if (id === "sqlsave") {
+    const label = ($("sqllabel") && $("sqllabel").value.trim()) || "manual";
+    const r = await fetch("/_admin/sqlite/save", {method: "POST", headers: H, body: JSON.stringify({label})});
+    if (!r.ok) dbErr = "스냅샷 저장 실패: " + await r.text(); else dbErr = "";
+    return showDbQuery();
+  }
+  if (ev.target.dataset && ev.target.dataset.sqlrestore != null) {
+    const sid = +ev.target.dataset.sqlrestore;
+    if (!confirm(`스냅샷 #${sid} 상태로 복원할까요?`)) return;
+    const r = await fetch("/_admin/sqlite/restore", {method: "POST", headers: H, body: JSON.stringify({id: sid})});
+    if (!r.ok) alert("복원 실패: " + await r.text()); else { load(); showDbQuery(); }
+    return;
+  }
   if (id === "chaosapply" || id === "chaosclear") {
     let rules;
     try { rules = id === "chaosclear" ? [] : JSON.parse($("chaosrules").value); } catch (e) { return showSettings("JSON 오류: " + e.message); }

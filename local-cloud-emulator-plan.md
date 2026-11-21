@@ -66,7 +66,7 @@ Status as of **2026-11-21**: `[x]` completed, `[~]` partially implemented or int
 - [x] Service identification and routing (headers, host, path, query action/version)
 - [x] SigV4 header parsing & optional full signature verification (`VERIFY_SIGV4=1`)
 - [x] Account, region, and ARN model
-- [~] State persistence (memory, snapshot, reset) — Implemented with in-memory state + JSON snapshot export/restore (`RC_STATE_FILE`, `/_admin/snapshot`). SQLite was skipped because JSON snapshots cover local dev workflows cleanly; SQLite can be added later if very large state is needed.
+- [x] State persistence (SQLite, memory mode, snapshots, reset) — In-memory state + JSON snapshots (`RC_STATE_FILE`, `/_admin/snapshot`) + bundled SQLite store (`RC_SQLITE_FILE`, `service_state` / `snapshots` / `events` tables, `/_admin/sqlite/*`, read-only SQL console at `/_admin/sql`)
 - [x] Standard error formatting and request IDs (`x-amzn-requestid`, `x-amz-request-id`)
 - [x] Event bus (publishes every request to SSE `/_events` and recent ring buffer)
 - [x] Config file and environment variables (`RC_CONFIG` `KEY=VALUE`, `/_admin/config`)
@@ -144,7 +144,7 @@ Status as of **2026-11-21**: `[x]` completed, `[~]` partially implemented or int
 - [x] **Security (7):** IAM implicit/explicit deny, CSRF header enforcement, S3 path traversal, missing/malformed SigV4, >256 MiB payload rejection (413), injection payloads
 - [x] **Incidents (4):** 1000-message queue flood, DynamoDB 400 KB item & SQS 256 KiB message limits, Lambda repeated failures, SQS DLQ buildup
 - [x] **Chaos / Fault Injection (6):** Throttling recovery, 5xx recovery, latency injection, 50% partial failure, mid-request dropped connections, table delete/recreate under write load
-- [~] **Cross-SDK Compatibility:** Python, JS, and Rust suites each independently verify overlapping services; automated cross-SDK response diffing is not yet implemented.
+- [x] **Cross-SDK Compatibility:** Python, JS, and Rust suites verify overlapping services, and `tools/sdk_compare.py` runs identical 7-service scenarios on Python (`boto3`) and JS (`@aws-sdk` v3) to automatically diff normalized responses and error codes.
 - [x] **Regression:** Failed scenarios can be saved to `tests/regressions/*.json` and replayed via `/_inspect/replay`
 - [x] **Performance (2):** 40-request concurrent burst throughput, resident-memory growth across 2000 write/delete cycles
 - [x] **Fuzzing (1):** 15 malformed inputs to detect panics or crashes

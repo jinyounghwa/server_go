@@ -23,6 +23,7 @@ mod sigv4;
 mod sns;
 mod sqs;
 mod ssm;
+mod storage;
 
 use axum::response::IntoResponse;
 use axum::{
@@ -123,6 +124,7 @@ pub struct App {
     pub(crate) chaos: Mutex<Vec<Value>>,
     events: broadcast::Sender<String>,
     pub recent: Mutex<std::collections::VecDeque<Value>>,
+    pub store: Mutex<storage::SqliteStore>,
 }
 
 fn json_reply(prefix: &str, r: Result<Value, ApiErr>) -> Response {
@@ -209,6 +211,7 @@ const JSON_TARGETS: &[(&str, &str)] = &[
 pub fn emit(app: &App, ev: Value) {
     println!("{ev}");
     let _ = app.events.send(ev.to_string());
+    app.store.lock().unwrap().record_event(&ev);
     // Recent history for the explanation agent.
     let mut r = app.recent.lock().unwrap();
     if r.len() >= 1000 {
@@ -927,6 +930,58 @@ async fn save_snapshot_file(State(app): State<Arc<App>>, h: HeaderMap) -> Respon
     }
 }
 
+async fn sqlite_snapshots(State(app): State<Arc<App>>) -> Json<Value> {
+    Json(app.store.lock().unwrap().list_snapshots())
+}
+
+async fn sqlite_save(State(app): State<Arc<App>>, h: HeaderMap, body: Bytes) -> Response {
+    if !h.contains_key("x-rocalcloud") {
+        return Response::builder().status(403).body(Body::empty()).unwrap();
+    }
+    let label = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v["label"].as_str().map(str::to_string))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "manual".into());
+    let snap = export_snapshot(&app);
+    match app.store.lock().unwrap().save_snapshot(&label, &snap) {
+        Ok(id) => Json(json!({"id": id, "label": label, "saved_at": snap["saved_at"]})).into_response(),
+        Err(e) => Response::builder().status(500).body(Body::from(e)).unwrap(),
+    }
+}
+
+async fn sqlite_restore(State(app): State<Arc<App>>, h: HeaderMap, body: Bytes) -> Response {
+    if !h.contains_key("x-rocalcloud") {
+        return Response::builder().status(403).body(Body::empty()).unwrap();
+    }
+    let id = serde_json::from_slice::<Value>(&body).ok().and_then(|v| v["id"].as_i64());
+    let snap = match app.store.lock().unwrap().load_snapshot(id) {
+        Ok(Some(s)) => s,
+        Ok(None) => return Response::builder().status(404).body(Body::from("no snapshot found")).unwrap(),
+        Err(e) => return Response::builder().status(500).body(Body::from(e)).unwrap(),
+    };
+    import_snapshot(&app, &snap);
+    emit(&app, json!({"ts": chrono::Utc::now().to_rfc3339(), "service": "admin", "op": "SnapshotLoaded", "status": 200}));
+    Json(json!({"restored": true, "saved_at": snap["saved_at"]})).into_response()
+}
+
+async fn admin_sql(State(app): State<Arc<App>>, h: HeaderMap, body: Bytes) -> Response {
+    if !h.contains_key("x-rocalcloud") {
+        return Response::builder().status(403).body(Body::empty()).unwrap();
+    }
+    let Ok(v) = serde_json::from_slice::<Value>(&body) else {
+        return Response::builder().status(400).body(Body::from("invalid JSON")).unwrap();
+    };
+    let Some(sql) = v["sql"].as_str() else {
+        return Response::builder().status(400).body(Body::from("missing sql field")).unwrap();
+    };
+    let limit = v["limit"].as_u64().unwrap_or(500) as usize;
+    match app.store.lock().unwrap().query_readonly(sql, limit) {
+        Ok(res) => Json(res).into_response(),
+        Err(e) => Response::builder().status(400).body(Body::from(e)).unwrap(),
+    }
+}
+
 // Custom header forces a CORS preflight, so other websites can't wipe state with a blind POST.
 async fn reset(State(app): State<Arc<App>>, h: HeaderMap) -> axum::http::StatusCode {
     if !h.contains_key("x-rocalcloud") {
@@ -1080,7 +1135,7 @@ fn load_config() {
     }
 }
 
-const CONFIG_KEYS: &[&str] = &["ENFORCE_IAM", "VERIFY_SIGV4", "BIND", "REGION", "RC_CONFIG", "RC_STATE_FILE", "RC_TOWN_ORIGIN",
+const CONFIG_KEYS: &[&str] = &["ENFORCE_IAM", "VERIFY_SIGV4", "BIND", "REGION", "RC_CONFIG", "RC_STATE_FILE", "RC_SQLITE_FILE", "RC_TOWN_ORIGIN",
     "RC_LLM_URL", "RC_LLM_MODEL", "RC_DNS_PORT", "RC_DOCKER", "RC_CONTAINER_MEMORY", "RC_PYTHON", "RC_NODE"];
 
 async fn get_config() -> Json<Value> {
@@ -1148,6 +1203,10 @@ async fn serve() {
         chaos: Default::default(),
         events: broadcast::channel(1024).0,
         recent: Default::default(),
+        store: Mutex::new(
+            storage::SqliteStore::open(std::env::var("RC_SQLITE_FILE").ok().as_deref())
+                .expect("open sqlite store"),
+        ),
     });
     let _ = APP.set(app.clone());
     let router = Router::new()
@@ -1167,6 +1226,10 @@ async fn serve() {
         .route("/_admin/config", get(get_config))
         .route("/_admin/snapshot", get(get_snapshot).post(post_snapshot))
         .route("/_admin/snapshot/save", post(save_snapshot_file))
+        .route("/_admin/sqlite/snapshots", get(sqlite_snapshots))
+        .route("/_admin/sqlite/save", post(sqlite_save))
+        .route("/_admin/sqlite/restore", post(sqlite_restore))
+        .route("/_admin/sql", post(admin_sql))
         .route("/_admin/reset", post(reset))
         .route("/_admin/reach", get(reach))
         .route("/_api/{*rest}", axum::routing::any(api_invoke))
@@ -1182,6 +1245,12 @@ async fn serve() {
                 import_snapshot(&app, &snap);
                 eprintln!("rocalcloud restored snapshot from {path}");
             }
+        }
+    } else if std::env::var("RC_SQLITE_FILE").is_ok() {
+        let restored = app.store.lock().unwrap().load_service_state();
+        if let Some(snap) = restored {
+            import_snapshot(&app, &snap);
+            eprintln!("rocalcloud restored state from SQLite ({})", app.store.lock().unwrap().path);
         }
     }
     tokio::spawn(managed::cleanup());

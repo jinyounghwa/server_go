@@ -103,13 +103,12 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
   `VERIFY_SIGV4=1`이면 서명 없는 요청도 루트로 서명한다. 서명 없이 보내야 하는 검사는 `x-rc-unsigned` 헤더를 단다.
 - 새 시나리오: `sc_x()` 함수 → `run_inner()`의 `plan` 목록과 `match id`에 추가 → `make_result()`로 결과.
 
-## 7. 남은 일 (계획서 4장의 `[~]` 항목)
-- SQLite 저장소: JSON 스냅샷으로 대신함. 대용량 상태가 필요해지면 추가.
-- SDK 간 응답 자동 대조: 지금은 Python·JS·Rust 스위트가 각자 검증만 한다.
+## 7. 남은 일 (계획서 4장)
+- SQLite 저장소(`core/src/storage.rs`, `RC_SQLITE_FILE`, `/_admin/sql`, `/_admin/sqlite/*`)와 SDK 간 응답 자동 대조(`tools/sdk_compare.py`), DB 쿼리 도구(`tools/db_query.py`), 부분실패 검사(`tools/partial_fail_check.py`), 메모리 측정(`tools/mem_bench.py`) 모두 구현 완료.
 - 우분투 전체 검증(Docker 필요 테스트 포함)은 큰 변경 뒤마다 4절 방법으로 돌린다.
 
 ## 8. 알려진 한계 (요약)
-상태는 메모리 전용(JSON 스냅샷 파일 `RC_STATE_FILE`로 보존, SQLite 없음), SigV4 서명은 `VERIFY_SIGV4=1`일 때만 검증(SigV2 거부,
+상태는 기본 인메모리(JSON 스냅샷 `RC_STATE_FILE` 또는 SQLite `RC_SQLITE_FILE`로 영속 저장 가능), SigV4 서명은 `VERIFY_SIGV4=1`일 때만 검증(SigV2 거부,
 aws-chunked 조각 서명은 미검증), 리소스 기반 정책 미평가, KMS는 진짜 암호 아님,
 ALB는 L4 라운드로빈(경로 규칙 없음), Step Functions 병렬 가지가 순차 실행, SQS 메시지 속성 미저장, Query 프로토콜 구버전 SQS 미지원,
 ECS 태스크가 에뮬레이터를 부르려면 `BIND=0.0.0.0:4566` 필요. 세부는 각 파일의 `ponytail:` 주석.
