@@ -4,3 +4,4 @@ __pycache__/
 gui/gen/
 web/
 node_modules/
+.ubuntu_power.env

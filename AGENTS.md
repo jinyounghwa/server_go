@@ -73,6 +73,7 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
 - **맥 경량화 원칙 (필수)**: 맥에는 소스 코드만 가볍게 유지한다(~4 MB). `core/target`·`tests/rust/target`·`gui/target`·`tests/js/node_modules` 같은 무거운 빌드 산출물(수 GB)은 맥에 남기지 않고 우분투에서만 빌드·캐시한다. 맥에서 불가피하게 빌드했다면 작업 후 정리한다.
 - `ssh ubuntu` (192.168.0.105). 코드는 맥에서 쓰고 `rsync -az --exclude target --exclude node_modules --exclude __pycache__ core tests tools gui README.md local-cloud-emulator-plan.md AGENTS.md CONTRIBUTING.md SKILL.md Dockerfile ubuntu:~/work/projects/rocalcloud/`.
 - 원클릭 빌드·검증: `ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'` (`nice -n 10`, `-j 8` 한도 준수, 단위 테스트·릴리스 빌드·`sdk_compare`·`partial_fail_check`·`mem_bench`·`db_query`·컨테이너 0개 확인까지 수행).
+- 원격 전원 제어(맥 → 우분투): `python3 tools/ubuntu_power.py status | wake --wait | off` (MAC·IP는 git 제외 로컬 파일 `.ubuntu_power.env`에 저장, 우분투 `static-enp4s0`에 `wake-on-lan=magic` 영구 활성화 완료).
 - 수동 빌드: `ssh ubuntu 'cd ~/work/projects/rocalcloud/core && nice -n 10 ~/.cargo/bin/cargo build --release -j 8'`.
 - `Cargo.lock`이 우분투에서 갱신되면 `scp ubuntu:~/work/projects/rocalcloud/core/Cargo.lock core/Cargo.lock`으로 맥에 반영해 커밋한다.
 - 사양 한도 문서: 우분투 `~/work/docs/SPEC.md`. **한도를 넘는 작업은 먼저 사용자에게 묻는다.**
