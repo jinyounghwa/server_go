@@ -25,7 +25,7 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: "22"
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.4.0 # no moving major tag upstream
         with:
           enable-cache: false # no uv.lock; deps are pinned per run with --with
 
