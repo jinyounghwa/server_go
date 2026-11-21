@@ -98,7 +98,7 @@ def main():
     ddb = boto3.client(
         "dynamodb", endpoint_url=args.url, region_name="us-east-1",
         aws_access_key_id="test", aws_secret_access_key="test",
-        config=Config(retries={"max_attempts": 1}),
+        config=Config(retries={"mode": "standard", "total_max_attempts": 1}),
     )
     table = f"rc-pfail-{secrets.token_hex(3)}"
     ddb.create_table(

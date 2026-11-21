@@ -944,8 +944,12 @@ async fn sqlite_save(State(app): State<Arc<App>>, h: HeaderMap, body: Bytes) -> 
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "manual".into());
     let snap = export_snapshot(&app);
-    match app.store.lock().unwrap().save_snapshot(&label, &snap) {
-        Ok(id) => Json(json!({"id": id, "label": label, "saved_at": snap["saved_at"]})).into_response(),
+    let res = app.store.lock().unwrap().save_snapshot(&label, &snap);
+    match res {
+        Ok(id) => {
+            emit(&app, json!({"ts": chrono::Utc::now().to_rfc3339(), "service": "sqlite", "op": "SnapshotSaved", "target": label, "status": 200}));
+            Json(json!({"id": id, "label": label, "saved_at": snap["saved_at"]})).into_response()
+        }
         Err(e) => Response::builder().status(500).body(Body::from(e)).unwrap(),
     }
 }
@@ -976,8 +980,12 @@ async fn admin_sql(State(app): State<Arc<App>>, h: HeaderMap, body: Bytes) -> Re
         return Response::builder().status(400).body(Body::from("missing sql field")).unwrap();
     };
     let limit = v["limit"].as_u64().unwrap_or(500) as usize;
-    match app.store.lock().unwrap().query_readonly(sql, limit) {
-        Ok(res) => Json(res).into_response(),
+    let res = app.store.lock().unwrap().query_readonly(sql, limit);
+    match res {
+        Ok(res) => {
+            emit(&app, json!({"ts": chrono::Utc::now().to_rfc3339(), "service": "sqlite", "op": "SqlQuery", "status": 200}));
+            Json(res).into_response()
+        }
         Err(e) => Response::builder().status(400).body(Body::from(e)).unwrap(),
     }
 }
