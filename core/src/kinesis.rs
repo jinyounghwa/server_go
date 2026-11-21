@@ -1,5 +1,6 @@
 // Kinesis Data Streams (JSON 1.1): shards by MD5 hash range, sequence numbers, shard iterators.
-// ponytail: no resharding, enhanced fan-out, retention expiry or Lambda event source mappings yet.
+// Lambda event source mappings read shards through positions()/read() (lambda.rs poll_kinesis).
+// ponytail: no resharding, enhanced fan-out or retention expiry yet.
 use crate::{b64, epoch, err, need, unb64, ApiErr, ACCOUNT, REGION};
 use md5::{Digest, Md5};
 use serde_json::{json, Value};
@@ -49,6 +50,20 @@ fn iterator(stream: &str, shard: usize, pos: usize) -> String {
 }
 
 impl Kinesis {
+    pub fn exists(&self, name: &str) -> bool {
+        self.streams.contains_key(name)
+    }
+    // Start position in each shard: 0 (TRIM_HORIZON) or the current end (LATEST). Empty if the stream is gone.
+    pub fn positions(&self, name: &str, latest: bool) -> Vec<usize> {
+        self.streams.get(name).map_or(vec![], |s| s.shards.iter().map(|sh| if latest { sh.len() } else { 0 }).collect())
+    }
+    // Up to `limit` records of a shard from `pos`, in the Lambda event "kinesis" shape.
+    pub fn read(&self, name: &str, shard: usize, pos: usize, limit: usize) -> Vec<Value> {
+        let Some(recs) = self.streams.get(name).and_then(|s| s.shards.get(shard)) else { return vec![] };
+        recs.iter().skip(pos).take(limit).map(|x| json!({"kinesisSchemaVersion": "1.0", "partitionKey": x.key, "sequenceNumber": x.seq,
+            "data": x.data, "approximateArrivalTimestamp": x.at})).collect()
+    }
+
     fn describe(n: &str, s: &Stream, summary: bool) -> Value {
         let mut d = json!({"StreamName": n, "StreamARN": arn(n), "StreamStatus": "ACTIVE", "RetentionPeriodHours": 24,
             "StreamCreationTimestamp": s.created, "EncryptionType": "NONE", "OpenShardCount": s.shards.len(),

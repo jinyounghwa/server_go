@@ -494,7 +494,7 @@ def test_logs():
 
 
 PY_FN = r"""
-import datetime, hashlib, hmac, json, os, time, urllib.request
+import base64, datetime, hashlib, hmac, json, os, time, urllib.request
 def signed(method, url, body, service, headers=None):
     # Minimal SigV4 with the function's session keys (stdlib only), so VERIFY_SIGV4=1 accepts it.
     e = os.environ
@@ -517,7 +517,7 @@ def handler(event, ctx):
     req = signed("POST", ep + "/", b"Action=GetCallerIdentity&Version=2011-06-15", "sts", {"Content-Type": "application/x-www-form-urlencoded"})
     who = urllib.request.urlopen(req).read().decode()
     for r in event.get("Records", []):
-        body = r.get("body") or r.get("Sns", {}).get("Message")
+        body = r.get("body") or r.get("Sns", {}).get("Message") or base64.b64decode(r.get("kinesis", {}).get("data", "")).decode()
         urllib.request.urlopen(signed("PUT", f"{ep}/{os.environ['BUCKET']}/{body}", b"x", "s3"))
     return {"echo": event.get("x"), "who": who, "stage": os.environ.get("STAGE")}
 def boom(event, ctx):
@@ -580,7 +580,16 @@ def test_lambda():
     t = sns.create_topic(Name=f"t{run}")["TopicArn"]
     sns.subscribe(TopicArn=t, Protocol="lambda", Endpoint=lam.get_function(FunctionName=fn)["Configuration"]["FunctionArn"])
     sns.publish(TopicArn=t, Message="from-sns")
-    want = {"job-0", "job-1", "job-2", "from-sns"}
+    # Kinesis -> Lambda: records written before the mapping are read from TRIM_HORIZON, per shard in order.
+    kin = boto3.client("kinesis", **kw)
+    kin.create_stream(StreamName=f"clicks{run}", ShardCount=2)
+    sarn = kin.describe_stream_summary(StreamName=f"clicks{run}")["StreamDescriptionSummary"]["StreamARN"]
+    for i in range(3):
+        kin.put_record(StreamName=f"clicks{run}", Data=f"kin-{i}".encode(), PartitionKey=f"user{i}")
+    assert code(lam.create_event_source_mapping, EventSourceArn=sarn, FunctionName=fn) == "InvalidParameterValueException"  # StartingPosition required
+    km = lam.create_event_source_mapping(EventSourceArn=sarn, FunctionName=fn, StartingPosition="TRIM_HORIZON", BatchSize=50)
+    assert km["StartingPosition"] == "TRIM_HORIZON" and km["BatchSize"] == 50
+    want = {"job-0", "job-1", "job-2", "from-sns", "kin-0", "kin-1", "kin-2"}
     for _ in range(50):
         keys = {o["Key"] for o in s3.list_objects_v2(Bucket=b).get("Contents", [])}
         if want <= keys:
@@ -593,7 +602,7 @@ def test_lambda():
     lam.update_function_configuration(FunctionName=fn, Environment={"Variables": {"STAGE": "prod", "BUCKET": b}})
     assert json.loads(lam.invoke(FunctionName=fn, Payload="{}")["Payload"].read())["stage"] == "prod"
     assert {fn, fn + "-node"} <= {f["FunctionName"] for f in lam.list_functions()["Functions"]}
-    lam.delete_event_source_mapping(UUID=m)
+    lam.delete_event_source_mapping(UUID=m); lam.delete_event_source_mapping(UUID=km["UUID"]); kin.delete_stream(StreamName=f"clicks{run}")
     for f in (fn, fn + "-boom", fn + "-slow", fn + "-node"):
         lam.delete_function(FunctionName=f)
     assert code(lam.get_function, FunctionName=fn) == "ResourceNotFoundException"

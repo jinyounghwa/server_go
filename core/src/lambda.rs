@@ -38,6 +38,8 @@ pub struct Mapping {
     batch: u64,
     enabled: bool,
     modified: f64,
+    start: Option<String>, // Kinesis StartingPosition
+    retries: i64,          // Kinesis MaximumRetryAttempts (-1 = until it succeeds)
 }
 
 #[derive(Default)]
@@ -86,8 +88,13 @@ fn modified_now() -> String {
 }
 
 fn mapping_json(id: &str, m: &Mapping) -> Value {
-    json!({"UUID": id, "EventSourceArn": m.source, "FunctionArn": arn(&m.function), "BatchSize": m.batch,
-           "State": if m.enabled { "Enabled" } else { "Disabled" }, "LastModified": m.modified, "StateTransitionReason": "USER_INITIATED"})
+    let mut v = json!({"UUID": id, "EventSourceArn": m.source, "FunctionArn": arn(&m.function), "BatchSize": m.batch,
+           "State": if m.enabled { "Enabled" } else { "Disabled" }, "LastModified": m.modified, "StateTransitionReason": "USER_INITIATED"});
+    if let Some(s) = &m.start {
+        v["StartingPosition"] = s.clone().into();
+        v["MaximumRetryAttempts"] = m.retries.into();
+    }
+    v
 }
 
 pub struct Invocation {
@@ -396,15 +403,36 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
                 let fname = name_of(crate::need(&j, "FunctionName")?);
                 st.f.get(&fname).ok_or_else(|| not_found(&fname))?;
                 let src = crate::need(&j, "EventSourceArn")?.to_string();
-                if !src.starts_with("arn:aws:sqs:") {
-                    return Err(err("InvalidParameterValueException", "Only SQS event sources are supported locally"));
+                let kinesis = src.starts_with("arn:aws:kinesis:");
+                if !kinesis && !src.starts_with("arn:aws:sqs:") {
+                    return Err(err("InvalidParameterValueException", "Only SQS and Kinesis event sources are supported locally"));
+                }
+                let bad = |m: &str| err("InvalidParameterValueException", m.to_string());
+                let start = j["StartingPosition"].as_str().map(String::from);
+                if kinesis {
+                    if !matches!(start.as_deref(), Some("TRIM_HORIZON" | "LATEST")) {
+                        return Err(bad("StartingPosition must be TRIM_HORIZON or LATEST for a Kinesis event source"));
+                    }
+                    if !app.kinesis.lock().unwrap().exists(src.rsplit('/').next().unwrap_or("")) {
+                        return Err(bad("Stream not found"));
+                    }
+                }
+                let (dflt, max) = if kinesis { (100, 10000) } else { (10, 10) };
+                let retries = j["MaximumRetryAttempts"].as_i64().unwrap_or(-1);
+                if !(-1..=10000).contains(&retries) {
+                    return Err(bad("MaximumRetryAttempts must be between -1 and 10000"));
                 }
                 let id = uuid::Uuid::new_v4().to_string();
-                let m = Mapping { source: src, function: fname, batch: j["BatchSize"].as_u64().unwrap_or(10).clamp(1, 10), enabled: j["Enabled"].as_bool().unwrap_or(true), modified: crate::epoch() };
+                let m = Mapping { source: src, function: fname, batch: j["BatchSize"].as_u64().unwrap_or(dflt).clamp(1, max), enabled: j["Enabled"].as_bool().unwrap_or(true),
+                                  modified: crate::epoch(), start: start.filter(|_| kinesis), retries };
                 let out = mapping_json(&id, &m);
                 st.maps.insert(id.clone(), m);
                 let app = app.clone();
-                tokio::spawn(async move { poll_sqs(app, id).await });
+                if kinesis {
+                    tokio::spawn(async move { poll_kinesis(app, id).await });
+                } else {
+                    tokio::spawn(async move { poll_sqs(app, id).await });
+                }
                 (202, out)
             }
             "ListEventSourceMappings" => {
@@ -473,6 +501,45 @@ async fn poll_sqs(app: Arc<App>, id: String) {
     }
 }
 
+// One loop per Kinesis event source mapping: every shard is read in order from its own position. A failed batch is
+// retried (blocking that shard, as in AWS) until it succeeds or MaximumRetryAttempts is used up, then skipped.
+// ponytail: no bisect-on-error, on-failure destinations, tumbling windows or parallelization factor.
+async fn poll_kinesis(app: Arc<App>, id: String) {
+    let Some((src, start)) = app.lambda.lock().unwrap().maps.get(&id).map(|m| (m.source.clone(), m.start.clone())) else { return };
+    let stream = src.rsplit('/').next().unwrap_or("").to_string();
+    let mut pos = app.kinesis.lock().unwrap().positions(&stream, start.as_deref() == Some("LATEST"));
+    let mut failures = vec![0i64; pos.len()];
+    loop {
+        let Some((func, batch, enabled, retries, role)) = ({
+            let l = app.lambda.lock().unwrap();
+            l.maps.get(&id).map(|m| (m.function.clone(), m.batch as usize, m.enabled, m.retries, l.f.get(&m.function).map(|f| f.role.clone()).unwrap_or_default()))
+        }) else {
+            return; // mapping deleted
+        };
+        let mut busy = false;
+        for i in 0..pos.len() {
+            let recs = if enabled { app.kinesis.lock().unwrap().read(&stream, i, pos[i], batch) } else { vec![] };
+            if recs.is_empty() {
+                continue;
+            }
+            busy = true;
+            let records: Vec<Value> = recs.iter().map(|r| json!({"kinesis": r, "eventSource": "aws:kinesis", "eventVersion": "1.0",
+                "eventID": format!("shardId-{i:012}:{}", r["sequenceNumber"].as_str().unwrap_or("")), "eventName": "aws:kinesis:record",
+                "invokeIdentityArn": role, "awsRegion": REGION.as_str(), "eventSourceARN": src})).collect();
+            if invoke_logged(&app, &func, json!({ "Records": records }), "kinesis").await || (retries >= 0 && failures[i] >= retries) {
+                pos[i] += recs.len();
+                failures[i] = 0;
+            } else {
+                failures[i] += 1;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+        if !busy {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+}
+
 impl Lambda {
     pub fn exists(&self, name: &str) -> bool {
         self.f.contains_key(name)
@@ -481,7 +548,7 @@ impl Lambda {
         self.f
             .iter()
             .map(|(n, f)| {
-                let maps: Vec<Value> = self.maps.iter().filter(|(_, m)| m.function == *n).map(|(_, m)| json!(["SQS 트리거", m.source, format!("배치 {}", m.batch)])).collect();
+                let maps: Vec<Value> = self.maps.iter().filter(|(_, m)| m.function == *n).map(|(_, m)| json!([if m.start.is_some() { "Kinesis 트리거" } else { "SQS 트리거" }, m.source, format!("배치 {}", m.batch)])).collect();
                 let mut rows = vec![json!(["런타임", f.runtime, f.handler]), json!(["역할", f.role, ""]), json!(["제한", format!("{}초", f.timeout), format!("{} MB", f.memory)])];
                 rows.extend(maps);
                 json!({"name": n, "count": rows.len() - 3, "sub": format!("{} · 로그 그룹 /aws/lambda/{n}", f.arn), "cols": ["항목", "값", ""], "rows": rows})

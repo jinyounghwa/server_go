@@ -102,7 +102,7 @@ Status as of **2026-11-21**: `[x]` completed, `[~]` partially implemented or int
 
 ### 5. Cross-Service Integrations & Chaos Engineering
 - [x] S3 bucket notifications → SQS, SNS, Lambda
-- [x] SQS → Lambda event source mappings; SNS & EventBridge → SQS / SNS / Lambda
+- [x] SQS·Kinesis → Lambda event source mappings; SNS & EventBridge → SQS / SNS / Lambda
 - [x] Chaos fault injection (`/_admin/chaos`: latency, 5xx errors, service-specific throttling)
 
 ### 6. Desktop & Web GUI (Tauri + `/_ui`)
