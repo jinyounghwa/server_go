@@ -73,7 +73,7 @@ Status as of **2026-11-21**: `[x]` completed, `[~]` partially implemented or int
 
 ### 2. Tier-1 Services
 - [x] DynamoDB (tables, items, Query, Scan, GSI/LSI, batch & transactions, 400 KB item limit)
-- [x] S3 (buckets, objects, range reads, multipart uploads, presigned URLs)
+- [x] S3 (buckets, objects, range reads, multipart uploads, presigned URLs, bucket policies evaluated with identity policies)
 - [x] SQS (standard & FIFO queues with `MessageGroupId` ordering and 5-minute deduplication, DLQ, visibility timeout, long polling, message attributes with MD5)
 - [x] SNS (topics, SQS/Lambda subscriptions, filter policies, raw delivery)
 - [x] Secrets Manager

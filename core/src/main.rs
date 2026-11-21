@@ -407,11 +407,15 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
     };
 
     // Authorization: the first denied (action, resource) decides; otherwise the last allow explains.
+    let bucket_policy = match &svc {
+        Svc::S3(r) if !r.bucket.is_empty() => app.s3.lock().unwrap().policy(&r.bucket),
+        _ => None,
+    };
     let decision = {
         let iam = app.iam.lock().unwrap();
         let mut last = None;
         for (a, r) in checks(&app, &svc, &body) {
-            let d = iam.authorize(&principal, &a, &r);
+            let d = iam.authorize_with(&principal, &a, &r, bucket_policy.as_ref());
             let deny = !d.allowed;
             last = Some(d);
             if deny {

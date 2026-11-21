@@ -196,6 +196,28 @@ def test_iam():
     assert code(s3a.put_object, Bucket=b, Key="public/x", Body=b"x") == "AccessDenied"  # implicit deny
     assert code(boto3.client("dynamodb", **akw).list_tables) == "AccessDeniedException"
 
+    # Bucket policy: grants bob (no identity policy) read on one prefix; a Deny binds even the account root,
+    # but root can always manage the policy itself.
+    bob = f"bob{run}"
+    iam.create_user(UserName=bob)
+    bk = iam.create_access_key(UserName=bob)["AccessKey"]
+    s3b = boto3.client("s3", config=Config(s3={"addressing_style": "path"}), **dict(kw, aws_access_key_id=bk["AccessKeyId"], aws_secret_access_key=bk["SecretAccessKey"]))
+    assert code(s3b.get_object, Bucket=b, Key="public/a.txt") == "AccessDenied"
+    assert code(s3.get_bucket_policy, Bucket=b) == "NoSuchBucketPolicy"
+    assert code(s3.put_bucket_policy, Bucket=b, Policy=json.dumps({"Statement": [{"Effect": "Allow", "Action": "s3:*"}]})) == "MalformedPolicy"
+    bp = {"Version": "2012-10-17", "Statement": [
+        {"Sid": "BobReads", "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::000000000000:user/{bob}"}, "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{b}/public/*"},
+        {"Sid": "LockSecrets", "Effect": "Deny", "Principal": "*", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{b}/secret/*"}]}
+    s3.put_bucket_policy(Bucket=b, Policy=json.dumps(bp))
+    assert json.loads(s3.get_bucket_policy(Bucket=b)["Policy"]) == bp
+    assert s3b.get_object(Bucket=b, Key="public/a.txt")["Body"].read() == b"ok"
+    assert code(s3b.put_object, Bucket=b, Key="public/x", Body=b"x") == "AccessDenied"
+    assert code(s3.get_object, Bucket=b, Key="secret/k.txt") == "AccessDenied"  # root too
+    assert code(s3b.delete_bucket_policy, Bucket=b) == "AccessDenied"
+    s3.delete_bucket_policy(Bucket=b)
+    assert s3.get_object(Bucket=b, Key="secret/k.txt")["Body"].read() == b"no"
+    assert code(s3b.get_object, Bucket=b, Key="public/a.txt") == "AccessDenied"
+
     sim = iam.simulate_principal_policy(PolicySourceArn=f"arn:aws:iam::000000000000:user/{u}", ActionNames=["s3:GetObject"],
                                         ResourceArns=[f"arn:aws:s3:::{b}/public/a", f"arn:aws:s3:::{b}/secret/a", "arn:aws:s3:::other/x"])
     assert [r["EvalDecision"] for r in sim["EvaluationResults"]] == ["allowed", "explicitDeny", "implicitDeny"], sim
@@ -223,6 +245,7 @@ def test_iam():
     iam.detach_user_policy(UserName=u, PolicyArn=pol)
     iam.delete_access_key(UserName=u, AccessKeyId=key["AccessKeyId"])
     iam.delete_user(UserName=u)
+    iam.delete_access_key(UserName=bob, AccessKeyId=bk["AccessKeyId"]); iam.delete_user(UserName=bob)
     iam.delete_policy(PolicyArn=pol)
     iam.delete_role_policy(RoleName=r, PolicyName="sqs")
     iam.delete_role(RoleName=r); iam.delete_role(RoleName=f"lambda{run}")

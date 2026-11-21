@@ -150,6 +150,39 @@ fn stmt_matches(st: &Value, action: &str, resource: &str, ctx: &HashMap<String, 
     act && res && cond_ok(&st["Condition"], ctx)
 }
 
+fn req_ctx(p: &Principal) -> HashMap<String, String> {
+    let mut ctx = HashMap::from([
+        ("aws:PrincipalArn".to_string(), match p { Principal::Role { role, .. } => role_arn(role), _ => p.arn() }),
+        ("aws:PrincipalAccount".to_string(), ACCOUNT.to_string()),
+        ("aws:RequestedRegion".to_string(), REGION.clone()),
+        ("aws:SecureTransport".to_string(), "false".to_string()),
+    ]);
+    if let Principal::User(u) = p {
+        ctx.insert("aws:username".into(), u.clone());
+    }
+    ctx
+}
+
+// Shape check for resource-based policies (bucket policies): every statement needs Effect, Principal and Action.
+pub fn validate_resource_policy(doc: &Value) -> Result<(), String> {
+    let sts = statements(doc);
+    if sts.is_empty() {
+        return Err("Policy has no statements".into());
+    }
+    for st in sts {
+        if !matches!(st["Effect"].as_str(), Some("Allow" | "Deny")) {
+            return Err("Policy statement Effect must be Allow or Deny".into());
+        }
+        if st.get("Principal").is_none() && st.get("NotPrincipal").is_none() {
+            return Err("Policy statement must contain a Principal".into());
+        }
+        if st.get("Action").is_none() && st.get("NotAction").is_none() {
+            return Err("Policy statement must contain actions".into());
+        }
+    }
+    Ok(())
+}
+
 fn principal_match(p: &Value, c: &Principal) -> bool {
     if p == "*" {
         return true;
@@ -157,6 +190,20 @@ fn principal_match(p: &Value, c: &Principal) -> bool {
     let carn = c.arn();
     strs(&p["AWS"]).iter().any(|a| {
         a == "*" || a == ACCOUNT || *a == Principal::Root.arn() || glob(a, &carn, false)
+            || matches!(c, Principal::Role { role, .. } if *a == role_arn(role))
+    })
+}
+
+// For Allow statements in resource policies: naming the account (or its root ARN) delegates to the account's own
+// identity policies, as in AWS, so it only grants the root itself, never every user in the account.
+fn principal_grants(p: &Value, c: &Principal) -> bool {
+    if p == "*" {
+        return true;
+    }
+    let carn = c.arn();
+    strs(&p["AWS"]).iter().any(|a| {
+        let account_wide = a == ACCOUNT || *a == Principal::Root.arn();
+        a == "*" || (account_wide && matches!(c, Principal::Root)) || (!account_wide && glob(a, &carn, false))
             || matches!(c, Principal::Role { role, .. } if *a == role_arn(role))
     })
 }
@@ -189,15 +236,7 @@ impl Iam {
         let Some((_, e)) = self.entity(p) else {
             return Decision { allowed: true, kind: "allowed", reason: "account root (unregistered access key) is always allowed".into(), matched: vec![] };
         };
-        let mut ctx = HashMap::from([
-            ("aws:PrincipalArn".to_string(), match p { Principal::Role { role, .. } => role_arn(role), _ => p.arn() }),
-            ("aws:PrincipalAccount".to_string(), ACCOUNT.to_string()),
-            ("aws:RequestedRegion".to_string(), REGION.clone()),
-            ("aws:SecureTransport".to_string(), "false".to_string()),
-        ]);
-        if let Principal::User(u) = p {
-            ctx.insert("aws:username".into(), u.clone());
-        }
+        let ctx = req_ctx(p);
         let mut allow = None;
         for (label, doc) in self.docs(e) {
             for (i, st) in statements(doc).into_iter().enumerate() {
@@ -223,6 +262,49 @@ impl Iam {
                 kind: "implicitDeny",
                 reason: format!("User: {} is not authorized to perform: {action} on resource: {resource} because no identity-based policy allows the {action} action", p.arn()),
                 matched: vec![],
+            },
+        }
+    }
+
+    // Same-account evaluation with a resource-based policy (bucket policy): an explicit Deny in either policy wins,
+    // otherwise an Allow in either grants. The account root can always manage the bucket policy itself, as in AWS,
+    // so a Deny-everyone policy can't lock the bucket for good.
+    // ponytail: only S3 bucket policies are evaluated; SQS/SNS/Lambda resource policies are not stored yet.
+    pub fn authorize_with(&self, p: &Principal, action: &str, resource: &str, rp: Option<&Value>) -> Decision {
+        let id = self.authorize(p, action, resource);
+        let Some(doc) = rp else { return id };
+        if id.kind == "explicitDeny" || (matches!(p, Principal::Root) && action.ends_with("BucketPolicy")) {
+            return id;
+        }
+        let ctx = req_ctx(p);
+        let mut allow = None;
+        for (i, st) in statements(doc).into_iter().enumerate() {
+            let deny = st["Effect"] == "Deny";
+            let who = match st.get("NotPrincipal") {
+                Some(np) => !principal_match(np, p),
+                None if deny => principal_match(&st["Principal"], p),
+                None => principal_grants(&st["Principal"], p),
+            };
+            if !who || !stmt_matches(st, action, resource, &ctx) {
+                continue;
+            }
+            let sid = st["Sid"].as_str().map_or(format!("#{i}"), String::from);
+            if deny {
+                return Decision {
+                    allowed: false,
+                    kind: "explicitDeny",
+                    reason: format!("User: {} is not authorized to perform: {action} on resource: {resource} with an explicit deny in a resource-based policy (bucket policy, statement {sid})", p.arn()),
+                    matched: vec!["bucket policy".into()],
+                };
+            }
+            allow.get_or_insert(sid);
+        }
+        match (id.allowed, allow) {
+            (true, _) => id,
+            (false, Some(sid)) => Decision { allowed: true, kind: "allowed", reason: format!("allowed by resource-based policy (bucket policy, statement {sid})"), matched: vec!["bucket policy".into()] },
+            (false, None) => Decision {
+                reason: format!("User: {} is not authorized to perform: {action} on resource: {resource} because no identity-based policy or bucket policy allows the {action} action", p.arn()),
+                ..id
             },
         }
     }
@@ -602,6 +684,29 @@ impl Iam {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bucket_policy_combines_with_identity() {
+        let mut iam = Iam::default();
+        iam.handle(&Principal::Root, &HashMap::from([("Action".to_string(), "CreateUser".to_string()), ("UserName".to_string(), "bob".to_string())])).unwrap();
+        let bob = Principal::User("bob".into());
+        let obj = "arn:aws:s3:::b/k";
+        let pol = |eff: &str, who: Value, act: &str| json!({"Statement": [{"Sid": "S", "Effect": eff, "Principal": who, "Action": act, "Resource": "arn:aws:s3:::b/*"}]});
+        assert!(!iam.authorize_with(&bob, "s3:GetObject", obj, None).allowed);
+        assert!(iam.authorize_with(&bob, "s3:GetObject", obj, Some(&pol("Allow", json!({"AWS": user_arn("bob")}), "s3:GetObject"))).allowed);
+        assert!(iam.authorize_with(&bob, "s3:GetObject", obj, Some(&pol("Allow", json!("*"), "s3:Get*"))).allowed);
+        // Naming the account delegates to identity policies: bob still has none.
+        assert!(!iam.authorize_with(&bob, "s3:GetObject", obj, Some(&pol("Allow", json!({"AWS": ACCOUNT}), "s3:GetObject"))).allowed);
+        // Deny applies to everyone it names, root included, except root managing the policy itself.
+        let deny_all = pol("Deny", json!("*"), "s3:*");
+        assert_eq!(iam.authorize_with(&Principal::Root, "s3:GetObject", obj, Some(&deny_all)).kind, "explicitDeny");
+        assert!(iam.authorize_with(&Principal::Root, "s3:DeleteBucketPolicy", "arn:aws:s3:::b", Some(&deny_all)).allowed);
+        assert!(!iam.authorize_with(&bob, "s3:DeleteBucketPolicy", "arn:aws:s3:::b", Some(&deny_all)).allowed);
+        let not_bob = json!({"Statement": [{"Effect": "Deny", "NotPrincipal": {"AWS": user_arn("bob")}, "Action": "s3:*", "Resource": "*"}]});
+        assert_eq!(iam.authorize_with(&Principal::Root, "s3:GetObject", obj, Some(&not_bob)).kind, "explicitDeny");
+        assert!(validate_resource_policy(&json!({"Statement": [{"Effect": "Allow", "Action": "s3:*"}]})).is_err());
+        assert!(validate_resource_policy(&json!({"Statement": []})).is_err());
+    }
 
     #[test]
     fn glob_and_conditions() {

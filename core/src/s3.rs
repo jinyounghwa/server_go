@@ -22,6 +22,7 @@ pub struct Bucket {
     objs: BTreeMap<String, Obj>,
     notif: Vec<Notif>,
     notif_xml: String,
+    policy: Option<serde_json::Value>,
 }
 // One bucket notification target (QueueConfiguration / TopicConfiguration / CloudFunctionConfiguration).
 struct Notif {
@@ -55,7 +56,7 @@ pub struct Store {
 const NS: &str = r#" xmlns="http://s3.amazonaws.com/doc/2006-03-01/""#;
 // Sub-resources we don't emulate yet: answer 501 instead of pretending.
 const UNSUPPORTED: &[&str] = &[
-    "acl", "policy", "tagging", "versioning", "versions", "cors", "lifecycle", "website",
+    "acl", "tagging", "versioning", "versions", "cors", "lifecycle", "website",
     "encryption", "logging", "replication", "location", "ownershipControls", "publicAccessBlock",
     "object-lock", "legal-hold", "retention", "attributes", "accelerate", "requestPayment", "torrent",
 ];
@@ -184,6 +185,9 @@ impl Req {
             "PutBucketNotificationConfiguration" => "s3:PutBucketNotification",
             "GetBucketNotificationConfiguration" => "s3:GetBucketNotification",
             "DeleteBucket" => "s3:DeleteBucket",
+            "PutBucketPolicy" => "s3:PutBucketPolicy",
+            "GetBucketPolicy" => "s3:GetBucketPolicy",
+            "DeleteBucketPolicy" => "s3:DeleteBucketPolicy",
             _ => "s3:Unsupported",
         };
         let res = match (self.bucket.is_empty(), self.key.is_empty() || action == "s3:ListBucket") {
@@ -221,6 +225,9 @@ pub fn classify(m: &Method, uri: &Uri, h: &HeaderMap) -> Req {
         _ if UNSUPPORTED.iter().any(|k| has(k)) => "Unsupported",
         ("GET", true, _) => "ListBuckets",
         (_, true, _) => "Unsupported",
+        ("PUT", _, true) if has("policy") => "PutBucketPolicy",
+        ("GET", _, true) if has("policy") => "GetBucketPolicy",
+        ("DELETE", _, true) if has("policy") => "DeleteBucketPolicy",
         ("PUT", _, true) if has("notification") => "PutBucketNotificationConfiguration",
         ("GET", _, true) if has("notification") => "GetBucketNotificationConfiguration",
         ("PUT", _, true) => "CreateBucket",
@@ -276,7 +283,7 @@ fn exec(
             if st.buckets.contains_key(b) {
                 return Err(fail(409, "BucketAlreadyOwnedByYou", "Your previous request to create the named bucket succeeded and you already own it."));
             }
-            st.buckets.insert(b.into(), Bucket { created: Utc::now(), objs: BTreeMap::new(), notif: vec![], notif_xml: String::new() });
+            st.buckets.insert(b.into(), Bucket { created: Utc::now(), objs: BTreeMap::new(), notif: vec![], notif_xml: String::new(), policy: None });
             resp(200).header("location", format!("/{b}")).body(Body::empty()).unwrap()
         }
         "HeadBucket" => {
@@ -451,6 +458,22 @@ fn exec(
             bk.notif_xml = x;
             empty(200)
         }
+        "PutBucketPolicy" => {
+            let bk = st.buckets.get_mut(b).ok_or_else(no_bucket)?;
+            let doc: serde_json::Value = serde_json::from_slice(&body).map_err(|_| fail(400, "MalformedPolicy", "Policies must be valid JSON and the first byte must be '{'"))?;
+            crate::iam::validate_resource_policy(&doc).map_err(|m| fail(400, "MalformedPolicy", &m))?;
+            bk.policy = Some(doc);
+            empty(204)
+        }
+        "GetBucketPolicy" => {
+            let bk = st.buckets.get(b).ok_or_else(no_bucket)?;
+            let doc = bk.policy.as_ref().ok_or_else(|| fail(404, "NoSuchBucketPolicy", "The bucket policy does not exist"))?;
+            resp(200).header("content-type", "application/json").body(Body::from(doc.to_string())).unwrap()
+        }
+        "DeleteBucketPolicy" => {
+            st.buckets.get_mut(b).ok_or_else(no_bucket)?.policy = None;
+            empty(204)
+        }
         "GetBucketNotificationConfiguration" => {
             let bk = st.buckets.get(b).ok_or_else(no_bucket)?;
             let x = if bk.notif_xml.is_empty() { format!("<NotificationConfiguration{NS}/>") } else { bk.notif_xml.clone() };
@@ -531,13 +554,18 @@ impl Store {
             .collect()
     }
 
+    // Bucket policy, consulted by the authorizer for every request to the bucket.
+    pub fn policy(&self, bucket: &str) -> Option<serde_json::Value> {
+        self.buckets.get(bucket).and_then(|b| b.policy.clone())
+    }
+
     pub fn snap_save(&self) -> serde_json::Value {
         let buckets: Vec<serde_json::Value> = self.buckets.iter().map(|(n, b)| {
             let objs: Vec<serde_json::Value> = b.objs.iter().map(|(k, o)| serde_json::json!({
                 "key": k, "data": crate::b64(&o.data), "ctype": o.ctype,
                 "modified": o.modified.to_rfc3339(), "meta": o.meta,
             })).collect();
-            serde_json::json!({"name": n, "created": b.created.to_rfc3339(), "objects": objs})
+            serde_json::json!({"name": n, "created": b.created.to_rfc3339(), "objects": objs, "policy": b.policy})
         }).collect();
         serde_json::json!(buckets)
     }
@@ -560,7 +588,8 @@ impl Store {
                     .filter_map(|m| Some((m[0].as_str()?.into(), m[1].as_str()?.into()))).collect();
                 objs.insert(key.into(), Obj { data, etag, ctype, modified, meta });
             }
-            self.buckets.insert(name.into(), Bucket { created, objs, notif: vec![], notif_xml: String::new() });
+            let policy = Some(b["policy"].clone()).filter(|p| crate::iam::validate_resource_policy(p).is_ok());
+            self.buckets.insert(name.into(), Bucket { created, objs, notif: vec![], notif_xml: String::new(), policy });
         }
     }
 }
