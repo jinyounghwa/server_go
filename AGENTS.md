@@ -119,7 +119,9 @@ Step Functions Parallel·Map 동시 실행, 이벤트 `auth.source`와 마을 �
 2. ~~SNS 토픽 정책·Lambda 함수 정책~~(완료). IAM 액션 이름도 `lambda:InvokeFunction`으로 맞췄다(전에는 `lambda:Invoke`).
 3. ~~Step Functions Parallel·Map 실패 시 나머지 중단~~(완료).
 4. ~~ALB 경로·호스트 규칙~~(완료) → ~~aws-chunked 조각 서명 검증~~(완료). 각각 sdk_test.py에 정상·오류 경로 테스트를 같이 넣는다.
-5. **3D 마을 점검**: 저사양 GPU·모바일·Safari·Firefox. 연대기 섬 숫자(SDK 테스트 28/5/4개, 시나리오 21개, GPU 65°C)는
+5. ~~3D 마을 점검~~(2026-11-21, 우분투 Playwright: Chromium·Firefox·WebKit·iPhone 13·Pixel 7). 휴대폰은 피드를 접고 라벨을 숨긴 채 시작,
+   WebGL 2가 없으면 안내 문구, 느리면 GTAO → 해상도 → 그림자·블룸 → 해상도 0.6 → 반사 바다·후처리 순으로 끈다(GPU 없는 소프트웨어 렌더링 3→7fps).
+   남은 점검: 실제 휴대폰·실제 Safari(이번은 에뮬레이션), 실기기 GPU가 약한 노트북. 연대기 섬 숫자(SDK 테스트 28/5/4개, 시나리오 21개, GPU 65°C)는
    `town.html` 12절에 손으로 적은 값이다(검사관 훈련장 기둥 수는 `RANGE_CAT` 길이를 따른다).
 6. (선택) `?api=`로 IPv6 `[::1]`: CSP가 IPv6 리터럴을 못 받으므로 요청이 있을 때만.
 

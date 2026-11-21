@@ -125,6 +125,13 @@ canvas#c:active { cursor: grabbing; }
   #hud-tr { width: 250px; max-height: 38vh; }
   #hint3d { display: none; }
 }
+/* Phones: the feed sits above the dock instead of over the title card, and starts collapsed (see script). */
+@media (max-width: 640px) {
+  #hud-tl { right: 10px; top: 10px; left: 10px; }
+  #hud-tl .hud-card { padding: 8px 12px; }
+  #hud-tr { top: auto; bottom: 70px; left: 10px; right: 10px; width: auto; max-height: 34vh; }
+  #hud-tr.collapsed { max-height: 40px; }
+}
 #shutdown-overlay {
   position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center;
   background: rgba(7, 11, 20, 0.84); backdrop-filter: blur(12px);
@@ -399,6 +406,14 @@ const TEX = {
 // 2. RENDERER, SCENE, PHYSICAL SKY + IBL, BLOOM POST-PROCESSING
 // ============================================================
 const canvas = $("c");
+// Without WebGL 2 (hardware acceleration off, some VMs) there is nothing to draw: say so instead of a blank page.
+if (!document.createElement("canvas").getContext("webgl2")) {
+  const n = document.createElement("div");
+  n.style.cssText = "position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;z-index:60;background:#070b14;color:#e2e8f0;font-size:14px;line-height:1.6";
+  n.textContent = "이 브라우저에서는 WebGL 2를 쓸 수 없어 3D 마을을 그릴 수 없습니다. 브라우저 설정에서 하드웨어 가속을 켜거나 다른 브라우저로 열어 주세요. 에뮬레이터의 관리 화면(/_ui)은 그대로 쓸 수 있습니다.";
+  document.body.append(n);
+  throw new Error("WebGL 2 is not available");
+}
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 1.75));
 renderer.shadowMap.enabled = true;
@@ -1794,7 +1809,7 @@ function cityPulse(out) {
 }
 
 // Adaptive quality: drop ambient occlusion, then resolution, if the frame rate stays low.
-let fpsFrames = 0, fpsT0 = performance.now(), lowStrikes = 0;
+let fpsFrames = 0, fpsT0 = performance.now(), lowStrikes = 0, lowTier = false;
 function adaptQuality(now) {
   fpsFrames++;
   if (now - fpsT0 < 2000) return;
@@ -1804,6 +1819,16 @@ function adaptQuality(now) {
   lowStrikes = 0;
   if (gtaoPass.enabled) { gtaoPass.enabled = false; $("q_hi").classList.remove("active"); }
   else if (renderer.getPixelRatio() > 1) { renderer.setPixelRatio(1); resize(); }
+  else if (renderer.shadowMap.enabled) {
+    // Weak or software GPUs: drop shadows and bloom (materials recompile once), then render below native resolution.
+    renderer.shadowMap.enabled = false; bloomPass.enabled = false;
+    scene.traverse(o => { if (o.material) [].concat(o.material).forEach(m => m.needsUpdate = true); });
+  } else if (renderer.getPixelRatio() > 0.6) { renderer.setPixelRatio(0.6); resize(); }
+  else if (!lowTier) {
+    // Last step: the reflective ocean renders the scene twice; swap it for flat water and skip post-processing.
+    lowTier = true; ocean.visible = false; scene.add(water);
+    water.material = new THREE.MeshBasicMaterial({ color: 0x0b4f7a });
+  }
 }
 $("q_hi").onclick = () => { gtaoPass.enabled = !gtaoPass.enabled; $("q_hi").classList.toggle("active", gtaoPass.enabled); };
 
@@ -2248,6 +2273,10 @@ $("c_orbit").onclick   = () => {
   camGoal = null; controls.autoRotate = !controls.autoRotate; controls.autoRotateSpeed = 0.55;
   $("c_orbit").classList.toggle("active", controls.autoRotate);
 };
+if (matchMedia("(max-width: 640px)").matches) {
+  $("hud-tr").classList.add("collapsed"); $("feed_arrow").textContent = "▸";
+  $("labels").classList.add("hide-labels"); $("toggle_labels").classList.remove("active");
+}
 $("toggle_labels").onclick = () => {
   const hidden = $("labels").classList.toggle("hide-labels");
   $("toggle_labels").classList.toggle("active", !hidden);
@@ -2455,7 +2484,7 @@ function animate(now) {
   }
 
   updateCity(dt, clock, now);
-  composer.render();
+  if (lowTier) renderer.render(scene, camera); else composer.render();
 }
 requestAnimationFrame(animate);
 
