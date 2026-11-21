@@ -1175,6 +1175,11 @@ async fn shutdown_signal(app: Arc<App>) {
     // Give SSE subscribers a brief moment to receive the Shutdown event before the listener closes.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     eprintln!("rocalcloud shutting down");
+    // Graceful shutdown waits for open connections (SQS long polls, keep-alives); never hold the port for long.
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        std::process::exit(0);
+    });
 }
 
 fn main() {
