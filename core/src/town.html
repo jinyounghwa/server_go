@@ -203,6 +203,7 @@ canvas#c:active { cursor: grabbing; }
   <button id="c_sec">🔐 보안</button>
   <button id="c_harbor">⚓ 항구·AI</button>
   <button id="c_downtown">🏙 다운타운</button>
+  <button id="c_heritage">🏛 연대기</button>
   <button id="c_gate">🛡 정문</button>
   <button id="c_orbit">🎬 시네마틱</button>
   <span class="sep"></span>
@@ -213,7 +214,7 @@ canvas#c:active { cursor: grabbing; }
   <button id="demo">데모</button>
   <a href="/_ui" id="gui" rel="noopener noreferrer">관리 GUI</a>
 </div>
-<div id="hint3d">드래그: 360° 회전 · 휠: 줌 · 건물 클릭: 포커스 · 4개 지구 28개 시설 + 다리 건너 클라우드 다운타운</div>
+<div id="hint3d">드래그: 360° 회전 · 휠: 줌 · 건물 클릭: 포커스 · 4개 지구 28개 시설 + 다리 건너 클라우드 다운타운 · 모노레일 건너 연대기 섬</div>
 <div id="tip"></div>
 <div id="shutdown-overlay" hidden role="dialog" aria-modal="true" aria-labelledby="shutdown-title">
   <div class="shutdown-card">
@@ -1682,7 +1683,359 @@ function updateCity(dt, t, now) {
   dtLabel.style.display = p1.visible ? "block" : "none"; dtLabel.style.left = p1.x + "px"; dtLabel.style.top = p1.y + "px";
   const p2 = project(new THREE.Vector3(LANDMARK.x, LM_TOP + 20, LANDMARK.z));
   lmLabel.style.display = p2.visible ? "flex" : "none"; lmLabel.style.left = p2.x + "px"; lmLabel.style.top = p2.y + "px";
+  updateHeritage(dt, t, now);
   adaptQuality(now);
+}
+
+// ============================================================
+// 12. HERITAGE ISLAND: EVERYTHING BUILT SO FAR (ROADMAP 0-10, SIGV4, FIFO, SDK SUITES, RELEASE, UBUNTU, PAGES)
+// Static parts share 3 vertex-coloured merged meshes; hover targets are invisible boxes.
+// ============================================================
+const HI = { cx: -6, cz: 142, rx: 80, rz: 34 };
+const HD = "🏛 연대기 섬";
+function hiHeight(x, z) {
+  const d = Math.hypot((x - HI.cx) / HI.rx, (z - HI.cz) / HI.rz);
+  return d > 1.08 ? -3.4 : -2.6 + 2.6 * smooth01(1.06 - d, 0, 0.12);
+}
+{
+  const g = new THREE.PlaneGeometry(HI.rx * 2 + 24, HI.rz * 2 + 24, 150, 70);
+  g.rotateX(-Math.PI / 2); g.translate(HI.cx, 0, HI.cz);
+  const p = g.attributes.position, col = new Float32Array(p.count * 3);
+  const cG = new THREE.Color(0x5f9448), cS = new THREE.Color(0xd6c39c);
+  for (let i = 0; i < p.count; i++) { const y = hiHeight(p.getX(i), p.getZ(i)); p.setY(i, y); const c = y < -0.4 ? cS : cG; col.set([c.r, c.g, c.b], i * 3); }
+  g.setAttribute("color", new THREE.BufferAttribute(col, 3)); g.computeVertexNormals();
+  const m = new THREE.Mesh(g, mStd({ map: TEX.grass, vertexColors: true, roughness: 0.92 }));
+  m.receiveShadow = true; scene.add(m);
+}
+addRoadH(146, 4.2, HI.cx, 134);
+addRoadV(28, 3.2, -4, 132);
+
+const HG = { matte: [], metal: [], glow: [] };
+function hp(kind, geo, color, x, y, z, rotY = 0) {
+  if (geo.index) geo = geo.toNonIndexed();
+  const c = new THREE.Color(color), n = geo.attributes.position.count, a = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) a.set([c.r, c.g, c.b], i * 3);
+  geo.setAttribute("color", new THREE.BufferAttribute(a, 3));
+  place(HG[kind], geo, x, y, z, rotY);
+}
+const Bx = (w, h, d) => new THREE.BoxGeometry(w, h, d), Cy = (rt, rb, h, s = 16) => new THREE.CylinderGeometry(rt, rb, h, s);
+
+// Hover/click targets reuse the building tooltip: {name, sub, district, desc, count}.
+const HB = {};
+function landmark(id, name, sub, hex, x, z, desc, w, h, d, ly) {
+  const b = { id, name, sub, hex, x, z, desc, district: HD, count: 0, ly };
+  const hit = new THREE.Mesh(Bx(w, h, d), new THREE.MeshBasicMaterial());
+  hit.position.set(x, h / 2, z); hit.visible = false; hit.userData.building = b; scene.add(hit); clickTargets.push(hit);
+  if (ly) {
+    const el = document.createElement("div"); el.className = "blabel";
+    el.innerHTML = '<span class="dotc" style="background:' + hex + ';color:' + hex + '"></span><span>' + name + '</span><span class="cnt">0</span>';
+    $("labels").appendChild(el); b.labelEl = el; b.cntEl = el.querySelector(".cnt");
+  } else b.labelEl = document.createElement("div");
+  return HB[id] = b;
+}
+function bump(id) { const b = HB[id]; b.count++; if (b.cntEl) b.cntEl.textContent = b.count; }
+
+// --- Roadmap avenue: one obelisk per plan checklist section, all done ---
+const STAGES = [
+  ["0", "기반", "이름·라이선스·문서·CI", "이름 rocalcloud, Apache-2.0, README·AGENTS·SKILL·CONTRIBUTING, CI·Release·Pages 워크플로"],
+  ["1", "코어 런타임", "axum·SigV4·SQLite", "axum+tokio 단일 바이너리, JSON·REST-XML·Query 프로토콜, SigV4 검증, ARN 모델, JSON 스냅샷·SQLite, 이벤트 버스, RC_CONFIG"],
+  ["2", "1등급 서비스", "DDB·S3·SQS·SNS +4", "DynamoDB(GSI·트랜잭션·400KB), S3(멀티파트·사전서명), SQS(FIFO·DLQ), SNS, Secrets, SSM, KMS, Logs"],
+  ["3", "2등급 서비스", "Lambda·SFN·Cognito +5", "API Gateway, Lambda(python·node 실행), EventBridge, Step Functions(ASL), Cognito(JWT), SES, Kinesis, CloudFormation"],
+  ["4", "가상 인프라", "IAM·VPC·RDS·ECS", "IAM·STS 정책 평가기, VPC 도달성 분석, RDS·ElastiCache·ECS 진짜 Docker 컨테이너, ALB TCP 리스너, Route 53 DNS"],
+  ["5", "연동·장애", "알림·트리거·Chaos", "S3 알림, SQS→Lambda, SNS·EventBridge 배달, 지연·5xx·스로틀 장애 주입"],
+  ["6", "GUI", "탐색기·로그·설정", "Tauri 창 + /_ui: 리소스 탐색기, 실시간 로그, IAM·VPC 시각화, 스냅샷, 장애·설정 화면"],
+  ["7", "3D 마을", "SSE·애니메이션·Pages", "/_town 3D 도시, 요청마다 밴·드론·정문 경비, 결과 기호, GitHub Pages에서 로컬 에뮬레이터에 연결"],
+  ["8", "LLM 해설", "Ollama·도구 4개", "우분투 Ollama qwen3.5:9b, 스키마 제한 출력, 도구 4개, LLM 없을 때 규칙 기반 설명, 파괴 작업 확인 토큰"],
+  ["9", "품질·릴리스", "SDK 3종·v0.1.0", "boto3·JS v3·Rust SDK 스위트, 퍼징·벤치, 보안 강화, 바이너리 3종·Homebrew·Dockerfile, v0.1.0"],
+  ["10", "검증 에이전트", "시나리오 20·재생", "보안 7·장애 6·사고 4·성능 2·퍼징 1, SDK 응답 대조, 회귀 재생, 127.0.0.1 전용 결정적 실행기"],
+];
+{
+  const cw = 186, cv = document.createElement("canvas"); cv.width = cw * STAGES.length; cv.height = 256;
+  const c = cv.getContext("2d");
+  STAGES.forEach(([n, t, s], i) => {
+    const x0 = i * cw, gr = c.createLinearGradient(0, 0, 0, 256);
+    gr.addColorStop(0, "#0f2744"); gr.addColorStop(1, "#071324");
+    c.fillStyle = gr; c.fillRect(x0 + 4, 4, cw - 8, 248);
+    c.strokeStyle = "#38bdf8"; c.lineWidth = 3; c.strokeRect(x0 + 8, 8, cw - 16, 240);
+    c.textAlign = "center"; c.fillStyle = "#e0f2fe"; c.font = "800 92px system-ui, sans-serif"; c.fillText(n, x0 + cw / 2, 108);
+    c.font = "700 25px system-ui, sans-serif"; c.fillText(t, x0 + cw / 2, 152);
+    c.fillStyle = "#94a3b8"; c.font = "500 15px system-ui, sans-serif"; c.fillText(s, x0 + cw / 2, 182);
+    c.fillStyle = "#34d399"; c.font = "800 24px system-ui, sans-serif"; c.fillText("✓ 완료", x0 + cw / 2, 226);
+  });
+  const tex = new THREE.CanvasTexture(cv); tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = 4;
+  const plates = [];
+  STAGES.forEach(([n, t, , d], i) => {
+    const x = 50 - i * 11.2, z = 126;
+    hp("matte", Bx(3, 0.6, 3), 0x9ca3af, x, 0.3, z);
+    hp("matte", Bx(1.9, 8, 1.9), 0xeeeae4, x, 4.6, z);
+    hp("glow", new THREE.ConeGeometry(1.42, 1.7, 4).rotateY(Math.PI / 4), 0x34d399, x, 9.45, z);
+    const pg = new THREE.PlaneGeometry(1.62, 2.23), uv = pg.attributes.uv;
+    for (let k = 0; k < uv.count; k++) uv.setX(k, (i + uv.getX(k)) / STAGES.length);
+    pg.rotateY(Math.PI); pg.translate(x, 5.6, z - 0.96); plates.push(pg);
+    landmark("st" + n, n + "단계 · " + t, "✓ 완료", "#34d399", x, z, d, 3, 10, 3, 0);
+  });
+  const pm = new THREE.MeshStandardMaterial({ map: tex, emissiveMap: tex, emissive: 0xffffff, emissiveIntensity: 0.35, roughness: 0.4 });
+  litWindowMats.push(pm); scene.add(new THREE.Mesh(mergeGeometries(plates), pm));
+}
+
+// --- Pavilions ---
+landmark("sig", "SigV4 서명 관문", "VERIFY_SIGV4=1", "#2dd4bf", -60, 154, "HMAC-SHA256 서명을 다시 계산해 대조합니다. 서명 없음·SigV2·위조 서명은 403. 모든 요청이 지나가고, 거부가 오면 붉게 번쩍입니다.", 11, 10, 3, 10.4);
+for (const sx of [-4, 4]) { hp("matte", Bx(1.5, 8, 1.5), 0xe2e8f0, -60 + sx, 4, 154); hp("glow", Bx(1.6, 0.25, 1.6), 0x2dd4bf, -60 + sx, 7.6, 154); }
+hp("matte", Bx(10.4, 1.4, 1.9), 0xcbd5e1, -60, 8.7, 154);
+const keyMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, emissive: 0x2dd4bf, emissiveIntensity: 1.4, metalness: 0.6, roughness: 0.3 });
+const keyRing = new THREE.Mesh(new THREE.TorusGeometry(2.1, 0.22, 12, 40), keyMat); keyRing.position.set(-60, 4.6, 154); scene.add(keyRing);
+const keyCore = new THREE.Mesh(new THREE.OctahedronGeometry(0.8), keyMat); keyCore.position.copy(keyRing.position); scene.add(keyCore);
+
+landmark("fifo", "SQS FIFO 컨베이어", "MessageGroupId · 중복 제거", "#f87171", -44, 154, "같은 MessageGroupId 메시지는 보낸 순서대로, 같은 중복 제거 ID는 5분 동안 한 번만 전달됩니다. SQS 요청이 오면 벨트가 빨라집니다.", 14, 5, 4, 5.6);
+hp("metal", Bx(12, 0.9, 2.4), 0x334155, -44, 1.1, 154);
+for (const sx of [-6.6, 6.6]) hp("matte", Bx(2.2, 3.6, 3), 0xc84b31, -44 + sx, 1.8, 154);
+for (let k = -5; k <= 5; k++) hp("metal", Bx(0.25, 0.9, 0.25), 0x64748b, -44 + k, 0.45, 155.1);
+const FIFO_N = 9, fifoBoxes = new THREE.InstancedMesh(Bx(0.95, 0.95, 0.95), mStd({ roughness: 0.5 }), FIFO_N);
+fifoBoxes.castShadow = true;
+for (let i = 0; i < FIFO_N; i++) fifoBoxes.setColorAt(i, new THREE.Color([0xfbbf24, 0x60a5fa, 0xf472b6][Math.floor(i / 3)]));
+scene.add(fifoBoxes);
+
+landmark("ddb400", "400KB 저울", "DynamoDB 항목 한도", "#60a5fa", -30, 154, "속성 이름과 값을 합쳐 400KB를 넘는 항목은 ValidationException으로 거부합니다. DynamoDB 요청이 오면 저울이 흔들립니다.", 8, 8, 4, 7.4);
+hp("matte", Cy(1.6, 2, 0.8, 24), 0x94a3b8, -30, 0.4, 154);
+hp("metal", Cy(0.22, 0.3, 5.4, 10), 0xd4af37, -30, 3.4, 154);
+const scale = new THREE.Group(); scale.position.set(-30, 6.1, 154); scene.add(scale);
+const goldM = mStd({ color: 0xd4af37, metalness: 0.9, roughness: 0.25 });
+scale.add(mkBox(7.4, 0.2, 0.3, goldM));
+const pans = [-3.4, 3.4].map(px => { const p = new THREE.Group(); p.position.x = px; scale.add(p); p.add(mkCyl(1.1, 0.8, 0.25, 20, goldM, 0, -1.8, 0)); p.add(mkCyl(0.03, 0.03, 1.8, 4, goldM, 0, -0.9, 0)); return p; });
+pans[0].add(mkBox(1.2, 1.2, 1.2, mStd({ color: 0x3b82f6, emissive: 0x1d4ed8, emissiveIntensity: 0.3 }), 0, -1.05, 0));
+pans[1].add(mkBox(0.5, 0.5, 0.5, mStd({ color: 0x93c5fd }), 0, -1.4, 0));
+
+landmark("sdk", "SDK 호환성 경기장", "boto3 28 · JS v3 · Rust", "#fbbf24", -16, 156, "공식 SDK 3종(Python boto3 28개, JS @aws-sdk v3, Rust aws-sdk)으로 기본·서명 검증 두 모드를 CI가 매번 돌립니다. 전광판은 이 마을이 받은 실제 요청 수입니다.", 20, 7, 20, 7.8);
+{
+  const pts = [[6.2, 0], [10, 0], [10, 3.4], [9.5, 3.4], [6.2, 0.6]].map(([x, y]) => new THREE.Vector2(x, y));
+  hp("matte", new THREE.LatheGeometry(pts, 48), 0xd1d5db, -16, 0.05, 156);
+  hp("matte", Cy(6.2, 6.2, 0.12, 40), 0x16a34a, -16, 0.12, 156);
+  hp("glow", new THREE.TorusGeometry(3, 0.06, 6, 40).rotateX(Math.PI / 2), 0xf8fafc, -16, 0.2, 156);
+  [[0x3776ab, 0], [0xf7df1e, 2.1], [0xdea584, 4.2]].forEach(([c, a]) => {
+    const x = -16 + Math.cos(a) * 10.6, z = 156 + Math.sin(a) * 10.6;
+    hp("metal", Cy(0.18, 0.22, 7, 8), 0x94a3b8, x, 3.5, z);
+    hp("glow", Bx(1.6, 1.0, 0.12), c, x, 6.4, z, -a);
+  });
+  for (const sx of [-3.4, 3.4]) hp("metal", Cy(0.16, 0.16, 6, 8), 0x475569, -16 + sx, 3, 145);
+}
+const board = document.createElement("canvas"); board.width = 1024; board.height = 384;
+const boardTex = new THREE.CanvasTexture(board); boardTex.colorSpace = THREE.SRGBColorSpace;
+const boardMat = new THREE.MeshStandardMaterial({ map: boardTex, emissiveMap: boardTex, emissive: 0xffffff, emissiveIntensity: 0.6, roughness: 0.5 });
+const boardMesh = new THREE.Mesh(new THREE.PlaneGeometry(8.4, 3.15), boardMat);
+boardMesh.position.set(-16, 6.6, 144.9); boardMesh.rotation.y = Math.PI; scene.add(boardMesh);
+hp("matte", Bx(8.8, 3.5, 0.3), 0x0f172a, -16, 6.6, 145.1);
+
+landmark("rocket", "v0.1.0 발사대", "CI · Release · SHA256SUMS", "#f472b6", 12, 154, "GitHub Actions가 태그마다 리눅스·맥 바이너리 3종과 SHA256SUMS를 만들어 릴리스합니다. 로켓이 주기적으로 발사됩니다.", 9, 14, 9, 13);
+hp("matte", Cy(3.4, 3.8, 0.9, 32), 0x9ca3af, 12, 0.45, 154);
+for (const [gx, gz] of [[2.6, -0.8], [4.0, -0.8], [2.6, 0.8], [4.0, 0.8]]) hp("metal", Bx(0.25, 12, 0.25), 0xb91c1c, 12 + gx, 6.4, 154 + gz);
+for (let k = 1; k <= 5; k++) hp("metal", Bx(1.7, 0.18, 1.85), 0xb91c1c, 15.3, k * 2.3, 154);
+hp("metal", Bx(2.2, 0.18, 0.3), 0x475569, 13.8, 8.6, 154);
+const rocket = new THREE.Group(); rocket.position.set(12, 0.9, 154); scene.add(rocket);
+const rWhite = mStd({ color: 0xf8fafc, metalness: 0.3, roughness: 0.35 }), rRed = mStd({ color: 0xdc2626, roughness: 0.4 });
+rocket.add(mkCyl(0.9, 0.95, 7, 24, rWhite, 0, 3.8, 0));
+rocket.add(new THREE.Mesh(new THREE.ConeGeometry(0.9, 2.2, 24), rRed)).position.y = 8.4;
+rocket.add(mkCyl(0.92, 0.92, 0.35, 24, mStd({ color: 0x0ea5e9, emissive: 0x0ea5e9, emissiveIntensity: 0.8 }), 0, 5.8, 0));
+for (let k = 0; k < 4; k++) { const f = mkBox(0.12, 1.6, 1.2, rRed, Math.cos(k * Math.PI / 2) * 1.05, 0.9, Math.sin(k * Math.PI / 2) * 1.05); f.rotation.y = -k * Math.PI / 2; rocket.add(f); }
+const flameMat = new THREE.MeshBasicMaterial({ color: 0xffa040, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false });
+const flame = new THREE.Mesh(new THREE.ConeGeometry(0.75, 4, 16, 1, true), flameMat); flame.rotation.x = Math.PI; flame.position.y = -1.7; flame.visible = false; rocket.add(flame);
+
+landmark("brew", "Homebrew 양조장", "brew install rocalcloud", "#fb923c", 28, 154, "packaging/의 Homebrew 포뮬러가 릴리스 바이너리의 sha256을 확인하고 설치합니다.", 11, 7, 7, 7.2);
+hp("matte", Bx(5, 3.2, 4.2), 0x9a3412, 31, 1.6, 155);
+hp("matte", new THREE.ConeGeometry(3.7, 1.8, 4).rotateY(Math.PI / 4), 0x44403c, 31, 4.1, 155);
+for (const [tx, tz] of [[24, 152.5], [26.6, 152.5], [24, 156]]) { hp("metal", Cy(1.1, 1.1, 4, 20), 0xb87333, tx, 2, tz); hp("metal", new THREE.SphereGeometry(1.1, 20, 10, 0, Math.PI * 2, 0, Math.PI / 2), 0xb87333, tx, 4, tz); }
+hp("metal", Cy(0.12, 0.12, 6.4, 8).rotateZ(Math.PI / 2), 0xd1d5db, 27.2, 4.6, 154);
+for (let k = 0; k < 4; k++) hp("matte", Cy(0.45, 0.4, 1.0, 12), 0x7c4a1e, 33.8 + (k % 2) * 1.0, 0.5 + Math.floor(k / 2) * 1.0, 158.6);
+
+landmark("docker", "Docker 야적장", "Dockerfile · RDS·ECS 컨테이너", "#38bdf8", 42, 154, "Dockerfile로 에뮬레이터를 띄우고, RDS·ElastiCache·ECS는 127.0.0.1에만 열린 진짜 컨테이너로 돌아갑니다. 해당 요청 수를 셉니다.", 11, 7, 9, 7.4);
+{
+  const CC = [0x2496ed, 0xf8fafc, 0xf97316, 0x0d9488, 0xdc2626, 0x1e3a8a];
+  let k = 0;
+  for (let gx = 0; gx < 3; gx++) for (let gz = 0; gz < 2; gz++) for (let gy = 0; gy < 3 - ((gx + gz) % 2); gy++)
+    hp("matte", Bx(3.0, 1.35, 1.35), CC[(k++ * 7) % CC.length], 39 + gx * 3.2, 0.68 + gy * 1.36, 152.6 + gz * 1.45);
+  for (const lx of [37, 47]) for (const lz of [151, 156.5]) hp("metal", Bx(0.3, 5.6, 0.3), 0xfacc15, lx, 2.8, lz);
+  for (const lz of [151, 156.5]) hp("metal", Bx(10.3, 0.4, 0.4), 0xfacc15, 42, 5.6, lz);
+}
+
+landmark("ubuntu", "우분투 검증 연구소", "8 GiB · 8스레드 · GPU 80°C 미만", "#e95420", 58, 150, "무거운 빌드·Docker 테스트·LLM은 우분투 PC에서 돌리고 맥에는 소스만 둡니다. 작업당 RAM 8 GiB, 8스레드, 스왑 금지, GPU 실측 최고 65°C.", 11, 7, 8, 7);
+hp("matte", Bx(8.4, 3.8, 5.2), 0xf5f5f4, 58, 1.9, 150);
+hp("glow", Bx(8.5, 0.3, 5.3), 0xe95420, 58, 3.7, 150);
+const ledMat = new THREE.MeshBasicMaterial({ color: 0x22c55e, toneMapped: false });
+for (let k = 0; k < 4; k++) {
+  hp("metal", Bx(1.2, 2.6, 0.9), 0x111827, 54.9 + k * 2.05, 1.3, 147.0);
+  const led = new THREE.Mesh(Bx(0.9, 0.08, 0.02), ledMat); led.position.set(54.9 + k * 2.05, 1.9 - (k % 2) * 0.4, 146.54); scene.add(led);
+}
+hp("matte", Cy(0.32, 0.32, 5, 12), 0xf8fafc, 63.6, 2.5, 152.6);
+hp("glow", Cy(0.2, 0.2, 5 * 65 / 80, 10), 0xef4444, 63.6, 5 * 65 / 160 + 0.02, 152.6);
+hp("glow", Bx(0.9, 0.06, 0.06), 0xfacc15, 63.6, 5 * 70 / 80, 152.2);
+const fan = new THREE.Group(); fan.position.set(58, 4.2, 150); scene.add(fan);
+for (let k = 0; k < 4; k++) { const bl = mkBox(2.2, 0.06, 0.45, mStd({ color: 0x94a3b8, metalness: 0.7 })); bl.rotation.y = k * Math.PI / 4; fan.add(bl); }
+
+landmark("range", "검사관 훈련장", "시나리오 20개", "#c084fc", -70, 138, "보안 7(빨강)·장애 6(노랑)·사고 4(주황)·성능 2(파랑)·퍼징 1(보라). 검사관 시나리오 결과가 올 때마다 기둥이 차례로 켜집니다.", 15, 6, 15, 6.8);
+const RANGE_CAT = [...Array(7).fill(0xef4444), ...Array(6).fill(0xfacc15), ...Array(4).fill(0xf97316), 0x38bdf8, 0x38bdf8, 0xa855f7];
+const rangeOrbs = new THREE.InstancedMesh(new THREE.SphereGeometry(0.42, 14, 10), new THREE.MeshBasicMaterial({ toneMapped: false }), 20);
+const rangeGlow = new Float32Array(20), rangeSpot = [];
+RANGE_CAT.forEach((c, i) => {
+  const a = i / 20 * Math.PI * 2, x = -70 + Math.cos(a) * 6.4, z = 138 + Math.sin(a) * 6.4;
+  hp("matte", Cy(0.2, 0.26, 2.4, 8), 0x64748b, x, 1.2, z); rangeSpot.push([x, 2.75, z]);
+});
+hp("matte", Cy(1.2, 1.6, 3.6, 8), 0x581c87, -70, 1.8, 138);
+hp("glow", new THREE.TorusGeometry(1.4, 0.12, 8, 30).rotateX(Math.PI / 2), 0xc084fc, -70, 3.7, 138);
+hp("matte", Cy(8, 8, 0.1, 40), 0x78716c, -70, 0.06, 138);
+scene.add(rangeOrbs);
+let rangeNext = 0;
+
+landmark("pages", "GitHub Pages 포털", "CORS 1곳 · CSP · 필터링", "#a78bfa", 64, 140, "이 페이지 자체입니다. 이벤트 스트림의 CORS는 Pages 출처 하나에만 열고, 확인 코드·주체·오류 같은 필드를 지운 사본만 보냅니다. ?api=는 루프백만 허용합니다.", 11, 11, 4, 11);
+const portalTex = (() => {
+  const cv = document.createElement("canvas"); cv.width = cv.height = 512; const c = cv.getContext("2d");
+  const gr = c.createLinearGradient(0, 0, 0, 512); gr.addColorStop(0, "#1e1b4b"); gr.addColorStop(0.6, "#6d28d9"); gr.addColorStop(1, "#f472b6");
+  c.fillStyle = gr; c.fillRect(0, 0, 512, 512);
+  for (let i = 0; i < 26; i++) { const w = 12 + (i * 37) % 24, h = 60 + (i * 53) % 170, x = i * 20; c.fillStyle = "#0b1020"; c.fillRect(x, 512 - h - 70, w, h);
+    c.fillStyle = "#fde68a"; for (let y = 512 - h - 60; y < 432; y += 14) if ((x + y) % 3) c.fillRect(x + 3, y, 3, 5); }
+  c.fillStyle = "#0b1020"; c.fillRect(0, 432, 512, 80);
+  c.fillStyle = "#fff"; c.textAlign = "center"; c.font = "800 50px system-ui, sans-serif"; c.fillText("GitHub Pages", 256, 120);
+  c.font = "600 26px system-ui, sans-serif"; c.fillText("로컬 에뮬레이터의 실시간 마을", 256, 166);
+  const t = new THREE.CanvasTexture(cv); t.colorSpace = THREE.SRGBColorSpace; return t;
+})();
+const portal = new THREE.Group(); portal.position.set(64, 6.2, 140); portal.rotation.y = Math.PI; scene.add(portal);
+portal.add(new THREE.Mesh(new THREE.TorusGeometry(4.3, 0.42, 16, 56), mStd({ color: 0x312e81, metalness: 0.8, roughness: 0.25, emissive: 0x7c3aed, emissiveIntensity: 0.5 })));
+const portalMat = new THREE.MeshBasicMaterial({ map: portalTex, side: THREE.DoubleSide, transparent: true, opacity: 0.92 });
+portal.add(new THREE.Mesh(new THREE.CircleGeometry(4.0, 48), portalMat));
+for (const sx of [-4.6, 4.6]) hp("metal", Bx(0.5, 3, 0.5), 0x312e81, 64 + sx, 1.5, 140);
+hp("matte", Bx(11, 0.4, 3), 0x9ca3af, 64, 0.2, 140);
+
+// --- Control billboard: a live /_ui screen fed by the same events ---
+landmark("gui", "관제 전광판", "/_ui · Tauri · 설정 화면", "#38bdf8", -18, 116, "관리 GUI(/_ui)를 Tauri 창으로도 엽니다. 리소스 탐색기·실시간 로그·IAM·VPC·장애 주입·스냅샷·설정 화면. 화면 속 로그는 이 마을이 받은 실제 요청입니다.", 13, 12, 2, 12.2);
+const screenCv = document.createElement("canvas"); screenCv.width = 1024; screenCv.height = 576;
+const screenTex = new THREE.CanvasTexture(screenCv); screenTex.colorSpace = THREE.SRGBColorSpace;
+const screenMat = new THREE.MeshStandardMaterial({ map: screenTex, emissiveMap: screenTex, emissive: 0xffffff, emissiveIntensity: 0.75, roughness: 0.4 });
+const screenMesh = new THREE.Mesh(new THREE.PlaneGeometry(12, 6.75), screenMat);
+screenMesh.position.set(-18, 7.4, 115.6); screenMesh.rotation.y = Math.PI; scene.add(screenMesh);
+hp("matte", Bx(12.6, 7.3, 0.4), 0x0f172a, -18, 7.4, 115.9);
+for (const sx of [-4.5, 4.5]) hp("metal", Bx(0.5, 4, 0.5), 0x334155, -18 + sx, 2, 116);
+
+// --- Event monorail from the main island's south avenue ---
+landmark("rail", "이벤트 모노레일", "SSE /_events", "#22d3ee", -4, 116, "모든 요청은 {service, op, status, auth}로 SSE에 실려 나갑니다. 최근 1000건은 해설 에이전트가 읽습니다.", 7, 9, 9, 9.6);
+const RAIL_Y = 6.4;
+hp("metal", Bx(0.9, 0.5, 92), 0xcbd5e1, -4, RAIL_Y, 72);
+for (let z = 32; z <= 112; z += 10) hp("matte", Cy(0.4, 0.55, RAIL_Y + 2.5, 10), 0xe5e7eb, -4, (RAIL_Y - 2.5) / 2, z);
+for (const [pz, len] of [[27, 6], [116, 8]]) {
+  hp("matte", Bx(5, 0.5, len), 0x94a3b8, -4, RAIL_Y - 0.4, pz);
+  hp("glow", Bx(5.05, 0.12, len), 0x22d3ee, -4, RAIL_Y - 0.1, pz);
+  hp("matte", Bx(5.6, 0.25, len), 0xf1f5f9, -4, RAIL_Y + 3.2, pz);
+  for (const sx of [-2.5, 2.5]) hp("metal", Bx(0.2, 3.4, 0.2), 0x64748b, -4 + sx, RAIL_Y + 1.5, pz);
+}
+const pods = [0, Math.PI].map(ph => {
+  const g = new THREE.Group(); scene.add(g);
+  g.add(mkBox(1.7, 1.4, 4.4, mStd({ color: 0xf8fafc, metalness: 0.4, roughness: 0.3 }), 0, 0.95, 0));
+  g.add(mkBox(1.75, 0.45, 3.6, mStd({ color: 0x0f172a, metalness: 0.8, roughness: 0.1 }), 0, 1.2, 0));
+  g.add(mkBox(1.76, 0.1, 4.42, new THREE.MeshBasicMaterial({ color: 0x22d3ee, toneMapped: false }), 0, 0.5, 0));
+  return { g, ph };
+});
+
+// --- Promenade lamps & trees ---
+for (let x = -76; x <= 64; x += 14) { hp("metal", Cy(0.08, 0.1, 3.4, 6), 0x334155, x, 1.7, 131.4); hp("glow", new THREE.SphereGeometry(0.26, 10, 8), 0xfff1c1, x, 3.5, 131.4); }
+{
+  const spots = [[-70, 138, 10], [-16, 156, 12], [-18, 116, 8], [-4, 116, 6], [64, 140, 7], [12, 154, 6], [-60, 154, 7], [-44, 154, 8], [-30, 154, 5], [28, 154, 7], [42, 154, 7], [58, 150, 7]];
+  for (let i = 0, n = 0; i < 600 && n < 90; i++) {
+    const x = HI.cx + (rnd() * 2 - 1) * HI.rx, z = HI.cz + (rnd() * 2 - 1) * HI.rz;
+    if (Math.hypot((x - HI.cx) / HI.rx, (z - HI.cz) / HI.rz) > 0.9) continue;
+    if (Math.abs(z - 126) < 3.5 || Math.abs(z - 134) < 4.5 || (Math.abs(x + 4) < 4 && z < 147)) continue;
+    if (spots.some(([sx, sz, r]) => Math.hypot(x - sx, z - sz) < r)) continue;
+    const s = 0.8 + rnd() * 0.6; n++;
+    hp("matte", Cy(0.14 * s, 0.2 * s, 1.4 * s, 6), 0x5c3d28, x, 0.7 * s, z);
+    hp("matte", new THREE.ConeGeometry(1.1 * s, 3.2 * s, 7), rnd() < 0.5 ? 0x2f6f3a : 0x3f8a46, x, 2.9 * s, z);
+  }
+}
+addMerged(HG.matte, mStd({ vertexColors: true, roughness: 0.62, metalness: 0.06 }));
+addMerged(HG.metal, mStd({ vertexColors: true, roughness: 0.32, metalness: 0.75 }));
+addMerged(HG.glow, new THREE.MeshBasicMaterial({ vertexColors: true }), false);
+
+const hiLabel = document.createElement("div"); hiLabel.className = "dlabel"; hiLabel.textContent = HD + " · 계획서 0~10단계 전부 ✓";
+$("labels").append(hiLabel);
+
+// --- Live data on the billboard & scoreboard ---
+const hLog = []; let hDirty = true, hDrawT = 0, hTot = 0, hOk = 0;
+const UI_SIDE = ["리소스 탐색기", "실시간 로그", "IAM 정책", "VPC 도달성", "장애 주입", "스냅샷", "설정 (RC_CONFIG)"];
+function drawHeritageScreens() {
+  let c = screenCv.getContext("2d");
+  c.fillStyle = "#0b1220"; c.fillRect(0, 0, 1024, 576);
+  c.fillStyle = "#111a2e"; c.fillRect(0, 0, 1024, 60);
+  c.textAlign = "left"; c.fillStyle = "#38bdf8"; c.font = "800 30px system-ui, sans-serif"; c.fillText("rocalcloud  /_ui", 24, 41);
+  c.fillStyle = "#94a3b8"; c.font = "500 21px system-ui, sans-serif"; c.fillText("요청 " + hTot + " · 성공 " + hOk + " · 실패 " + (hTot - hOk), 640, 40);
+  c.fillStyle = "#0f172a"; c.fillRect(0, 60, 226, 516);
+  UI_SIDE.forEach((s, i) => { c.fillStyle = i === 1 ? "#38bdf8" : "#cbd5e1"; c.font = "500 20px system-ui, sans-serif"; c.fillText(s, 22, 104 + i * 36); });
+  c.fillStyle = "#e2e8f0"; c.font = "700 23px system-ui, sans-serif"; c.fillText("실시간 요청 로그 · /_events", 248, 100);
+  hLog.forEach((l, i) => {
+    const y = 140 + i * 42;
+    c.fillStyle = "#131c31"; c.fillRect(244, y - 27, 760, 36); c.fillStyle = OUT_CSS[l.out] || "#38bdf8"; c.fillRect(244, y - 27, 7, 36);
+    c.fillStyle = "#e2e8f0"; c.font = "500 20px ui-monospace, Menlo, monospace"; c.fillText(l.text, 264, y);
+  });
+  c = board.getContext("2d");
+  c.fillStyle = "#020617"; c.fillRect(0, 0, 1024, 384);
+  c.textAlign = "center"; c.fillStyle = "#fbbf24"; c.font = "800 44px system-ui, sans-serif"; c.fillText("SDK 호환성 경기장", 512, 64);
+  [["Python boto3", "28", "#60a5fa"], ["JS @aws-sdk v3", "5", "#fde047"], ["Rust aws-sdk", "4", "#fdba74"]].forEach(([n, k, col], i) => {
+    const x = 180 + i * 332; c.fillStyle = col; c.font = "700 27px system-ui, sans-serif"; c.fillText(n, x, 130);
+    c.font = "800 64px system-ui, sans-serif"; c.fillText(k + " ✓", x, 204);
+  });
+  c.fillStyle = "#94a3b8"; c.font = "500 24px system-ui, sans-serif"; c.fillText("CI: 기본 모드 + VERIFY_SIGV4=1 모드", 512, 262);
+  c.fillStyle = "#34d399"; c.font = "800 38px ui-monospace, Menlo, monospace"; c.fillText("LIVE  요청 " + hTot + "  ·  성공 " + hOk, 512, 336);
+  screenTex.needsUpdate = boardTex.needsUpdate = true;
+}
+
+let sigFlash = 0, sigBad = false, fifoBoost = 0, scaleKick = 0;
+const DOCKER_SVC = new Set(["rds", "elasticache", "ecs"]);
+function heritagePulse(e, out) {
+  hTot++; if (out === "ok" || out === "defend") hOk++;
+  hLog.unshift({ out, text: (String(e.service) + " " + String(e.op || "") + " " + (e.status || "")).slice(0, 56) });
+  if (hLog.length > 10) hLog.pop();
+  hDirty = true;
+  bump("rail"); bump("gui"); bump("sdk"); bump("pages");
+  if (e.service !== "inspector") { bump("sig"); sigFlash = 1; sigBad = out === "deny" || e.status === 403; }
+  if (e.service === "sqs") { bump("fifo"); fifoBoost = 1; }
+  if (e.service === "dynamodb") { bump("ddb400"); scaleKick = 1; }
+  if (DOCKER_SVC.has(e.service)) bump("docker");
+  if (e.service === "inspector" && e.op === "ScenarioDone") { bump("range"); rangeGlow[rangeNext] = 1; rangeNext = (rangeNext + 1) % 20; }
+}
+
+// Shadows follow the camera target so every island gets them.
+const sunOff = new THREE.Vector3(), hTmp = new THREE.Vector3(), hCol = new THREE.Color();
+function updateHeritage(dt, t, now) {
+  sun.target.position.set(Math.round(controls.target.x / 8) * 8, 0, Math.round(controls.target.z / 8) * 8);
+  sun.position.copy(sun.target.position).add(sunOff);
+  if (hDirty && now - hDrawT > 250) { hDirty = false; hDrawT = now; drawHeritageScreens(); }
+  sigFlash = Math.max(0, sigFlash - dt * 1.6); fifoBoost = Math.max(0, fifoBoost - dt * 0.5); scaleKick = Math.max(0, scaleKick - dt * 0.7);
+  keyMat.emissive.setHex(sigBad && sigFlash > 0.05 ? 0xef4444 : 0x2dd4bf); keyMat.emissiveIntensity = 0.9 + sigFlash * 2.5;
+  rangeGlow.forEach((g, i) => {
+    rangeGlow[i] = Math.max(0, g - dt * 0.25);
+    const [x, y, z] = rangeSpot[i], s = 1 + rangeGlow[i] * 0.8;
+    dummy.position.set(x, y, z); dummy.rotation.set(0, 0, 0); dummy.scale.setScalar(s); dummy.updateMatrix(); rangeOrbs.setMatrixAt(i, dummy.matrix);
+    rangeOrbs.setColorAt(i, hCol.setHex(RANGE_CAT[i]).multiplyScalar(0.3 + rangeGlow[i] * 1.4));
+  });
+  rangeOrbs.instanceMatrix.needsUpdate = true; rangeOrbs.instanceColor.needsUpdate = true;
+  ledMat.color.setHex(Math.sin(t * 7) > 0 ? 0x22c55e : 0x0f3d1f);
+  if (reduce) return;
+  keyRing.rotation.y += dt * (0.8 + sigFlash * 5); keyCore.rotation.y -= dt * 1.4;
+  for (let i = 0; i < FIFO_N; i++) {
+    const k = ((t * (0.05 + fifoBoost * 0.2) + i / FIFO_N) % 1);
+    dummy.position.set(-49.5 + k * 11, 2.05, 154); dummy.rotation.set(0, 0, 0); dummy.scale.setScalar(k < 0.05 || k > 0.95 ? 0.001 : 1); dummy.updateMatrix(); fifoBoxes.setMatrixAt(i, dummy.matrix);
+  }
+  fifoBoxes.instanceMatrix.needsUpdate = true;
+  scale.rotation.z = Math.sin(t * 0.8) * 0.05 + 0.16 + Math.sin(t * 9) * scaleKick * 0.12;
+  pans.forEach(p => p.rotation.z = -scale.rotation.z);
+  const cyc = t % 40, up = cyc > 30 ? (cyc - 30) / 6 : 0;
+  rocket.position.y = 0.9 + (up < 1 ? up * up * 120 : 400); flame.visible = cyc > 28.5 && up < 1;
+  flame.scale.set(1, 1 + Math.sin(t * 40) * 0.15 + up * 1.5, 1);
+  fan.rotation.y += dt * 6;
+  portal.rotation.y = Math.PI + Math.sin(t * 0.3) * 0.35;
+  pods.forEach(p => { const z = 27 + (0.5 - 0.5 * Math.cos(t * 0.22 + p.ph)) * 89; p.g.position.set(-4, RAIL_Y + 0.25, z); });
+  const camD = camera.position.distanceTo(hTmp.set(HI.cx, 0, HI.cz));
+  for (const b of Object.values(HB)) if (b.ly) {
+    const p = project(hTmp.set(b.x, b.ly, b.z));
+    const show = p.visible && camD < 200;
+    b.labelEl.style.display = show ? "flex" : "none"; if (show) { b.labelEl.style.left = p.x + "px"; b.labelEl.style.top = p.y + "px"; }
+  }
+  const ph = project(hTmp.set(HI.cx, 2, 110));
+  hiLabel.style.display = ph.visible ? "block" : "none"; hiLabel.style.left = ph.x + "px"; hiLabel.style.top = ph.y + "px";
 }
 
 // ============================================================
@@ -1703,6 +2056,7 @@ function applyTheme(name) {
   sun.position.copy(sunDir).multiplyScalar(260);
   if (sun.position.y < 34) sun.position.set(-90, 120, -80);
   sun.position.add(sun.target.position);
+  sunOff.copy(sun.position).sub(sun.target.position);
   sun.color.setHex(th.sunC); sun.intensity = th.sunI;
   hemi.intensity = th.hemiI;
   scene.fog.color.setHex(th.fogC); scene.fog.density = th.fogD;
@@ -1725,7 +2079,7 @@ function applyTheme(name) {
 applyTheme("day");
 
 let camGoal = null;
-const CAM_BTNS = ["c_city", "c_data", "c_compute", "c_sec", "c_harbor", "c_downtown", "c_gate", "c_orbit"];
+const CAM_BTNS = ["c_city", "c_data", "c_compute", "c_sec", "c_harbor", "c_downtown", "c_heritage", "c_gate", "c_orbit"];
 function flyTo(pos, target, btnId) {
   controls.autoRotate = false;
   CAM_BTNS.forEach(id => $(id).classList.toggle("active", id === btnId));
@@ -1736,6 +2090,7 @@ $("t_golden").onclick = () => applyTheme("golden");
 $("t_night").onclick = () => applyTheme("night");
 $("c_city").onclick    = () => flyTo([-86, 62, 98], [8, 4, -30], "c_city");
 $("c_downtown").onclick = () => flyTo([-42, 46, -42], [44, 22, -118], "c_downtown");
+$("c_heritage").onclick = () => flyTo([-20, 118, 86], [-20, 0, 142], "c_heritage");
 $("c_data").onclick    = () => flyTo([-52, 26, 6], [-26, 2, -20], "c_data");
 $("c_compute").onclick = () => flyTo([56, 26, 6], [24, 2, -20], "c_compute");
 $("c_sec").onclick     = () => flyTo([-52, 24, 52], [-26, 2, 18], "c_sec");
@@ -1773,7 +2128,7 @@ canvas.addEventListener("mousemove", ev => {
   const tip = $("tip");
   if (!b) { tip.style.display = "none"; return; }
   b.labelEl.classList.add("hot");
-  tip.innerHTML = `<b>${b.name}</b> <span style="color:#94a3b8">${b.sub}</span><br><span style="color:#a5b4fc">${b.district}</span> · 누적: <b>${b.count}건</b> · <span style="color:#38bdf8">클릭 포커스</span>`;
+  tip.innerHTML = `<b>${b.name}</b> <span style="color:#94a3b8">${b.sub}</span><br><span style="color:#a5b4fc">${b.district}</span> · 누적: <b>${b.count}건</b> · <span style="color:#38bdf8">클릭 포커스</span>${b.desc ? `<br><span style="color:#cbd5e1">${b.desc}</span>` : ""}`;
   tip.style.display = "block";
   tip.style.left = Math.min(window.innerWidth - 280, ev.clientX + 16) + "px";
   tip.style.top = Math.max(12, ev.clientY + 16) + "px";
@@ -1969,6 +2324,7 @@ function handle(e) {
   if (paused || townStopped) return;
   spawn(e);
   cityPulse(outcome(e));
+  heritagePulse(e, outcome(e));
   caption(e);
 }
 

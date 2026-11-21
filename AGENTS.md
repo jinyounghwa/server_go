@@ -7,7 +7,7 @@
 
 - 계획서 4장 체크리스트를 실제 상태로 표시했다(2026-11-21). 6장 순서 **1~8단계 전부 완료** (코어·22개 서비스·GUI·캐릭터 마을·해설 에이전트·검증 에이전트·Python/JS/Rust 3개 SDK 호환성 스위트·Dockerfile/Homebrew/GitHub Actions CI·Release 패키징·문서 정비).
 - 2026-11-21 추가: 선택적 SigV4 검증, SQS FIFO, DynamoDB 400KB 한도, 검사 시나리오 7개, 설정 파일·설정 화면, SKILL.md.
-- 이후 추가: JSON 상태 스냅샷, 3D(Three.js) 캐릭터 마을, GitHub Pages 마을(`pages.yml`). Pages 마을은 방문자 PC의 로컬 에뮬레이터
+- 이후 추가: JSON 상태 스냅샷, 3D(Three.js) 캐릭터 마을(본섬 28개 시설 + 다리 건너 다운타운 + 모노레일 건너 "연대기 섬": 계획서 0~10단계 오벨리스크와 SigV4·FIFO·400KB·SDK 경기장·릴리스·Homebrew·Docker·우분투·검사관 훈련장·Pages 포털·/_ui 전광판, `town.html` 12절), GitHub Pages 마을(`pages.yml`). Pages 마을은 방문자 PC의 로컬 에뮬레이터
   (`127.0.0.1:4566`, `?api=`)에 SSE로 붙어 실제 트래픽을 보여 주고, 연결 전에만 목업 트래픽을 돌린다(5초마다 재시도).
 - `v0.1.0` 릴리스 완료(2026-11-21): 바이너리 3종 + SHA256SUMS, Homebrew sha256 반영.
   macOS 러너는 `macos-latest`를 쓴다(버전 고정 러너 macos-13·14는 폐지됨).
