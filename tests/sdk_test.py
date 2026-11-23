@@ -1387,6 +1387,36 @@ def test_route53():
     r53.change_resource_record_sets(HostedZoneId=z, ChangeBatch={"Changes": [
         {"Action": "UPSERT", "ResourceRecordSet": rr(f"api.{zone}", "A", ["10.0.0.3"])}]})
     assert q(f"api.{zone}") == ["10.0.0.3"]
+
+    # Routing policies: weighted (0 never wins), failover (PRIMARY first) and latency (first set).
+    w = lambda sid, val, weight: {"Name": f"cdn.{zone}", "Type": "A", "TTL": 60, "SetIdentifier": sid, "Weight": weight,
+                                  "ResourceRecords": [{"Value": val}]}
+    r53.change_resource_record_sets(HostedZoneId=z, ChangeBatch={"Changes": [
+        {"Action": "CREATE", "ResourceRecordSet": w("east", "10.1.1.1", 1)},
+        {"Action": "CREATE", "ResourceRecordSet": w("west", "10.2.2.2", 0)}]})
+    assert q(f"cdn.{zone}") == ["10.1.1.1"], "weight 0 never wins"
+    r53.change_resource_record_sets(HostedZoneId=z, ChangeBatch={"Changes": [
+        {"Action": "UPSERT", "ResourceRecordSet": w("east", "10.1.1.1", 0)},
+        {"Action": "UPSERT", "ResourceRecordSet": w("west", "10.2.2.2", 255)}]})
+    assert q(f"cdn.{zone}") == ["10.2.2.2"]
+    sets = {(s["SetIdentifier"]): s for s in r53.list_resource_record_sets(HostedZoneId=z)["ResourceRecordSets"] if "SetIdentifier" in s}
+    assert sets["west"]["Weight"] == 255 and sets["east"]["Weight"] == 0, "policies round-trip"
+    fo = lambda sid, val, fail: {"Name": f"db.{zone}", "Type": "A", "TTL": 60, "SetIdentifier": sid, "Failover": fail,
+                                 "ResourceRecords": [{"Value": val}]}
+    r53.change_resource_record_sets(HostedZoneId=z, ChangeBatch={"Changes": [
+        {"Action": "CREATE", "ResourceRecordSet": fo("main", "10.3.3.3", "PRIMARY")},
+        {"Action": "CREATE", "ResourceRecordSet": fo("backup", "10.4.4.4", "SECONDARY")}]})
+    assert q(f"db.{zone}") == ["10.3.3.3"]
+    r53.change_resource_record_sets(HostedZoneId=z, ChangeBatch={"Changes": [
+        {"Action": "DELETE", "ResourceRecordSet": fo("main", "10.3.3.3", "PRIMARY")}]})
+    assert q(f"db.{zone}") == ["10.4.4.4"], "failover to SECONDARY"
+    lat = lambda sid, val, region: {"Name": f"edge.{zone}", "Type": "A", "TTL": 60, "SetIdentifier": sid, "Region": region,
+                                    "ResourceRecords": [{"Value": val}]}
+    r53.change_resource_record_sets(HostedZoneId=z, ChangeBatch={"Changes": [
+        {"Action": "CREATE", "ResourceRecordSet": lat("use1", "10.5.5.5", "us-east-1")},
+        {"Action": "CREATE", "ResourceRecordSet": lat("euw1", "10.6.6.6", "eu-west-1")}]})
+    assert q(f"edge.{zone}") == ["10.5.5.5"], "latency takes the first set (client region unknown)"
+
     assert code(r53.delete_hosted_zone, Id=z) == "HostedZoneNotEmpty"
     for s in r53.list_resource_record_sets(HostedZoneId=z)["ResourceRecordSets"]:
         if s["Type"] not in ("SOA", "NS"):

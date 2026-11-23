@@ -1,6 +1,7 @@
 // Route 53 (REST-XML) hosted zones and record sets, plus a tiny DNS server on 127.0.0.1:{RC_DNS_PORT or 10053}/udp
 // that answers A, AAAA, CNAME and TXT from the zones (aliases resolve inside the zones; anything else → 127.0.0.1).
-// ponytail: no routing policies (weighted/latency/failover), health checks, DNSSEC, TCP DNS or zone transfers.
+// Routing policies: weighted (random by Weight; 0 never wins), failover (PRIMARY beats SECONDARY; no health checks)
+// and latency (first set — the client's region is unknown). ponytail: no health checks, DNSSEC, TCP DNS or zone transfers.
 use crate::s3::{esc, tags};
 use crate::{err, ApiErr, App};
 use std::{collections::BTreeMap, net::{Ipv4Addr, Ipv6Addr}, sync::Arc};
@@ -14,6 +15,10 @@ struct RecordSet {
     ttl: u32,
     values: Vec<String>,
     alias: Option<String>, // alias DNS name
+    set_id: Option<String>, // routing-policy set identifier
+    weight: Option<u64>,
+    region: Option<String>,
+    failover: Option<String>, // PRIMARY | SECONDARY
 }
 struct Zone {
     name: String,
@@ -55,7 +60,11 @@ fn rrset_xml(r: &RecordSet) -> String {
         None => format!("<TTL>{}</TTL><ResourceRecords>{}</ResourceRecords>", r.ttl,
                         r.values.iter().map(|v| format!("<ResourceRecord><Value>{}</Value></ResourceRecord>", esc(v))).collect::<String>()),
     };
-    format!("<ResourceRecordSet><Name>{}</Name><Type>{}</Type>{body}</ResourceRecordSet>", esc(&r.name), r.ty)
+    let pol = r.set_id.as_ref().map_or(String::new(), |s| format!("<SetIdentifier>{}</SetIdentifier>", esc(s))
+        + &r.weight.map_or(String::new(), |w| format!("<Weight>{w}</Weight>"))
+        + &r.region.as_ref().map_or(String::new(), |g| format!("<Region>{}</Region>", esc(g)))
+        + &r.failover.as_ref().map_or(String::new(), |f| format!("<Failover>{}</Failover>", esc(f))));
+    format!("<ResourceRecordSet><Name>{}</Name><Type>{}</Type>{pol}{body}</ResourceRecordSet>", esc(&r.name), r.ty)
 }
 const DELEGATION: &str = "<DelegationSet><NameServers><NameServer>ns1.rocalcloud.local</NameServer><NameServer>ns2.rocalcloud.local</NameServer></NameServers></DelegationSet>";
 
@@ -75,8 +84,8 @@ impl Route53 {
                     return Err(ApiErr { status: 409, ..err("HostedZoneAlreadyExists", format!("A hosted zone has already been created with the specified caller reference {caller}")) });
                 }
                 let id = format!("Z{}", &uuid::Uuid::new_v4().simple().to_string()[..20].to_uppercase());
-                let soa = RecordSet { name: name.clone(), ty: "SOA".into(), ttl: 900, values: vec![format!("ns1.rocalcloud.local. hostmaster.{name} 1 7200 900 1209600 86400")], alias: None };
-                let ns = RecordSet { name: name.clone(), ty: "NS".into(), ttl: 172800, values: vec!["ns1.rocalcloud.local.".into(), "ns2.rocalcloud.local.".into()], alias: None };
+                let soa = RecordSet { name: name.clone(), ty: "SOA".into(), ttl: 900, values: vec![format!("ns1.rocalcloud.local. hostmaster.{name} 1 7200 900 1209600 86400")], alias: None, set_id: None, weight: None, region: None, failover: None };
+                let ns = RecordSet { name: name.clone(), ty: "NS".into(), ttl: 172800, values: vec!["ns1.rocalcloud.local.".into(), "ns2.rocalcloud.local.".into()], alias: None, set_id: None, weight: None, region: None, failover: None };
                 let z = Zone { name, caller, comment: first(body, "Comment"), private: first(body, "PrivateZone") == "true", records: vec![soa, ns] };
                 let out = wrap("CreateHostedZoneResponse", format!("{}{}{DELEGATION}", z.xml(&id), change_info()));
                 self.zones.insert(id, z);
@@ -109,17 +118,22 @@ impl Route53 {
                 for c in tags(body, "Change") {
                     let action = first(&c, "Action");
                     let set = first(&c, "ResourceRecordSet");
+                    let ne = |s: String| if s.is_empty() { None } else { Some(s) };
                     let r = RecordSet {
                         name: fqdn(&first(&set, "Name")),
                         ty: first(&set, "Type"),
                         ttl: first(&set, "TTL").parse().unwrap_or(300),
                         values: tags(&set, "Value"),
                         alias: tags(&set, "AliasTarget").first().map(|a| fqdn(&first(a, "DNSName"))),
+                        set_id: ne(first(&set, "SetIdentifier")),
+                        weight: first(&set, "Weight").parse().ok(),
+                        region: ne(first(&set, "Region")),
+                        failover: ne(first(&set, "Failover")),
                     };
                     if !r.name.ends_with(&z.name) {
                         return Err(err("InvalidChangeBatch", format!("RRSet with DNS name {} is not permitted in zone {}", r.name, z.name)));
                     }
-                    let pos = recs.iter().position(|x| x.name == r.name && x.ty == r.ty);
+                    let pos = recs.iter().position(|x| x.name == r.name && x.ty == r.ty && x.set_id == r.set_id);
                     match (action.as_str(), pos) {
                         ("CREATE", Some(_)) => return Err(err("InvalidChangeBatch", format!("Tried to create resource record set [name='{}', type='{}'] but it already exists", r.name, r.ty))),
                         ("DELETE", None) => return Err(err("InvalidChangeBatch", format!("Tried to delete resource record set [name='{}', type='{}'] but it was not found", r.name, r.ty))),
@@ -156,8 +170,35 @@ impl Route53 {
             exact
         };
         let mut out = vec![];
-        for r in found {
-            let r = RecordSet { name: name.into(), ..r.clone() };
+        // Routing policies: among same name+type sets carrying a SetIdentifier, weighted picks by Weight
+        // (0 never wins), failover prefers PRIMARY, latency takes the first set (client region unknown).
+        let typed: Vec<&RecordSet> = found.iter().copied().filter(|r| r.ty == qtype).collect();
+        let candidates: Vec<RecordSet> = if typed.len() > 1 && typed.iter().any(|r| r.set_id.is_some()) {
+            let routed: Vec<&RecordSet> = typed.into_iter().filter(|r| r.set_id.is_some()).collect();
+            let chosen: Vec<RecordSet> = if routed.iter().any(|r| r.failover.as_deref() == Some("PRIMARY")) {
+                routed.iter().filter(|r| r.failover.as_deref() == Some("PRIMARY")).map(|r| (*r).clone()).collect()
+            } else {
+                let weights: Vec<u64> = routed.iter().map(|r| r.weight.unwrap_or(0)).collect();
+                let total: u64 = weights.iter().sum();
+                if total > 0 {
+                    let (mut acc, x) = (0u64, rand::random::<u64>() % total);
+                    match routed.iter().zip(weights).find(|&(_, w)| {
+                        acc += w;
+                        x < acc
+                    }) {
+                        Some((r, _)) => vec![(**r).clone()],
+                        None => vec![routed[0].clone()],
+                    }
+                } else {
+                    vec![routed[0].clone()] // latency, or all-zero weights
+                }
+            };
+            found.into_iter().filter(|r| r.ty != qtype).map(|r| (*r).clone()).chain(chosen).collect()
+        } else {
+            found.into_iter().map(|r| (*r).clone()).collect()
+        };
+        for r in candidates {
+            let r = RecordSet { name: name.into(), ..r };
             if r.ty == qtype && r.alias.is_none() {
                 out.push(r);
             } else if r.ty == qtype {
