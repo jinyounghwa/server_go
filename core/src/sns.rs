@@ -41,7 +41,8 @@ fn xml_map(m: &BTreeMap<String, String>) -> Value {
     json!({ "__entries": m })
 }
 
-// ponytail: filter policies support exact strings, numbers, prefix, exists and anything-but on message attributes.
+// ponytail: filter policies support exact strings/numbers, prefix, suffix, exists, anything-but and numeric
+// ranges ([">", 0] or [">=", 0, "<=", 5]) on message attributes; no $or or anything-but prefix.
 // A topic policy must be a valid resource policy; an empty value removes it.
 fn check_policy(p: Option<&String>) -> Result<(), ApiErr> {
     match p.filter(|p| !p.is_empty()) {
@@ -64,7 +65,23 @@ fn filter_ok(policy: &str, attrs: &Map<String, Value>) -> bool {
                 (Value::Object(o), h) => match o.iter().next() {
                     Some((op, v)) if op == "exists" => v.as_bool() == Some(h.is_some()),
                     Some((op, v)) if op == "prefix" => h.is_some_and(|h| v.as_str().is_some_and(|p| h.starts_with(p))),
+                    Some((op, v)) if op == "suffix" => h.is_some_and(|h| v.as_str().is_some_and(|s| h.ends_with(s))),
                     Some((op, v)) if op == "anything-but" => h.is_some_and(|h| !crate::iam::strs(v).iter().any(|x| x == h)),
+                    Some((op, v)) if op == "numeric" => {
+                        let Some(h) = h.and_then(|h| h.parse::<f64>().ok()) else { return false };
+                        v.as_array().is_some_and(|ps| {
+                            ps.chunks(2).all(|c| {
+                                c.len() == 2 && c[0].as_str().zip(c[1].as_f64()).is_some_and(|(o, n)| match o {
+                                    ">" => h > n,
+                                    ">=" | "=>" => h >= n,
+                                    "<" => h < n,
+                                    "<=" | "=<" => h <= n,
+                                    "=" => h == n,
+                                    _ => false,
+                                })
+                            })
+                        })
+                    }
                     _ => false,
                 },
                 _ => false,
@@ -261,5 +278,39 @@ impl Sns {
                 .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").into())).collect();
             self.subs.insert(arn.into(), Sub { topic: topic.into(), protocol: protocol.into(), endpoint: endpoint.into(), attrs });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attrs(k: &str, v: &str) -> Map<String, Value> {
+        let mut m = Map::new();
+        m.insert(k.to_string(), json!({"DataType": "Number", "Value": v}));
+        m
+    }
+
+    #[test]
+    fn filter_policy_operators() {
+        let pol = |s: &str| s.to_string();
+        // numeric: single comparison and two-pair range (between)
+        assert!(filter_ok(&pol(r#"{"n": [{"numeric": [">", 0]}]}"#), &attrs("n", "5")));
+        assert!(!filter_ok(&pol(r#"{"n": [{"numeric": [">", 5]}]}"#), &attrs("n", "5")));
+        assert!(filter_ok(&pol(r#"{"n": [{"numeric": [">=", 0, "<=", 5]}]}"#), &attrs("n", "5")));
+        assert!(!filter_ok(&pol(r#"{"n": [{"numeric": [">=", 0, "<=", 4]}]}"#), &attrs("n", "5")));
+        assert!(filter_ok(&pol(r#"{"n": [{"numeric": ["<", 10]}]}"#), &attrs("n", "5")));
+        assert!(!filter_ok(&pol(r#"{"n": [{"numeric": [">", 0]}]}"#), &attrs("n", "x")), "non-number never matches");
+        assert!(!filter_ok(&pol(r#"{"n": [{"numeric": [">", 0]}]}"#), &Map::new()), "missing attribute never matches");
+        assert!(!filter_ok(&pol(r#"{"n": [{"numeric": ["~", 0]}]}"#), &attrs("n", "5")), "unknown comparison");
+        // suffix and anything-but arrays
+        assert!(filter_ok(&pol(r#"{"f": [{"suffix": ".txt"}]}"#), &attrs("f", "a.txt")));
+        assert!(!filter_ok(&pol(r#"{"f": [{"suffix": ".log"}]}"#), &attrs("f", "a.txt")));
+        assert!(filter_ok(&pol(r#"{"f": [{"anything-but": ["a.txt", "b.txt"]}]}"#), &attrs("f", "c.txt")));
+        // AND across attributes, OR within one
+        assert!(filter_ok(&pol(r#"{"n": [{"numeric": [">", 0]}], "f": [{"suffix": ".txt"}]}"#), &{
+            let mut m = attrs("n", "5"); m.insert("f".into(), json!({"DataType": "String", "Value": "a.txt"})); m
+        }));
+        assert!(!filter_ok(&pol(r#"{"n": [1, {"numeric": [">", 100]}]}"#), &attrs("n", "5")), "OR of exact and range");
     }
 }

@@ -505,6 +505,24 @@ def test_sns_to_sqs():
     vip = sqs.receive_message(QueueUrl=vip_q, MaxNumberOfMessages=10, MessageAttributeNames=["All"])["Messages"]
     assert [m["Body"] for m in vip] == ["golden"], vip  # filter + raw delivery
     assert vip[0]["MessageAttributes"]["tier"] == {"DataType": "String", "StringValue": "gold"}, vip  # raw keeps attributes
+
+    # Filter policy operators: numeric ranges, suffix and anything-but.
+    hi_q, txt_q, no_q = (sqs.create_queue(QueueName=f"{n}{run}")["QueueUrl"] for n in ("hi", "txt", "no"))
+    sns.subscribe(TopicArn=t, Protocol="sqs", Endpoint=arn(hi_q), ReturnSubscriptionArn=True,
+                  Attributes={"RawMessageDelivery": "true", "FilterPolicy": json.dumps({"amount": [{"numeric": [">=", 100, "<=", 500]}]})})
+    sns.subscribe(TopicArn=t, Protocol="sqs", Endpoint=arn(txt_q), ReturnSubscriptionArn=True,
+                  Attributes={"RawMessageDelivery": "true", "FilterPolicy": json.dumps({"file": [{"suffix": ".txt"}]})})
+    sns.subscribe(TopicArn=t, Protocol="sqs", Endpoint=arn(no_q), ReturnSubscriptionArn=True,
+                  Attributes={"RawMessageDelivery": "true", "FilterPolicy": json.dumps({"file": [{"anything-but": ["a.txt", "b.txt"]}]})})
+    num = {"DataType": "Number", "StringValue": "250"}
+    sns.publish(TopicArn=t, Message="in-range", MessageAttributes={"amount": num, "file": {"DataType": "String", "StringValue": "c.txt"}})
+    sns.publish(TopicArn=t, Message="out-of-range", MessageAttributes={"amount": {"DataType": "Number", "StringValue": "999"}})
+    sns.publish(TopicArn=t, Message="wrong-ext", MessageAttributes={"file": {"DataType": "String", "StringValue": "x.log"}})
+    time.sleep(0.3)
+    assert [m["Body"] for m in sqs.receive_message(QueueUrl=hi_q, MaxNumberOfMessages=10)["Messages"]] == ["in-range"]
+    assert [m["Body"] for m in sqs.receive_message(QueueUrl=txt_q, MaxNumberOfMessages=10)["Messages"]] == ["in-range"]
+    assert [m["Body"] for m in sqs.receive_message(QueueUrl=no_q, MaxNumberOfMessages=10)["Messages"]] == ["in-range", "wrong-ext"]  # anything-but matches both
+    sqs.delete_queue(QueueUrl=hi_q); sqs.delete_queue(QueueUrl=txt_q); sqs.delete_queue(QueueUrl=no_q)
     assert code(sns.publish, TopicArn=t + "x", Message="m") == "NotFound"
     sns.delete_topic(TopicArn=t)
     sqs.delete_queue(QueueUrl=all_q); sqs.delete_queue(QueueUrl=vip_q)

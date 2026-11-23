@@ -10,7 +10,8 @@
 - 이후 추가: JSON 상태 스냅샷, 3D(Three.js) 캐릭터 마을(본섬 28개 시설 + 다리 건너 다운타운 + 모노레일 건너 "연대기 섬": 계획서 0~10단계 오벨리스크와 SigV4·FIFO·400KB·SDK 경기장·릴리스·Homebrew·Docker·우분투·검사관 훈련장·Pages 포털·/_ui 전광판, `town.html` 12절), GitHub Pages 마을(`pages.yml`). Pages 마을은 방문자 PC의 로컬 에뮬레이터
   (`127.0.0.1:4566`, `?api=`)에 SSE로 붙어 실제 트래픽을 보여 주고, 연결 전에는 목업 트래픽을 돌린다. Pages에서는 자동 연결·재시도를 하지 않고 🔌 연결 버튼을 눌렀을 때만 붙는다(실패한 연결마다 브라우저가 ERR_CONNECTION_REFUSED를 콘솔에 남기기 때문). `/_town`(같은 출처)은 자동 연결.
 - 2026-11-23 추가: IAM 조건 연산자 확장 — Numeric*·Date*·IpAddress/NotIpAddress(IPv4·IPv6 CIDR), ForAnyValue/ForAllValues 한정자, 요청 컨텍스트에 `aws:SourceIp`·`aws:EpochTime`·`aws:CurrentTime` 추가. boto3 테스트 31개.
-- 2026-11-23 추가2: `STRICT_DELIVERY=1`(ENFORCE_IAM 함께) — 대상 리소스 정책이 없으면 SNS·EventBridge·S3 배달을 AWS처럼 거부. 기본은 관대(정책 없으면 허용). boto3 테스트 32개(둘째 에뮬레이터 4567 포트로 확인).
+- 2026-11-23 추가2: `STRICT_DELIVERY=1`(ENFORCE_IAM 함께) — 대상 리소스 정책이 없으면 SNS·EventBridge·S3 배달을 AWS처럼 거부. 기본은 관대(정책 없음 허용). boto3 테스트 32개(둘째 에뮬레이터 4567 포트로 확인).
+- 2026-11-23 추가3: SNS 필터 정책에 `numeric`(단일 비교·두 쌍 범위)·`suffix` 추가, 단위 테스트 `filter_policy_operators` 추가.
 - `v0.1.0` 릴리스 완료(2026-11-21): 바이너리 3종 + SHA256SUMS, Homebrew sha256 반영.
 - `v0.1.4` 릴리스(2026-11-22): ALB 요청별 규칙 라우팅, aws-chunked 트레일러 서명 검증, SNS·EventBridge·S3 배달의 대상 정책 판정(서비스 주체). Homebrew 0.1.4.
 - `v0.1.3` 릴리스 완료(2026-11-21): SNS·Lambda 리소스 정책, ALB 리스너 규칙, aws-chunked 서명 검증. release.yml도 Node 24 액션으로. Homebrew 0.1.3.

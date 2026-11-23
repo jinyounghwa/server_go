@@ -92,7 +92,7 @@ All options can be set via environment variables or a `KEY=VALUE` file pointed t
 | **S3** | List/Create/Head/DeleteBucket, Put/Get/Head/Delete/CopyObject, Range reads, ListObjects(V2) with prefix/delimiter/paging, DeleteObjects, multipart upload, SigV4 presigned URLs |
 | **SQS** | Create/Delete/List/PurgeQueue, GetQueueUrl, Get/SetQueueAttributes, Send/Receive/DeleteMessage (+Batch), ChangeMessageVisibility, long polling, DLQs, FIFO queues (`MessageGroupId` ordering, deduplication IDs & content-based dedup, 5-min window), 256 KiB message limit |
 | **IAM / STS** | Users, roles, managed & inline policies, access keys, `SimulatePrincipalPolicy`, `AssumeRole` (trust policy checked), `GetCallerIdentity` |
-| **SNS** | Topics, subscriptions (SQS, Lambda), filter policies, raw delivery, topic/subscription attributes |
+| **SNS** | Topics, subscriptions (SQS, Lambda), filter policies (exact/prefix/suffix/anything-but/exists, numeric ranges), raw delivery, topic/subscription attributes |
 | **Secrets Manager** | Create/Get/Put/Update/Describe/List/Delete/RestoreSecret, version stages, `GetRandomPassword` |
 | **SSM** | Parameter Store: Put/Get/GetParameters(ByPath)/Delete/DescribeParameters, `SecureString` |
 | **KMS** | Keys, aliases, Encrypt/Decrypt with encryption context, `GenerateDataKey`, enable/disable, scheduled deletion *(local obfuscation only, not real cryptography)* |
