@@ -12,6 +12,7 @@
 - 2026-11-23 추가: IAM 조건 연산자 확장 — Numeric*·Date*·IpAddress/NotIpAddress(IPv4·IPv6 CIDR), ForAnyValue/ForAllValues 한정자, 요청 컨텍스트에 `aws:SourceIp`·`aws:EpochTime`·`aws:CurrentTime` 추가. boto3 테스트 31개.
 - 2026-11-23 추가2: `STRICT_DELIVERY=1`(ENFORCE_IAM 함께) — 대상 리소스 정책이 없으면 SNS·EventBridge·S3 배달을 AWS처럼 거부. 기본은 관대(정책 없음 허용). boto3 테스트 32개(둘째 에뮬레이터 4567 포트로 확인).
 - 2026-11-23 추가3: SNS 필터 정책에 `numeric`(단일 비교·두 쌍 범위)·`suffix` 추가, 단위 테스트 `filter_policy_operators` 추가.
+- 2026-11-23 추가4: SigV4 시계 오차 검증 — 헤더 서명의 `x-amz-date`가 15분 이상 어긋나면 `RequestTimeTooSkewed`(사전 서명 URL은 `X-Amz-Expires` 규칙만 적용, 단위 테스트 `clock_skew_rejects_stale_header_dates`).
 - `v0.1.0` 릴리스 완료(2026-11-21): 바이너리 3종 + SHA256SUMS, Homebrew sha256 반영.
 - `v0.1.4` 릴리스(2026-11-22): ALB 요청별 규칙 라우팅, aws-chunked 트레일러 서명 검증, SNS·EventBridge·S3 배달의 대상 정책 판정(서비스 주체). Homebrew 0.1.4.
 - `v0.1.3` 릴리스 완료(2026-11-21): SNS·Lambda 리소스 정책, ALB 리스너 규칙, aws-chunked 서명 검증. release.yml도 Node 24 액션으로. Homebrew 0.1.3.

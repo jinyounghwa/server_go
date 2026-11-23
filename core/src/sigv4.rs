@@ -1,7 +1,8 @@
 // SigV4 signing and (optional, VERIFY_SIGV4=1) verification. HMAC-SHA256 is built on sha2.
 // Signed aws-chunked bodies (STREAMING-AWS4-HMAC-SHA256-PAYLOAD) have every chunk signature checked, and a hex
 // x-amz-content-sha256 must match the body. With ...-PAYLOAD-TRAILER the x-amz-trailer-signature over the trailing headers is
-// checked too. ponytail: SigV4a and clock-skew limits are not checked; trailer checksum values are not recomputed.
+// checked too. Header-signed requests are rejected when x-amz-date is more than 15 minutes off (RequestTimeTooSkewed);
+// presigned URLs keep their X-Amz-Expires rule instead. ponytail: SigV4a is not checked; trailer checksum values are not recomputed.
 use axum::http::{HeaderMap, Method, Uri};
 use sha2::{Digest, Sha256};
 
@@ -138,6 +139,15 @@ pub fn verify(method: &Method, uri: &Uri, h: &HeaderMap, body: &[u8], secret_of:
     } else {
         return Err(("MissingAuthenticationToken", "Request is missing Authentication Token".into()));
     };
+    // AWS rejects header-signed requests whose x-amz-date is more than ~15 minutes off the server clock.
+    // Presigned URLs are exempt: their X-Amz-Date is creation time and only X-Amz-Expires bounds them.
+    if hv("authorization").is_some() {
+        if let Ok(t) = chrono::NaiveDateTime::parse_from_str(&amz_date, "%Y%m%dT%H%M%SZ") {
+            if (chrono::Utc::now().naive_utc() - t).num_seconds().abs() > 900 {
+                return Err(("RequestTimeTooSkewed", "The difference between the request time and the server's time is too large.".into()));
+            }
+        }
+    }
     let parts: Vec<&str> = cred.split('/').collect();
     if parts.len() != 5 {
         return Err(("IncompleteSignature", format!("Credential is malformed: {cred}")));
@@ -269,5 +279,30 @@ mod tests {
         assert_eq!(verify(&Method::POST, &uri, &h, body, |_| ("other".into(), None)).err().unwrap().0, "SignatureDoesNotMatch");
         h.insert("x-amz-target", "DynamoDB_20120810.DeleteTable".parse().unwrap());
         assert_eq!(verify(&Method::POST, &uri, &h, body, |_| ("sec".into(), None)).err().unwrap().0, "SignatureDoesNotMatch");
+    }
+
+    #[test]
+    fn clock_skew_rejects_stale_header_dates() {
+        let (host, body) = ("127.0.0.1:4566", b"");
+        let payload = sha256_hex(body);
+        let signed_at = |mins: i64| {
+            let d = (chrono::Utc::now() + chrono::Duration::minutes(mins)).format("%Y%m%dT%H%M%SZ").to_string();
+            let hs = [("host", host), ("x-amz-date", d.as_str()), ("x-amz-content-sha256", payload.as_str())];
+            let names = ["host", "x-amz-date", "x-amz-content-sha256"];
+            let get = |k: &str| hs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string()).unwrap_or_default();
+            let creq = canonical_request("GET", "/", "", "s3", &names, &get, &payload);
+            let sig = signature("sec", &d[..8], "us-east-1", "s3", &d, &creq);
+            let mut h = HeaderMap::new();
+            h.insert("host", host.parse().unwrap());
+            for (k, v) in hs {
+                h.insert(axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+            }
+            h.insert("authorization", format!("AWS4-HMAC-SHA256 Credential=AKID/{}/us-east-1/s3/aws4_request, SignedHeaders={}, Signature={sig}", &d[..8], names.join(";")).parse().unwrap());
+            h
+        };
+        let uri: Uri = "/".parse().unwrap();
+        assert_eq!(verify(&Method::GET, &uri, &signed_at(-20), body, |_| ("sec".into(), None)).err().unwrap().0, "RequestTimeTooSkewed");
+        assert_eq!(verify(&Method::GET, &uri, &signed_at(20), body, |_| ("sec".into(), None)).err().unwrap().0, "RequestTimeTooSkewed");
+        assert!(verify(&Method::GET, &uri, &signed_at(5), body, |_| ("sec".into(), None)).is_ok(), "within the 15-minute window");
     }
 }
