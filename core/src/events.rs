@@ -446,6 +446,11 @@ mod tests {
         // 2026-11-22 is a Sunday: next MON-FRI 09:30 is Monday the 23rd.
         assert_eq!(next("cron(30 9 ? * MON-FRI *)", "2026-11-22T10:00:00Z").as_deref(), Some("2026-11-23T09:30:00+00:00"));
         assert_eq!(next("cron(0 0 1 JAN ? 2027)", "2026-11-22T00:00:00Z").as_deref(), Some("2027-01-01T00:00:00+00:00"));
+        // Boundary cases: month-end (skip Feb 31 -> Mar 31), leap day Feb 29, Friday -> Monday MON-FRI, past year -> None.
+        assert_eq!(next("cron(0 0 31 * ? *)", "2026-01-31T00:00:00Z").as_deref(), Some("2026-03-31T00:00:00+00:00"));
+        assert_eq!(next("cron(0 0 29 2 ? *)", "2026-11-22T00:00:00Z").as_deref(), Some("2028-02-29T00:00:00+00:00"));
+        assert_eq!(next("cron(0 9 ? * MON-FRI *)", "2026-11-20T09:00:00Z").as_deref(), Some("2026-11-23T09:00:00+00:00"));
+        assert_eq!(next("cron(0 0 1 1 ? 2025)", "2026-01-01T00:00:00Z"), None, "past year never fires");
         assert_eq!(next("cron(0 0 31 2 ? *)", "2026-11-22T00:00:00Z"), None, "Feb 31 never comes");
         for bad in ["cron(0 12 * * * *)", "cron(0 12 ? * ? *)", "cron(61 * * * ? *)", "cron(0 12 L * ? *)", "cron(0 12 * *)"] {
             assert!(cron_parse(bad).is_none(), "{bad}");

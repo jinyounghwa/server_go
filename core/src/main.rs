@@ -765,11 +765,12 @@ fn deliver(app: &Arc<App>, rid: &str, d: &sns::Delivery, from: &str, src: &str) 
         "sqs" => app.sqs.lock().unwrap().deliver(d.endpoint.rsplit(':').next().unwrap_or(""), d.body.clone(), &d.attrs),
         "lambda" => {
             let name = lambda::name_of(&d.endpoint);
+            let target = d.endpoint.clone(); // keeps a :version / :alias qualifier
             let env: Value = serde_json::from_str(&d.body).unwrap_or_default();
             let event = json!({"Records": [{"EventSource": "aws:sns", "EventVersion": "1.0", "EventSubscriptionArn": env["UnsubscribeURL"], "Sns": env}]});
             let ok = app.lambda.lock().unwrap().exists(&name);
             let app = app.clone();
-            tokio::spawn(async move { lambda::invoke_logged(&app, &name, event, "sns").await });
+            tokio::spawn(async move { lambda::invoke_logged(&app, &target, event, "sns").await });
             ok
         }
         _ => false, // ponytail: http/email/sms endpoints are not called

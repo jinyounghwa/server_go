@@ -28,7 +28,9 @@ fn no_stream() -> ApiErr {
     err("ResourceNotFoundException", "The specified log stream does not exist.")
 }
 
-// ponytail: filter patterns are plain terms / "quoted phrases" that must all appear; JSON and ?OR patterns unsupported.
+// ponytail: filter patterns support plain terms, "quoted phrases" (AND), ?term / ?["a","b"] OR lists, and
+// JSON patterns { $.a.b = "x" $.n != 2 } with =, !=, * (exists); IN and missing-field subtleties follow the
+// simple reading above, and malformed JSON patterns never match.
 fn pattern_terms(p: &str) -> Vec<String> {
     let mut out = vec![];
     let mut rest = p.trim();
@@ -44,6 +46,109 @@ fn pattern_terms(p: &str) -> Vec<String> {
         }
     }
     out
+}
+
+fn get_path<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut cur = v;
+    for seg in path.split('.') {
+        cur = match cur {
+            Value::Object(m) => m.get(seg)?,
+            Value::Array(a) => a.get(seg.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
+fn json_eq(f: &Value, val: &str) -> bool {
+    match f {
+        Value::String(s) => s == val,
+        Value::Number(x) => x.as_f64().is_some_and(|x| val.parse::<f64>().is_ok_and(|v| v == x)),
+        Value::Bool(x) => val == if *x { "true" } else { "false" },
+        _ => false,
+    }
+}
+
+// { $.path = value ... } against a JSON event message: "=" needs the field (or * for any non-null),
+// "!=" also matches when the field is missing. Numbers, strings and booleans compare by value.
+fn json_match(pat: &str, msg: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(msg) else { return false };
+    let b = pat.as_bytes();
+    let (mut i, n) = (0, b.len());
+    while i < n {
+        while i < n && b[i] == b' ' {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        if !pat[i..].starts_with("$.") {
+            return false;
+        }
+        i += 2;
+        let st = i;
+        while i < n && b[i] != b' ' && b[i] != b'=' && b[i] != b'!' {
+            i += 1;
+        }
+        let path = pat[st..i].to_string();
+        while i < n && b[i] == b' ' {
+            i += 1;
+        }
+        let neg = pat[i..].starts_with("!=");
+        if neg {
+            i += 2;
+        } else if i < n && b[i] == b'=' {
+            i += 1;
+        } else {
+            return false;
+        }
+        while i < n && b[i] == b' ' {
+            i += 1;
+        }
+        let val = if i < n && b[i] == b'"' {
+            let end = pat[i + 1..].find('"').map_or(n, |e| i + 1 + e);
+            let s = pat[i + 1..end].to_string();
+            i = (end + 1).min(n);
+            s
+        } else {
+            let st = i;
+            while i < n && b[i] != b' ' {
+                i += 1;
+            }
+            pat[st..i].to_string()
+        };
+        let eq = match get_path(&v, &path) {
+            None => false,
+            Some(f) => if val == "*" { !f.is_null() } else { json_eq(f, &val) },
+        };
+        if eq == neg {
+            return false;
+        }
+    }
+    true
+}
+
+// Filter pattern: empty matches all; plain/quoted terms must all appear; ?term or ?["a","b"] builds an OR
+// list (one of them must appear); a { $.f = v } pattern matches JSON messages field by field.
+fn event_matches(p: &str, msg: &str) -> bool {
+    let p = p.trim();
+    if p.is_empty() {
+        return true;
+    }
+    if let Some(inner) = p.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        return json_match(inner, msg);
+    }
+    let (mut ands, mut ors) = (vec![], vec![]);
+    for t in pattern_terms(p) {
+        match t.strip_prefix('?') {
+            Some(o) => {
+                let o = o.trim().trim_start_matches('[').trim_end_matches(']');
+                ors.extend(o.split(',').map(|x| x.trim().trim_matches('"').to_string()).filter(|x| !x.is_empty()));
+            }
+            None => ands.push(t),
+        }
+    }
+    ands.iter().all(|t| msg.contains(t.as_str())) && (ors.is_empty() || ors.iter().any(|t| msg.contains(t.as_str())))
 }
 
 impl Logs {
@@ -148,12 +253,12 @@ impl Logs {
             }
             "FilterLogEvents" => {
                 let names: Vec<&str> = r["logStreamNames"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-                let terms = pattern_terms(r["filterPattern"].as_str().unwrap_or(""));
+                let terms = r["filterPattern"].as_str().unwrap_or("");
                 let mut out = vec![];
                 for (sn, s) in g.streams.iter().filter(|(n, _)| names.is_empty() || names.contains(&n.as_str())) {
                     for (i, e) in s.events.iter().enumerate() {
                         let in_time = r["startTime"].as_i64().is_none_or(|t| e.0 >= t) && r["endTime"].as_i64().is_none_or(|t| e.0 < t);
-                        if in_time && terms.iter().all(|t| e.1.contains(t.as_str())) {
+                        if in_time && event_matches(terms, &e.1) {
                             out.push(json!({"logStreamName": sn, "timestamp": e.0, "message": e.1, "ingestionTime": e.2, "eventId": format!("{sn}-{i}")}));
                         }
                     }
@@ -187,5 +292,31 @@ mod tests {
     fn terms() {
         assert_eq!(super::pattern_terms(r#"ERROR "user 42" db"#), vec!["ERROR", "user 42", "db"]);
         assert!(super::pattern_terms("  ").is_empty());
+    }
+
+    #[test]
+    fn filter_patterns() {
+        let m = |p: &str, msg: &str| super::event_matches(p, msg);
+        assert!(m("", "anything"));
+        assert!(m("ERROR db", "ERROR in db"));
+        assert!(!m("ERROR cache", "ERROR in db"));
+        assert!(m("\"user 42\"", "hello user 42 bye"));
+        // ?-OR: one of them must appear
+        assert!(m("?ERROR ?WARNING", "WARNING: hot"));
+        assert!(!m("?ERROR ?WARNING", "INFO: fine"));
+        assert!(m("api ?[\"500\",\"503\"]", "api returned 503"));
+        assert!(!m("api ?[\"500\",\"503\"]", "api returned 200"), "AND terms still required");
+        // JSON patterns
+        let ev = r#"{"event": "login", "user": {"name": "kim", "tries": 3}, "tags": ["a", "b"]}"#;
+        assert!(m("{ $.event = \"login\" }", ev));
+        assert!(!m("{ $.event = \"logout\" }", ev));
+        assert!(m("{ $.user.name = kim $.user.tries = 3 }", ev), "strings unquoted, numbers by value");
+        assert!(m("{ $.user.tries != 4 }", ev));
+        assert!(m("{ $.missing != x }", ev), "missing field satisfies !=");
+        assert!(!m("{ $.missing = x }", ev));
+        assert!(m("{ $.user = * }", ev), "* means the field exists");
+        assert!(!m("{ $.user.nope = * }", ev));
+        assert!(m("{ $.tags.0 = a }", ev), "array index path");
+        assert!(!m("{ $.event = \"login\"", "not json"), "malformed pattern / non-JSON message never match");
     }
 }

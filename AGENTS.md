@@ -17,6 +17,7 @@
 - 2026-11-23 추가6: Kinesis 리샤딩 — `SplitShard`(ShardToSplit)·`MergeShards`. 샤드 모델을 명시적(범위·닫힘)로 개편, 닫힌 샤드는 읽기 유지·새 레코드는 열린 샤드로만 배치, Lambda 매핑은 새 샤드 자동 추적(끝에만 추가해 인덱스 안정).
 - 2026-11-23 추가7: S3 알림 대상 저장 시 검증 — 큐·토픽·함수 ARN이 실제로 존재해야 `PutBucketNotificationConfiguration` 성공(없으면 400 `InvalidArgument`).
 - 2026-11-23 추가8: Route53 라우팅 정책 — 가중치(무작위, 0은 당첨 안 됨)·페일오버(PRIMARY 우선)·지연시간(첫 세트; 클라이언트 리전을 모름). 레코드 세트 정체성이 (이름·타입·SetIdentifier)로 확장, List에 정책 속성 표시.
+- 2026-11-23 추가9: CloudWatch Logs 필터 패턴(`?OR` 리스트, JSON `{ $.a.b = "x" $.n != 2 }`, `*` 존재 체크) + 미검증 경계 경로 테스트(`test_handoff_edge_paths`: Kinesis→Lambda 재시도·건너뛰기, SNS/EB→Lambda 별칭 버전, S3/EB→SQS 큐 정책 Deny, `cron_next` 월말·윤년·요일·과거연도 단위 테스트). boto3 테스트 33개.
 - `v0.1.0` 릴리스 완료(2026-11-21): 바이너리 3종 + SHA256SUMS, Homebrew sha256 반영.
 - `v0.1.4` 릴리스(2026-11-22): ALB 요청별 규칙 라우팅, aws-chunked 트레일러 서명 검증, SNS·EventBridge·S3 배달의 대상 정책 판정(서비스 주체). Homebrew 0.1.4.
 - `v0.1.3` 릴리스 완료(2026-11-21): SNS·Lambda 리소스 정책, ALB 리스너 규칙, aws-chunked 서명 검증. release.yml도 Node 24 액션으로. Homebrew 0.1.3.

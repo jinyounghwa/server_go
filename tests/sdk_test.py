@@ -598,6 +598,23 @@ def test_logs():
     assert again["events"] == [] and again["nextForwardToken"] == ev["nextForwardToken"]
     f = logs.filter_log_events(logGroupName=g, filterPattern='ERROR "user 42"')
     assert [e["message"] for e in f["events"]] == ["ERROR db timeout user 42"]
+
+    # ?-OR lists and JSON patterns.
+    logs.create_log_stream(logGroupName=g, logStreamName="s2")
+    logs.put_log_events(logGroupName=g, logStreamName="s2", logEvents=[
+        {"timestamp": now + 10, "message": m} for m in ["WARNING: disk", "INFO: ok",
+                                                        '{"event": "login", "user": {"name": "kim", "tries": 3}}',
+                                                        '{"event": "logout", "user": {"name": "lee"}}']])
+    fp = lambda p: [e["message"] for e in logs.filter_log_events(logGroupName=g, logStreamNames=["s2"], filterPattern=p)["events"]]
+    assert fp("?ERROR ?WARNING") == ["WARNING: disk"]
+    assert fp("?[\"INFO\",\"done\"]") == ["INFO: ok"]
+    assert fp('{ $.event = "login" }') == ['{"event": "login", "user": {"name": "kim", "tries": 3}}']
+    assert fp('{ $.user.name != kim }') == ['{"event": "logout", "user": {"name": "lee"}}'], "non-JSON skipped; different value matches"
+    assert fp('{ $.missing != x }') == ['{"event": "login", "user": {"name": "kim", "tries": 3}}', '{"event": "logout", "user": {"name": "lee"}}'], "missing field in JSON satisfies !="
+    assert fp('{ $.user.tries = 3 }') == ['{"event": "login", "user": {"name": "kim", "tries": 3}}']
+    assert fp('{ $.user = * }') == ['{"event": "login", "user": {"name": "kim", "tries": 3}}', '{"event": "logout", "user": {"name": "lee"}}']
+    assert fp('{ $.event = "login"') == [], "malformed JSON pattern matches nothing"
+    logs.delete_log_stream(logGroupName=g, logStreamName="s2")
     assert logs.describe_log_streams(logGroupName=g)["logStreams"][0]["logStreamName"] == "s1"
     logs.put_retention_policy(logGroupName=g, retentionInDays=7)
     assert logs.describe_log_groups(logGroupNamePrefix=g)["logGroups"][0]["retentionInDays"] == 7
@@ -1684,6 +1701,106 @@ def test_snapshot():
     assert u_s3.get_object(Bucket=p, Key="a.txt")["Body"].read() == b"hello-snap"
     assert code(u_s3.list_buckets) == "AccessDenied"
     urllib.request.urlopen(urllib.request.Request(f"{EP}/_admin/reset", headers={"x-rocalcloud": "1"}, method="POST"))
+
+
+def test_handoff_edge_paths():
+    """Verify Kinesis->Lambda retry/skip, SNS/EventBridge->Lambda alias ARN version, and S3/EB->SQS Deny policies."""
+    kin, lam, sns, eb, logs = (boto3.client(n, **kw) for n in ("kinesis", "lambda", "sns", "events", "logs"))
+    p = f"edge{run}"
+    q = sqs.create_queue(QueueName=p)["QueueUrl"]
+    qa = sqs.get_queue_attributes(QueueUrl=q, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    recv = lambda: [m["Body"] for m in sqs.receive_message(QueueUrl=q, MaxNumberOfMessages=10).get("Messages", [])]
+    log_msgs = lambda fn: [e["message"] for e in logs.filter_log_events(logGroupName=f"/aws/lambda/{fn}")["events"]] if any(
+        g["logGroupName"] == f"/aws/lambda/{fn}" for g in logs.describe_log_groups(logGroupNamePrefix=f"/aws/lambda/{fn}")["logGroups"]
+    ) else []
+
+    # 1. Kinesis -> Lambda failure retry + skip after MaximumRetryAttempts=1
+    stream = f"{p}-s"
+    kin.create_stream(StreamName=stream, ShardCount=1)
+    sarn = kin.describe_stream(StreamName=stream)["StreamDescription"]["StreamARN"]
+    fn_k = f"{p}-k"
+    code_k = (
+        "import base64\n"
+        "def handler(ev, ctx):\n"
+        "    for r in ev.get('Records', []):\n"
+        "        msg = base64.b64decode(r['kinesis']['data']).decode()\n"
+        "        if msg == 'fail': raise RuntimeError('boom')\n"
+        "        print('KIN_OK:' + msg)\n"
+        "    return 'ok'\n"
+    )
+    lam.create_function(FunctionName=fn_k, Runtime="python3.12", Role="arn:aws:iam::000000000000:role/r",
+                        Handler="index.handler", Code={"ZipFile": zipped({"index.py": code_k})})
+    esm = lam.create_event_source_mapping(EventSourceArn=sarn, FunctionName=fn_k, StartingPosition="TRIM_HORIZON",
+                                          BatchSize=1, MaximumRetryAttempts=1)["UUID"]
+    kin.put_record(StreamName=stream, PartitionKey="p1", Data=b"fail")
+    kin.put_record(StreamName=stream, PartitionKey="p1", Data=b"ok")
+    got = []
+    for _ in range(50):
+        got = log_msgs(fn_k)
+        if any("KIN_OK:ok" in m for m in got):
+            break
+        time.sleep(0.15)
+    assert any("KIN_OK:ok" in m for m in got), f"Kinesis shard should skip failing batch after MaximumRetryAttempts=1, got={got}"
+    lam.delete_event_source_mapping(UUID=esm); lam.delete_function(FunctionName=fn_k); kin.delete_stream(StreamName=stream)
+
+    # 2. EventBridge & SNS target with Lambda alias ARN runs pinned version (not $LATEST)
+    fn_a = f"{p}-a"
+    mk_ver_code = lambda tag: (
+        "import os\n"
+        "def handler(ev, ctx):\n"
+        f"    print('VER:' + os.environ.get('AWS_LAMBDA_FUNCTION_VERSION', '?') + ':{tag}')\n"
+        "    return 'ok'\n"
+    )
+    lam.create_function(FunctionName=fn_a, Runtime="python3.12", Role="arn:aws:iam::000000000000:role/r",
+                        Handler="index.handler", Code={"ZipFile": zipped({"index.py": mk_ver_code("v1")})})
+    v1 = lam.publish_version(FunctionName=fn_a)["Version"]
+    alias_arn = lam.create_alias(FunctionName=fn_a, Name="live", FunctionVersion=v1)["AliasArn"]
+    lam.update_function_code(FunctionName=fn_a, ZipFile=zipped({"index.py": mk_ver_code("latest")}))
+    t = sns.create_topic(Name=p)["TopicArn"]
+    sns.subscribe(TopicArn=t, Protocol="lambda", Endpoint=alias_arn)
+    eb.put_rule(Name=p, EventPattern=json.dumps({"source": [p]}))
+    eb.put_targets(Rule=p, Targets=[{"Id": "a", "Arn": alias_arn}])
+    sns.publish(TopicArn=t, Message="hi")
+    eb.put_events(Entries=[{"Source": p, "DetailType": "x", "Detail": "{}"}])
+    vers = []
+    for _ in range(50):
+        vers = [m for m in log_msgs(fn_a) if "VER:" in m]
+        if len(vers) >= 2:
+            break
+        time.sleep(0.15)
+    assert len(vers) == 2 and all(f"VER:{v1}:v1" in m for m in vers), f"alias targets must invoke version {v1}, got {vers}"
+    eb.remove_targets(Rule=p, Ids=["a"]); eb.delete_rule(Name=p); sns.delete_topic(TopicArn=t)
+    lam.delete_alias(FunctionName=fn_a, Name="live"); lam.delete_function(FunctionName=fn_a)
+
+    # 3. S3 notification -> SQS and EventBridge -> SQS blocked by queue Deny policy
+    bkt = f"{p}-b"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_notification_configuration(Bucket=bkt, NotificationConfiguration={
+        "QueueConfigurations": [{"QueueArn": qa, "Events": ["s3:ObjectCreated:*"]}]})
+    eb.put_rule(Name=f"{p}-q", EventPattern=json.dumps({"source": [f"{p}-q"]}))
+    eb.put_targets(Rule=f"{p}-q", Targets=[{"Id": "q", "Arn": qa}])
+    deny_pol = json.dumps({"Statement": [
+        {"Effect": "Deny", "Principal": {"Service": "s3.amazonaws.com"}, "Action": "sqs:SendMessage", "Resource": qa},
+        {"Effect": "Deny", "Principal": {"Service": "events.amazonaws.com"}, "Action": "sqs:SendMessage", "Resource": qa},
+    ]})
+    sqs.set_queue_attributes(QueueUrl=q, Attributes={"Policy": deny_pol})
+    s3.put_object(Bucket=bkt, Key="denied.txt", Body=b"x")
+    eb.put_events(Entries=[{"Source": f"{p}-q", "DetailType": "x", "Detail": "{}"}])
+    time.sleep(0.35)
+    assert recv() == [], "S3 and EventBridge deliveries must be blocked by queue Deny policy"
+    allow_pol = json.dumps({"Statement": [
+        {"Effect": "Allow", "Principal": {"Service": "s3.amazonaws.com"}, "Action": "sqs:SendMessage", "Resource": qa},
+        {"Effect": "Allow", "Principal": {"Service": "events.amazonaws.com"}, "Action": "sqs:SendMessage", "Resource": qa},
+    ]})
+    sqs.set_queue_attributes(QueueUrl=q, Attributes={"Policy": allow_pol})
+    s3.put_object(Bucket=bkt, Key="allowed.txt", Body=b"y")
+    eb.put_events(Entries=[{"Source": f"{p}-q", "DetailType": "x", "Detail": "{}"}])
+    time.sleep(0.35)
+    got_q = recv()
+    assert len(got_q) == 2 and any("allowed.txt" in m for m in got_q) and any(f"{p}-q" in m for m in got_q), got_q
+    eb.remove_targets(Rule=f"{p}-q", Ids=["q"]); eb.delete_rule(Name=f"{p}-q")
+    s3.delete_object(Bucket=bkt, Key="denied.txt"); s3.delete_object(Bucket=bkt, Key="allowed.txt"); s3.delete_bucket(Bucket=bkt)
+    sqs.delete_queue(QueueUrl=q)
 
 
 if __name__ == "__main__":
