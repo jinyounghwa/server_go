@@ -102,7 +102,7 @@ All options can be set via environment variables or a `KEY=VALUE` file pointed t
 | **Step Functions** | ASL interpreter: Pass, Task (`lambda:invoke`, `sqs:sendMessage`, `sns:publish`, `dynamodb:*`), Choice, Wait, Succeed, Fail, Parallel, Map, Retry/Catch, Parameters/ResultSelector/ResultPath/OutputPath, intrinsics (`Format`, `StringToJson`, `JsonToString`, `Array`, `UUID`, `MathAdd`), execution history, `StopExecution` |
 | **API Gateway (HTTP APIs)** | `apigatewayv2` APIs, Lambda proxy integrations (payload 2.0), routes with `{params}` and `{proxy+}`, stages, quick create; invoke at `/_api/{apiId}/[{stage}/]path` |
 | **Cognito** | User pools, app clients (with secrets), SignUp/Confirm, ForgotPassword, `USER_PASSWORD_AUTH`, refresh tokens, `NEW_PASSWORD_REQUIRED`, admin user APIs, RS256 JWTs with JWKS at `/_cognito/{poolId}/.well-known/jwks.json`; verification codes emit `CodeSent` events |
-| **Kinesis** | Streams, shards (MD5 hash ranges), `PutRecord(s)`, shard iterators (`TRIM_HORIZON`, `LATEST`, `AT/AFTER_SEQUENCE_NUMBER`, `AT_TIMESTAMP`), `GetRecords` |
+| **Kinesis** | Streams, shards (MD5 hash ranges), `PutRecord(s)`, shard iterators (`TRIM_HORIZON`, `LATEST`, `AT/AFTER_SEQUENCE_NUMBER`, `AT_TIMESTAMP`), `GetRecords`, resharding (`SplitShard`/`MergeShards`; closed shards stay readable) |
 | **SES** | v1 (Query) and v2 (REST): identities, `SendEmail`, `SendRawEmail`; messages appear in the GUI mailbox and are never sent externally |
 | **RDS** | `postgres` / `mysql` / `mariadb` instances as real Docker containers on `127.0.0.1`; create, describe, stop, start, reboot, delete |
 | **ElastiCache** | `redis` / `valkey` / `memcached` clusters as Docker containers; create, describe (with node endpoints), delete |

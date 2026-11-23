@@ -616,6 +616,12 @@ async fn poll_kinesis(app: Arc<App>, id: String) {
             return; // mapping deleted
         };
         let mut busy = false;
+        // Follow resharding: newly appended shards start from their beginning (they are empty at creation).
+        let cur = app.kinesis.lock().unwrap().shard_count(&stream);
+        while pos.len() < cur {
+            pos.push(0);
+            failures.push(0);
+        }
         for i in 0..pos.len() {
             let recs = if enabled { app.kinesis.lock().unwrap().read(&stream, i, pos[i], batch) } else { vec![] };
             if recs.is_empty() {

@@ -1052,6 +1052,40 @@ def test_kinesis():
     k.delete_stream(StreamName=n)
     assert code(k.describe_stream, StreamName=n) == "ResourceNotFoundException"
 
+    # Resharding: SplitShard/MergeShards. Closed shards stay readable; new records route to open shards only.
+    n2 = f"reshard{run}"
+    k.create_stream(StreamName=n2, ShardCount=2)
+    sh = {s["ShardId"]: s for s in k.list_shards(StreamName=n2)["Shards"]}
+    (a_id, b_id) = sorted(sh)
+    hk = sh[a_id]["HashKeyRange"]["EndingHashKey"]
+    pre = k.put_record(StreamName=n2, Data=b"before", PartitionKey="user-1", ExplicitHashKey=hk)["ShardId"]
+    assert pre == a_id, "ExplicitHashKey pins the record to shard a"
+    mid = (int(sh[a_id]["HashKeyRange"]["StartingHashKey"]) + int(sh[a_id]["HashKeyRange"]["EndingHashKey"])) // 2 + 1
+    k.split_shard(StreamName=n2, ShardToSplit=a_id, NewStartingHashKey=str(mid))
+    after = k.list_shards(StreamName=n2)["Shards"]
+    kids = [s for s in after if s["ShardId"] not in (a_id, b_id)]
+    assert len(kids) == 2 and all("EndingSequenceNumber" not in s["SequenceNumberRange"] for s in kids)
+    assert {s["ShardId"] for s in after if "EndingSequenceNumber" in s["SequenceNumberRange"]} == {a_id}, "split closes the parent only"
+    covered = sorted((int(s["HashKeyRange"]["StartingHashKey"]), int(s["HashKeyRange"]["EndingHashKey"])) for s in kids)
+    assert covered == sorted([(int(sh[a_id]["HashKeyRange"]["StartingHashKey"]), mid - 1), (mid, int(sh[a_id]["HashKeyRange"]["EndingHashKey"]))])
+    assert k.describe_stream_summary(StreamName=n2)["StreamDescriptionSummary"]["OpenShardCount"] == 3
+    post = k.put_record(StreamName=n2, Data=b"after", PartitionKey="user-1", ExplicitHashKey=hk)["ShardId"]
+    assert post in {s["ShardId"] for s in kids} and post != pre
+    it = k.get_shard_iterator(StreamName=n2, ShardId=pre, ShardIteratorType="TRIM_HORIZON")["ShardIterator"]
+    assert [x["Data"] for x in k.get_records(ShardIterator=it)["Records"]] == [b"before"], "closed shard still readable"
+    assert code(k.split_shard, StreamName=n2, ShardToSplit=a_id, NewStartingHashKey=str(mid)) == "InvalidArgumentException", "closed shard"
+    assert code(k.split_shard, StreamName=n2, ShardToSplit=b_id, NewStartingHashKey=sh[b_id]["HashKeyRange"]["StartingHashKey"]) == "InvalidArgumentException"
+    assert code(k.split_shard, StreamName=n2, ShardToSplit="shardId-000000000099", NewStartingHashKey=str(mid)) == "ResourceNotFoundException"
+    assert code(k.merge_shards, StreamName=n2, ShardToMerge=kids[0]["ShardId"], AdjacentShardToMerge=b_id) == "InvalidArgumentException", "not adjacent"
+    k.merge_shards(StreamName=n2, ShardToMerge=kids[0]["ShardId"], AdjacentShardToMerge=kids[1]["ShardId"])
+    merged = [s for s in k.list_shards(StreamName=n2)["Shards"] if "EndingSequenceNumber" not in s["SequenceNumberRange"]]
+    assert len(merged) == 2
+    joined = [s for s in merged if s["ShardId"] not in (a_id, b_id)][0]
+    assert (int(joined["HashKeyRange"]["StartingHashKey"]), int(joined["HashKeyRange"]["EndingHashKey"])) == \
+        (int(sh[a_id]["HashKeyRange"]["StartingHashKey"]), int(sh[a_id]["HashKeyRange"]["EndingHashKey"]))
+    assert k.put_record(StreamName=n2, Data=b"merged", PartitionKey="user-1", ExplicitHashKey=hk)["ShardId"] == joined["ShardId"]
+    k.delete_stream(StreamName=n2)
+
 
 def test_ses():
     import urllib.request
