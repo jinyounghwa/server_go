@@ -312,6 +312,80 @@ def test_iam():
     s3.delete_bucket(Bucket=b)
 
 
+def test_iam_conditions():
+    # Condition operators beyond String*/Bool: Numeric*, Date*, IpAddress and the ForAnyValue/ForAllValues
+    # qualifiers, evaluated against the live request context (aws:SourceIp=127.0.0.1, aws:EpochTime/CurrentTime,
+    # aws:RequestedRegion=us-east-1).
+    iam = boto3.client("iam", **kw)
+    u, b = f"cond{run}", f"condb{run}"
+    s3.create_bucket(Bucket=b)
+    s3.put_object(Bucket=b, Key="a.txt", Body=b"ok")
+    iam.create_user(UserName=u)
+    k = iam.create_access_key(UserName=u)["AccessKey"]
+    ukw = dict(kw, aws_access_key_id=k["AccessKeyId"], aws_secret_access_key=k["SecretAccessKey"])
+    us3 = boto3.client("s3", config=Config(s3={"addressing_style": "path"}), **ukw)
+
+    def try_cond(cond):
+        iam.put_user_policy(UserName=u, PolicyName="c", PolicyDocument=json.dumps({"Statement": [
+            {"Effect": "Allow", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{b}/*", "Condition": cond}]}))
+        try:
+            return us3.get_object(Bucket=b, Key="a.txt")["Body"].read() == b"ok"
+        except ClientError:
+            return False
+
+    try:  # Numeric*: epoch time is a number in both the policy and the context
+        assert try_cond({"NumericGreaterThan": {"aws:EpochTime": "1000000000"}})
+        assert try_cond({"NumericLessThanEquals": {"aws:EpochTime": "9999999999"}})
+        assert not try_cond({"NumericLessThan": {"aws:EpochTime": "1000000000"}})
+        assert not try_cond({"NumericEquals": {"aws:EpochTime": ["1", "2"]}})
+        # Date*: epoch seconds, RFC 3339 and date-only values
+        assert try_cond({"DateGreaterThan": {"aws:CurrentTime": "2000-01-01T00:00:00Z"}})
+        assert try_cond({"DateGreaterThanEquals": {"aws:CurrentTime": "2000-01-01"}})
+        assert not try_cond({"DateLessThan": {"aws:CurrentTime": "2000-01-01T00:00:00Z"}})
+        assert not try_cond({"DateGreaterThan": {"aws:CurrentTime": "9999-01-01T00:00:00Z"}})
+        # IpAddress / NotIpAddress on aws:SourceIp
+        assert try_cond({"IpAddress": {"aws:SourceIp": "127.0.0.1/32"}})
+        assert try_cond({"IpAddress": {"aws:SourceIp": ["10.0.0.0/8", "127.0.0.0/8"]}})
+        assert not try_cond({"IpAddress": {"aws:SourceIp": "10.0.0.0/8"}})
+        assert try_cond({"NotIpAddress": {"aws:SourceIp": "10.0.0.0/8"}})
+        assert not try_cond({"IpAddress": {"aws:SourceIp": "::1/128"}})
+        # Qualifiers: single-valued keys act like the base operator; missing keys follow AWS rules
+        assert try_cond({"ForAllValues:StringEquals": {"aws:RequestedRegion": "us-east-1"}})
+        assert try_cond({"ForAnyValue:StringEquals": {"aws:RequestedRegion": "us-east-1"}})
+        assert not try_cond({"ForAnyValue:StringEquals": {"aws:RequestedRegion": "eu-west-1"}})
+        assert try_cond({"ForAllValues:StringEquals": {"aws:MissingKey": "x"}})
+        assert not try_cond({"ForAnyValue:StringEquals": {"aws:MissingKey": "x"}})
+        # Unknown operators never match
+        assert not try_cond({"StringSuperEquals": {"aws:RequestedRegion": "us-east-1"}})
+    finally:
+        iam.delete_user_policy(UserName=u, PolicyName="c")
+
+    # The same operators work in a bucket policy (resource-based) and in SimulatePrincipalPolicy.
+    bp = {"Statement": [{"Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::000000000000:user/{u}"}, "Action": "s3:GetObject",
+                         "Resource": f"arn:aws:s3:::{b}/*", "Condition": {"IpAddress": {"aws:SourceIp": "127.0.0.0/8"}}}]}
+    s3.put_bucket_policy(Bucket=b, Policy=json.dumps(bp))
+    assert us3.get_object(Bucket=b, Key="a.txt")["Body"].read() == b"ok"
+    bp["Statement"][0]["Condition"] = {"IpAddress": {"aws:SourceIp": "10.0.0.0/8"}}
+    s3.put_bucket_policy(Bucket=b, Policy=json.dumps(bp))
+    assert code(us3.get_object, Bucket=b, Key="a.txt") == "AccessDenied"
+    s3.delete_bucket_policy(Bucket=b)
+    doc = {"Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*",
+                          "Condition": {"DateGreaterThan": {"aws:CurrentTime": "2000-01-01T00:00:00Z"}}}]}
+    iam.put_user_policy(UserName=u, PolicyName="c", PolicyDocument=json.dumps(doc))
+    sim = iam.simulate_principal_policy(PolicySourceArn=f"arn:aws:iam::000000000000:user/{u}", ActionNames=["s3:GetObject"], ResourceArns=["arn:aws:s3:::x/y"])
+    assert sim["EvaluationResults"][0]["EvalDecision"] == "allowed"
+    doc["Statement"][0]["Condition"] = {"DateLessThan": {"aws:CurrentTime": "2000-01-01T00:00:00Z"}}
+    iam.put_user_policy(UserName=u, PolicyName="c", PolicyDocument=json.dumps(doc))
+    sim = iam.simulate_principal_policy(PolicySourceArn=f"arn:aws:iam::000000000000:user/{u}", ActionNames=["s3:GetObject"], ResourceArns=["arn:aws:s3:::x/y"])
+    assert sim["EvaluationResults"][0]["EvalDecision"] == "implicitDeny"
+
+    iam.delete_user_policy(UserName=u, PolicyName="c")
+    iam.delete_access_key(UserName=u, AccessKeyId=k["AccessKeyId"])
+    iam.delete_user(UserName=u)
+    s3.delete_object(Bucket=b, Key="a.txt")
+    s3.delete_bucket(Bucket=b)
+
+
 def test_network():
     import urllib.request
     ec2 = boto3.client("ec2", **kw)

@@ -113,17 +113,35 @@ pub fn glob(p: &str, s: &str, ci: bool) -> bool {
     p[pi..].iter().all(|c| *c == '*')
 }
 
-// ponytail: String*/Arn*/Bool operators (+IfExists); others never match. ForAnyValue/ForAllValues not supported.
+// Numeric*, Date* and IpAddress operators are handled here alongside String*/Arn*/Bool and
+// the ForAnyValue/ForAllValues qualifiers. ponytail: request context keys are single-valued, so the
+// qualifiers only change the missing-key rule (ForAllValues passes on a missing key); multivalued
+// semantics need a list-valued context. Date accepts epoch seconds or ISO 8601 (RFC 3339, YYYY-MM-DD,
+// UTC assumed when no offset); IpAddress parses IPv4/IPv6 CIDRs (no zone index).
 fn cond_ok(c: &Value, ctx: &HashMap<String, String>) -> bool {
     let Some(m) = c.as_object() else { return true };
     m.iter().all(|(op, kv)| {
         kv.as_object().is_some_and(|kv| {
             kv.iter().all(|(k, want)| {
-                let (base, if_exists) = op.strip_suffix("IfExists").map_or((op.as_str(), false), |b| (b, true));
+                let mut all = None; // Some(false) = ForAnyValue, Some(true) = ForAllValues
+                let mut rest = op.as_str();
+                if let Some(b) = rest.strip_prefix("ForAnyValue:") {
+                    rest = b;
+                    all = Some(false);
+                } else if let Some(b) = rest.strip_prefix("ForAllValues:") {
+                    rest = b;
+                    all = Some(true);
+                }
+                let (base, if_exists) = rest.strip_suffix("IfExists").map_or((rest, false), |b| (b, true));
                 let wants = strs(want);
                 let Some(h) = ctx.iter().find(|(ck, _)| ck.eq_ignore_ascii_case(k)).map(|(_, v)| v.as_str()) else {
-                    return if_exists || base.contains("Not");
+                    // Missing key: IfExists passes, ForAllValues passes (empty set), negated single-valued operators pass.
+                    return if_exists || all == Some(true) || base.contains("Not");
                 };
+                let num = |f: fn(std::cmp::Ordering) -> bool| {
+                    cmp_op(h, &wants, |s| s.trim().parse::<f64>().ok(), f)
+                };
+                let date = |f: fn(std::cmp::Ordering) -> bool| cmp_op(h, &wants, date_secs, f);
                 match base {
                     "StringEquals" | "ArnEquals" => wants.iter().any(|w| w == h),
                     "StringNotEquals" | "ArnNotEquals" => !wants.iter().any(|w| w == h),
@@ -132,11 +150,122 @@ fn cond_ok(c: &Value, ctx: &HashMap<String, String>) -> bool {
                     "StringLike" | "ArnLike" => wants.iter().any(|w| glob(w, h, false)),
                     "StringNotLike" | "ArnNotLike" => !wants.iter().any(|w| glob(w, h, false)),
                     "Bool" => wants.iter().any(|w| w.eq_ignore_ascii_case(h)),
+                    "NumericEquals" => num(|o| o == std::cmp::Ordering::Equal),
+                    "NumericNotEquals" => num(|o| o != std::cmp::Ordering::Equal),
+                    "NumericLessThan" => num(|o| o == std::cmp::Ordering::Less),
+                    "NumericLessThanEquals" => num(|o| o != std::cmp::Ordering::Greater),
+                    "NumericGreaterThan" => num(|o| o == std::cmp::Ordering::Greater),
+                    "NumericGreaterThanEquals" => num(|o| o != std::cmp::Ordering::Less),
+                    "DateEquals" => date(|o| o == std::cmp::Ordering::Equal),
+                    "DateNotEquals" => date(|o| o != std::cmp::Ordering::Equal),
+                    "DateLessThan" => date(|o| o == std::cmp::Ordering::Less),
+                    "DateLessThanEquals" => date(|o| o != std::cmp::Ordering::Greater),
+                    "DateGreaterThan" => date(|o| o == std::cmp::Ordering::Greater),
+                    "DateGreaterThanEquals" => date(|o| o != std::cmp::Ordering::Less),
+                    "IpAddress" => wants.iter().any(|w| ip_in(w, h)),
+                    "NotIpAddress" => !wants.iter().any(|w| ip_in(w, h)),
                     _ => false,
                 }
             })
         })
     })
+}
+
+fn cmp_op<T: PartialOrd>(h: &str, wants: &[String], parse: impl Fn(&str) -> Option<T>, f: fn(std::cmp::Ordering) -> bool) -> bool {
+    let Some(hv) = parse(h) else { return false };
+    wants.iter().any(|w| parse(w).is_some_and(|wv| hv.partial_cmp(&wv).is_some_and(f)))
+}
+
+// Epoch seconds, RFC 3339 ("2026-11-23T10:00:00Z", "+09:00" offset) or a date-only "2026-11-23" (UTC).
+fn date_secs(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if let Ok(n) = s.parse::<i64>() {
+        return Some(n);
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp());
+    }
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok().and_then(|d| d.and_hms_opt(0, 0, 0)).map(|t| t.and_utc().timestamp())
+}
+
+// IPv4 or IPv6; IPv4-mapped IPv6 literals (::ffff:a.b.c.d) count as IPv4, as AWS does. No zone index (%eth0).
+enum Ip {
+    V4([u8; 4]),
+    V6([u8; 16]),
+}
+
+fn parse_ip(s: &str) -> Option<Ip> {
+    let s = s.trim();
+    if !s.contains(':') {
+        let q: Vec<u8> = s.split('.').map(|x| x.parse::<u8>().ok()).collect::<Option<Vec<_>>>()?;
+        return (q.len() == 4).then(|| Ip::V4(q.try_into().unwrap()));
+    }
+    let (head, tail) = s.split_once("::").map_or((s, None), |(h, t)| (h, Some(t)));
+    let push = |g: &str, v: &mut Vec<u16>| -> Option<()> {
+        if g.contains('.') {
+            let q: Vec<u8> = g.split('.').map(|x| x.parse::<u8>().ok()).collect::<Option<Vec<_>>>()?;
+            if q.len() != 4 {
+                return None;
+            }
+            v.push(((q[0] as u16) << 8) | q[1] as u16);
+            v.push(((q[2] as u16) << 8) | q[3] as u16);
+        } else {
+            v.push(u16::from_str_radix(g, 16).ok()?);
+        }
+        Some(())
+    };
+    let mut groups = vec![];
+    for g in head.split(':').filter(|g| !g.is_empty()) {
+        push(g, &mut groups)?;
+    }
+    if let Some(t) = tail {
+        let mut right = vec![];
+        for g in t.split(':').filter(|g| !g.is_empty()) {
+            push(g, &mut right)?;
+        }
+        if groups.len() + right.len() > 7 {
+            return None; // "::" must stand for at least one zero group
+        }
+        let zeros = vec![0u16; 8 - groups.len() - right.len()]; // fill between head and tail
+        groups.extend(zeros);
+        groups.extend(right);
+    } else if groups.len() != 8 {
+        return None;
+    }
+    let mut b = [0u8; 16];
+    for (i, g) in groups.iter().enumerate() {
+        b[i * 2] = (g >> 8) as u8;
+        b[i * 2 + 1] = (g & 0xff) as u8;
+    }
+    if b[..10].iter().all(|&x| x == 0) && b[10] == 0xff && b[11] == 0xff {
+        Some(Ip::V4([b[12], b[13], b[14], b[15]]))
+    } else {
+        Some(Ip::V6(b))
+    }
+}
+
+// Prefix length is relative to the written family (32 for IPv4, 128 for IPv6); families must match.
+fn ip_in(want: &str, ip: &str) -> bool {
+    let (net_s, bits_s) = match want.split_once('/') {
+        Some((n, b)) => (n, Some(b)),
+        None => (want, None),
+    };
+    let (Some(net), Some(ipb)) = (parse_ip(net_s), parse_ip(ip)) else { return false };
+    let (n, i, max) = match (&net, &ipb) {
+        (Ip::V4(n), Ip::V4(i)) => (&n[..], &i[..], 32u32),
+        (Ip::V6(n), Ip::V6(i)) => (&n[..], &i[..], 128u32),
+        _ => return false,
+    };
+    let bits = if let Some(b) = bits_s {
+        let Ok(b) = b.trim().parse::<u32>() else { return false };
+        b
+    } else {
+        max // bare address = full-length prefix
+    };
+    if bits > max || n[..(bits / 8) as usize] != i[..(bits / 8) as usize] {
+        return false;
+    }
+    bits % 8 == 0 || (n[(bits / 8) as usize] & (0xffu8 << (8 - bits % 8))) == (i[(bits / 8) as usize] & (0xffu8 << (8 - bits % 8)))
 }
 
 fn stmt_matches(st: &Value, action: &str, resource: &str, ctx: &HashMap<String, String>) -> bool {
@@ -150,12 +279,16 @@ fn stmt_matches(st: &Value, action: &str, resource: &str, ctx: &HashMap<String, 
     act && res && cond_ok(&st["Condition"], ctx)
 }
 
-fn req_ctx(p: &Principal) -> HashMap<String, String> {
+fn req_ctx(p: &Principal, ip: &str) -> HashMap<String, String> {
+    let now = chrono::Utc::now();
     let mut ctx = HashMap::from([
         ("aws:PrincipalArn".to_string(), match p { Principal::Role { role, .. } => role_arn(role), _ => p.arn() }),
         ("aws:PrincipalAccount".to_string(), ACCOUNT.to_string()),
         ("aws:RequestedRegion".to_string(), REGION.clone()),
         ("aws:SecureTransport".to_string(), "false".to_string()),
+        ("aws:SourceIp".to_string(), ip.to_string()),
+        ("aws:EpochTime".to_string(), now.timestamp().to_string()),
+        ("aws:CurrentTime".to_string(), now.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
     ]);
     if let Principal::User(u) = p {
         ctx.insert("aws:username".into(), u.clone());
@@ -254,10 +387,14 @@ impl Iam {
     }
 
     pub fn authorize(&self, p: &Principal, action: &str, resource: &str) -> Decision {
+        self.authorize_ip(p, action, resource, "127.0.0.1")
+    }
+
+    pub fn authorize_ip(&self, p: &Principal, action: &str, resource: &str, ip: &str) -> Decision {
         let Some((_, e)) = self.entity(p) else {
             return Decision { allowed: true, kind: "allowed", reason: "account root (unregistered access key) is always allowed".into(), matched: vec![] };
         };
-        let ctx = req_ctx(p);
+        let ctx = req_ctx(p, ip);
         let mut allow = None;
         for (label, doc) in self.docs(e) {
             for (i, st) in statements(doc).into_iter().enumerate() {
@@ -293,12 +430,16 @@ impl Iam {
     // The root can likewise always rewrite a queue or topic policy.
     // Covers S3 bucket, SQS queue, SNS topic and Lambda function (AddPermission) policies.
     pub fn authorize_with(&self, p: &Principal, action: &str, resource: &str, rp: Option<(&str, &Value)>) -> Decision {
-        let id = self.authorize(p, action, resource);
+        self.authorize_with_ip(p, action, resource, rp, "127.0.0.1")
+    }
+
+    pub fn authorize_with_ip(&self, p: &Principal, action: &str, resource: &str, rp: Option<(&str, &Value)>, ip: &str) -> Decision {
+        let id = self.authorize_ip(p, action, resource, ip);
         let Some((kind, doc)) = rp else { return id };
         if id.kind == "explicitDeny" || (matches!(p, Principal::Root) && (action.ends_with("BucketPolicy") || action == "sqs:SetQueueAttributes" || action == "sns:SetTopicAttributes" || action == "lambda:RemovePermission" || action == "lambda:AddPermission")) {
             return id;
         }
-        let ctx = req_ctx(p);
+        let ctx = req_ctx(p, ip);
         let mut allow = None;
         for (i, st) in statements(doc).into_iter().enumerate() {
             let deny = st["Effect"] == "Deny";
@@ -754,5 +895,47 @@ mod tests {
         assert!(!cond_ok(&json!({"StringEquals": {"aws:username": ["lee", "park"]}}), &ctx));
         assert!(cond_ok(&json!({"StringNotEquals": {"aws:missing": "x"}}), &ctx));
         assert!(!cond_ok(&json!({"StringEquals": {"aws:missing": "x"}}), &ctx));
+    }
+
+    #[test]
+    fn condition_operators() {
+        let now = chrono::Utc::now().timestamp();
+        let ctx = HashMap::from([
+            ("aws:SourceIp".to_string(), "127.0.0.1".to_string()),
+            ("aws:EpochTime".to_string(), now.to_string()),
+        ]);
+        // Numeric*
+        assert!(cond_ok(&json!({"NumericGreaterThan": {"aws:EpochTime": "1000000000"}}), &ctx));
+        assert!(cond_ok(&json!({"NumericLessThanEquals": {"aws:EpochTime": now + 1}}), &ctx));
+        assert!(!cond_ok(&json!({"NumericLessThan": {"aws:EpochTime": "1000000000"}}), &ctx));
+        assert!(!cond_ok(&json!({"NumericEquals": {"aws:EpochTime": ["1", "2"]}}), &ctx));
+        assert!(cond_ok(&json!({"NumericNotEquals": {"aws:EpochTime": "0"}}), &ctx));
+        assert!(!cond_ok(&json!({"NumericEquals": {"aws:EpochTime": "not-a-number"}}), &ctx));
+        // Date*: epoch seconds, RFC 3339 and date-only forms
+        assert!(cond_ok(&json!({"DateGreaterThan": {"aws:EpochTime": "2020-01-01T00:00:00Z"}}), &ctx));
+        assert!(cond_ok(&json!({"DateGreaterThan": {"aws:EpochTime": "2020-01-01"}}), &ctx));
+        assert!(cond_ok(&json!({"DateLessThan": {"aws:EpochTime": "9999-01-01T00:00:00Z"}}), &ctx));
+        // 2000-01-01T09:00+09:00 == 2000-01-01T00:00Z
+        assert!(cond_ok(&json!({"DateEquals": {"x": "2000-01-01T09:00:00+09:00"}}), &HashMap::from([("x".to_string(), "946684800".to_string())])));
+        assert!(!cond_ok(&json!({"DateLessThan": {"aws:EpochTime": "garbage"}}), &ctx));
+        // IpAddress / NotIpAddress
+        assert!(cond_ok(&json!({"IpAddress": {"aws:SourceIp": ["10.0.0.0/8", "127.0.0.0/8"]}}), &ctx));
+        assert!(cond_ok(&json!({"IpAddress": {"aws:SourceIp": "127.0.0.1"}}), &ctx)); // bare IP = /32
+        assert!(!cond_ok(&json!({"IpAddress": {"aws:SourceIp": "127.0.0.2/32"}}), &ctx));
+        assert!(cond_ok(&json!({"NotIpAddress": {"aws:SourceIp": "10.0.0.0/8"}}), &ctx));
+        assert!(!cond_ok(&json!({"IpAddress": {"aws:SourceIp": "::1/128"}}), &ctx), "v4 and v6 never overlap");
+        assert!(cond_ok(&json!({"IpAddress": {"aws:SourceIp": "::1/128"}}), &HashMap::from([("aws:SourceIp".to_string(), "::1".to_string())])));
+        assert!(cond_ok(&json!({"IpAddress": {"aws:SourceIp": "2001:db8::/32"}}), &HashMap::from([("aws:SourceIp".to_string(), "2001:DB8::abcd".to_string())])));
+        assert!(cond_ok(&json!({"IpAddress": {"aws:SourceIp": "::ffff:127.0.0.1"}}), &ctx), "v4-mapped v6 counts as v4");
+        // Qualifiers: single-valued context makes them equal to the base operator, except on missing keys.
+        assert!(cond_ok(&json!({"ForAnyValue:StringEquals": {"aws:SourceIp": "127.0.0.1"}}), &ctx));
+        assert!(cond_ok(&json!({"ForAllValues:StringEquals": {"aws:SourceIp": "127.0.0.1"}}), &ctx));
+        assert!(!cond_ok(&json!({"ForAnyValue:StringEquals": {"aws:missing": "x"}}), &ctx));
+        assert!(cond_ok(&json!({"ForAllValues:StringEquals": {"aws:missing": "x"}}), &ctx));
+        assert!(cond_ok(&json!({"ForAllValues:StringEqualsIfExists": {"aws:missing": "x"}}), &ctx));
+        // req_ctx carries the new keys
+        let c = req_ctx(&Principal::Root, "192.168.0.5");
+        assert_eq!(c["aws:SourceIp"], "192.168.0.5");
+        assert!(c["aws:EpochTime"].parse::<i64>().unwrap() + 60 > now);
     }
 }

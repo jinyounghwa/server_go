@@ -117,7 +117,7 @@ Unsupported S3 sub-resources return `501 NotImplemented`, and unsupported operat
 
 ## IAM Enforcement & Signature Verification
 
-- **IAM (`ENFORCE_IAM=1`):** Every request is evaluated against the caller's identity policies (Allow/Deny, wildcards, `NotAction`/`NotResource`, `String`/`Arn`/`Bool` conditions). Unregistered access keys (e.g. `test`) act as account root and are always allowed. Without `ENFORCE_IAM=1`, decisions and denial reasons are recorded in the event stream and GUI without blocking requests.
+- **IAM (`ENFORCE_IAM=1`):** Every request is evaluated against the caller's identity policies (Allow/Deny, wildcards, `NotAction`/`NotResource`, `String`/`Arn`/`Bool`/`Numeric`/`Date`/`IpAddress` conditions with `IfExists` and `ForAnyValue`/`ForAllValues`, against request context keys such as `aws:SourceIp`, `aws:EpochTime`, `aws:CurrentTime`, `aws:RequestedRegion`). Unregistered access keys (e.g. `test`) act as account root and are always allowed. Without `ENFORCE_IAM=1`, decisions and denial reasons are recorded in the event stream and GUI without blocking requests.
 - **SigV4 (`VERIFY_SIGV4=1`):** Every request (Authorization header and presigned query auth, including session tokens and expiry) must carry a valid SigV4 signature. Wrong secrets receive `SignatureDoesNotMatch` / `InvalidSignatureException`; unsigned requests receive `MissingAuthenticationToken` (Cognito public operations remain unsigned). SigV2 presigned URLs are refused with a clear error; presign with `signature_version="s3v4"`. `aws-chunked` bodies are verified against their declared payload hash (individual chunk signatures are not verified).
 
 ---

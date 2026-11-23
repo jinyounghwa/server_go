@@ -28,7 +28,7 @@ mod storage;
 use axum::response::IntoResponse;
 use axum::{
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, State},
+    extract::{ConnectInfo, DefaultBodyLimit, State},
     http::{HeaderMap, Method, Uri},
     response::{
         sse::{Event, Sse},
@@ -339,7 +339,7 @@ fn checks(app: &App, svc: &Svc, body: &[u8]) -> Vec<(String, String)> {
     }
 }
 
-async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
+async fn handle(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
     let t0 = Instant::now();
     let rid = uuid::Uuid::new_v4().to_string();
     let (akid, scope) = sigv4(&headers, &uri);
@@ -426,7 +426,7 @@ async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: 
         let iam = app.iam.lock().unwrap();
         let mut last = None;
         for (a, r) in checks(&app, &svc, &body) {
-            let d = iam.authorize_with(&principal, &a, &r, resource_policy.as_ref().map(|(k, p)| (*k, p)));
+            let d = iam.authorize_with_ip(&principal, &a, &r, resource_policy.as_ref().map(|(k, p)| (*k, p)), &peer.ip().to_string());
             let deny = !d.allowed;
             last = Some(d);
             if deny {
@@ -1323,7 +1323,7 @@ async fn serve() {
     route53::serve_dns(app.clone());
     let l = tokio::net::TcpListener::bind(&bind).await.expect("bind");
     eprintln!("rocalcloud listening on http://{bind}  (GUI: /_ui, town: /_town, events: /_events, ENFORCE_IAM={})", *ENFORCE as u8);
-    axum::serve(l, router).with_graceful_shutdown(shutdown_signal(app)).await.unwrap();
+    axum::serve(l, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).with_graceful_shutdown(shutdown_signal(app)).await.unwrap();
 }
 
 #[cfg(test)]

@@ -9,6 +9,7 @@
 - 2026-11-21 추가: S3 버킷 정책·SQS 큐 정책(`Policy` 속성, Put/Get/DeleteBucketPolicy, 같은 계정 규칙: 명시적 Deny 우선, 신원·버킷 정책 중 하나의 Allow면 허용, 계정 지정은 위임일 뿐 사용자 허용 아님, 루트는 정책 관리 항상 가능), SQS 메시지 속성(MD5 검증). 선택적 SigV4 검증, SQS FIFO, DynamoDB 400KB 한도, 검사 시나리오 7개, 설정 파일·설정 화면, SKILL.md.
 - 이후 추가: JSON 상태 스냅샷, 3D(Three.js) 캐릭터 마을(본섬 28개 시설 + 다리 건너 다운타운 + 모노레일 건너 "연대기 섬": 계획서 0~10단계 오벨리스크와 SigV4·FIFO·400KB·SDK 경기장·릴리스·Homebrew·Docker·우분투·검사관 훈련장·Pages 포털·/_ui 전광판, `town.html` 12절), GitHub Pages 마을(`pages.yml`). Pages 마을은 방문자 PC의 로컬 에뮬레이터
   (`127.0.0.1:4566`, `?api=`)에 SSE로 붙어 실제 트래픽을 보여 주고, 연결 전에는 목업 트래픽을 돌린다. Pages에서는 자동 연결·재시도를 하지 않고 🔌 연결 버튼을 눌렀을 때만 붙는다(실패한 연결마다 브라우저가 ERR_CONNECTION_REFUSED를 콘솔에 남기기 때문). `/_town`(같은 출처)은 자동 연결.
+- 2026-11-23 추가: IAM 조건 연산자 확장 — Numeric*·Date*·IpAddress/NotIpAddress(IPv4·IPv6 CIDR), ForAnyValue/ForAllValues 한정자, 요청 컨텍스트에 `aws:SourceIp`·`aws:EpochTime`·`aws:CurrentTime` 추가. boto3 테스트 31개.
 - `v0.1.0` 릴리스 완료(2026-11-21): 바이너리 3종 + SHA256SUMS, Homebrew sha256 반영.
 - `v0.1.4` 릴리스(2026-11-22): ALB 요청별 규칙 라우팅, aws-chunked 트레일러 서명 검증, SNS·EventBridge·S3 배달의 대상 정책 판정(서비스 주체). Homebrew 0.1.4.
 - `v0.1.3` 릴리스 완료(2026-11-21): SNS·Lambda 리소스 정책, ALB 리스너 규칙, aws-chunked 서명 검증. release.yml도 Node 24 액션으로. Homebrew 0.1.3.
@@ -111,18 +112,18 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
   `VERIFY_SIGV4=1`이면 서명 없는 요청도 루트로 서명한다. 서명 없이 보내야 하는 검사는 `x-rc-unsigned` 헤더를 단다.
 - 새 시나리오: `sc_x()` 함수 → `run_inner()`의 `plan` 목록과 `match id`에 추가 → `make_result()`로 결과.
 
-## 7. 다음에 할 일 (2026-11-22 기준, 우선순위 순)
+## 7. 다음에 할 일 (2026-11-23 기준, 우선순위 순)
 계획서 4장 체크리스트는 전부 완료, 최신 릴리스는 `v0.1.4`(Homebrew 반영). 지난 할 일 목록(v0.1.1~v0.1.4 릴리스, 버킷·큐·토픽·함수 정책,
 SQS 메시지 속성, Step Functions 동시 실행·실패 중단, ALB 경로·호스트 규칙(요청별), aws-chunked 조각·트레일러 서명, 서비스 주체 배달 정책,
 3D 마을 브라우저·휴대폰 점검)은 모두 끝났다. 남은 한계는 각 파일의 `ponytail:` 주석(`grep -rn ponytail core/src`)이 목록이다.
 
 1. **실기기 점검**(사용자 도움 필요): 실제 휴대폰·실제 Safari·GPU가 약한 노트북에서 Pages 마을을 연다. 지금까지는 우분투 Playwright 에뮬레이션만 했다.
-   연대기 섬 숫자(SDK 테스트 28/5/4개, 시나리오 21개, GPU 65°C)는 `town.html` 12절에 손으로 적은 값이니 바뀌면 같이 고친다.
+   연대기 섬 숫자(SDK 테스트 31/5/4개, 시나리오 21개, GPU 65°C)는 `town.html` 12절에 손으로 적은 값이니 바뀌면 같이 고친다.
 2. ~~EventBridge `cron()`(UTC, L·W·#은 거부)·InputTransformer·InputPath `[0]`~~ 완료(2026-11-22).
 3. ~~Kinesis → Lambda 이벤트 소스 매핑~~ 완료(2026-11-22, `lambda.rs` `poll_kinesis`: 샤드별 순서, 실패 배치는 재시도하며 샤드를 막고 `MaximumRetryAttempts` 뒤 건너뜀).
 4. ~~DynamoDB 경로 `a.b[0]`~~ 완료(2026-11-22): 업데이트(SET 끝 너머는 추가, REMOVE는 원래 인덱스 기준)·조건·프로젝션(중첩 경로 유지).
 5. ~~Lambda 버전·별칭~~ 완료(2026-11-22): PublishVersion(설정·코드 고정, 변화 없으면 같은 버전)·ListVersions·Create/Get/List/Update/DeleteAlias, `fn:1`·`fn:alias`·`Qualifier` 호출과 Get*. 가중치 라우팅은 거부.
-6. **IAM 조건 연산자**(`iam.rs` 116행): Numeric*·Date*·IpAddress, ForAnyValue/ForAllValues.
+6. ~~IAM 조건 연산자~~ 완료(2026-11-23): `cond_ok`에 Numeric*·Date*·IpAddress/NotIpAddress(IPv4·IPv6 CIDR)·ForAnyValue/ForAllValues 추가, 요청 컨텍스트에 `aws:SourceIp`(피어 IP, `authorize_ip` 체인)·`aws:EpochTime`·`aws:CurrentTime`. 남은 한계: 컨텍스트 키가 단일 값(다중 값 집합 시맨틱 불가), Date는 에포크·RFC 3339·`YYYY-MM-DD`만, IPv6 존 인덱스 미지원.
 7. (선택) 배달 정책을 AWS처럼 엄격하게: 대상에 정책이 없으면 거부(`iam.rs` `service_may`). 기존 사용자 흐름이 깨지므로 설정 스위치로만.
 8. (선택) `?api=`로 IPv6 `[::1]`: CSP가 IPv6 리터럴을 못 받으므로 요청이 있을 때만.
 
@@ -132,5 +133,6 @@ SQS 메시지 속성, Step Functions 동시 실행·실패 중단, ALB 경로·�
 ## 8. 알려진 한계 (요약)
 상태는 기본 인메모리(JSON 스냅샷 `RC_STATE_FILE` 또는 SQLite `RC_SQLITE_FILE`로 영속 저장 가능), SigV4 서명은 `VERIFY_SIGV4=1`일 때만 검증(SigV2 거부,
 aws-chunked 조각 서명·트레일러 서명 검증, 트레일러 체크섬 값 자체는 다시 계산하지 않음), 리소스 기반 정책은 S3 버킷·SQS 큐·SNS 토픽·Lambda 함수(AddPermission)를 평가, SNS·EventBridge·S3의 배달도 `ENFORCE_IAM=1`이면 대상 정책을 서비스 주체(`sns.amazonaws.com` 등)와 `aws:SourceArn`으로 판정(대상에 정책이 없으면 허용, AWS는 거부), KMS는 진짜 암호 아님,
+IAM 조건 연산자는 String·Arn·Bool·Numeric·Date·IpAddress(+IfExists, ForAnyValue/ForAllValues)를 지원하지만 컨텍스트 키가 단일 값이라 다중 값 집합 시맨틱은 없음,
 ALB 리스너 규칙(path-pattern·host-header)은 요청마다 고르되 규칙이 있는 리스너는 `Connection: close`로 요청당 연결 하나, Query 프로토콜 구버전 SQS 미지원,
 ECS 태스크가 에뮬레이터를 부르려면 `BIND=0.0.0.0:4566` 필요. 세부는 각 파일의 `ponytail:` 주석.
