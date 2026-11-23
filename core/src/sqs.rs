@@ -405,6 +405,10 @@ impl Queues {
     pub fn policy(&self, name: &str) -> Option<Value> {
         self.q.get(name)?.attrs.get("Policy").and_then(|p| serde_json::from_str(p).ok())
     }
+
+    pub fn exists(&self, name: &str) -> bool {
+        self.q.contains_key(name)
+    }
     pub fn delete_receipt(&mut self, name: &str, receipt: &str) {
         if let Some(q) = self.q.get_mut(name) {
             q.msgs.retain(|m| m.receipt.as_deref() != Some(receipt));

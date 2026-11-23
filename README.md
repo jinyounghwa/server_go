@@ -125,7 +125,7 @@ Unsupported S3 sub-resources return `501 NotImplemented`, and unsupported operat
 
 ## Integrations, Chaos & Docker-Backed Services
 
-- **Event-Driven Integrations:** S3 bucket notifications → SQS / SNS / Lambda (with prefix/suffix filters), SNS → SQS / Lambda, SQS → Lambda, EventBridge → SQS / SNS / Lambda. Every hop is emitted to `/_events`.
+- **Event-Driven Integrations:** S3 bucket notifications → SQS / SNS / Lambda (with prefix/suffix filters; destinations validated on save), SNS → SQS / Lambda, SQS → Lambda, EventBridge → SQS / SNS / Lambda. Every hop is emitted to `/_events`.
 - **Chaos Injection:** `POST /_admin/chaos` (requires header `x-rocalcloud: 1`) injects latency, HTTP 500s, and service-specific throttling:
   ```json
   {"rules": [{"service": "dynamodb", "op": "Get*", "latency_ms": 200, "error_rate": 0.1, "throttle_rate": 0.2}]}

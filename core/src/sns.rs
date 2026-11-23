@@ -233,6 +233,10 @@ impl Sns {
         self.topics.get(arn)?.get("Policy").and_then(|p| serde_json::from_str(p).ok())
     }
 
+    pub fn exists(&self, arn: &str) -> bool {
+        self.topics.contains_key(arn)
+    }
+
     pub fn admin(&self) -> Value {
         self.topics
             .keys()

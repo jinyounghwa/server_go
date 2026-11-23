@@ -753,6 +753,11 @@ def test_s3_notifications():
     cfg = {"QueueConfigurations": [{"Id": "csv-in", "QueueArn": arn(q1), "Events": ["s3:ObjectCreated:*"],
                                     "Filter": {"Key": {"FilterRules": [{"Name": "prefix", "Value": "in/"}, {"Name": "suffix", "Value": ".csv"}]}}}],
            "TopicConfigurations": [{"Id": "gone", "TopicArn": t, "Events": ["s3:ObjectRemoved:*"]}]}
+    # Destinations are validated when the configuration is saved.
+    assert code(s3.put_bucket_notification_configuration, Bucket=b, NotificationConfiguration={
+        "QueueConfigurations": [{"QueueArn": "arn:aws:sqs:us-east-1:000000000000:nope", "Events": ["s3:ObjectCreated:*"]}]}) == "InvalidArgument"
+    assert code(s3.put_bucket_notification_configuration, Bucket=b, NotificationConfiguration={
+        "TopicConfigurations": [{"TopicArn": "arn:aws:sns:us-east-1:000000000000:nope", "Events": ["s3:ObjectCreated:*"]}]}) == "InvalidArgument"
     s3.put_bucket_notification_configuration(Bucket=b, NotificationConfiguration=cfg)
     got = s3.get_bucket_notification_configuration(Bucket=b)
     assert got["QueueConfigurations"][0]["QueueArn"] == arn(q1) and got["TopicConfigurations"][0]["TopicArn"] == t, got

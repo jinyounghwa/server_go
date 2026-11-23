@@ -253,14 +253,14 @@ pub fn classify(m: &Method, uri: &Uri, h: &HeaderMap) -> Req {
 pub fn handle(app: &App, r: &Req, h: &HeaderMap, body: Bytes) -> Response {
     let body = dechunk(h, body);
     let mut st = app.s3.lock().unwrap();
-    exec(&mut st, r.op, &r.bucket, &r.key, &r.q, h, body).unwrap_or_else(|e| e)
+    exec(app, &mut st, r.op, &r.bucket, &r.key, &r.q, h, body).unwrap_or_else(|e| e)
 }
 
 pub fn error(e: &crate::ApiErr) -> Response {
     fail(e.status, &e.code, &e.msg)
 }
 
-fn exec(
+fn exec(app: &App,
     st: &mut Store,
     op: &str,
     b: &str,
@@ -454,7 +454,19 @@ fn exec(
         "PutBucketNotificationConfiguration" => {
             let bk = st.buckets.get_mut(b).ok_or_else(no_bucket)?;
             let x = String::from_utf8_lossy(&body).to_string();
-            bk.notif = parse_notif(&x);
+            let notif = parse_notif(&x);
+            // Destinations must exist when the configuration is saved, as in AWS.
+            for n in &notif {
+                let ok = match n.kind {
+                    "sqs" => n.target.starts_with("arn:aws:sqs:") && app.sqs.lock().unwrap().exists(n.target.rsplit(':').next().unwrap_or("")),
+                    "sns" => n.target.starts_with("arn:aws:sns:") && app.sns.lock().unwrap().exists(&n.target),
+                    _ => n.target.starts_with("arn:aws:lambda:") && app.lambda.lock().unwrap().exists(&crate::lambda::name_of(&n.target)),
+                };
+                if !ok {
+                    return Err(fail(400, "InvalidArgument", &format!("Unable to validate the following destination configurations: {}", n.target)));
+                }
+            }
+            bk.notif = notif;
             bk.notif_xml = x;
             empty(200)
         }
@@ -490,7 +502,6 @@ fn exec(
     })
 }
 
-// ponytail: destinations are not validated when the configuration is saved.
 fn parse_notif(x: &str) -> Vec<Notif> {
     let mut out = vec![];
     for (block, tgt, kind) in [("QueueConfiguration", "Queue", "sqs"), ("TopicConfiguration", "Topic", "sns"), ("CloudFunctionConfiguration", "CloudFunction", "lambda")] {
