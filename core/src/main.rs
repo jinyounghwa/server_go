@@ -440,12 +440,16 @@ async fn handle(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<std:
         last
     };
     // VERIFY_SIGV4=1: a bad or missing signature is refused before IAM (Cognito's public ops are unsigned).
+    // Expired STS session keys are refused regardless of the VERIFY_SIGV4 mode.
     let json_proto = matches!(svc, Svc::Ddb(_) | Svc::Json(..) | Svc::Sqs(_));
-    let sig_err = (*VERIFY && !(service == "cognito-idp" && COGNITO_PUBLIC.contains(&op.as_str())))
-        .then(|| {
-            let iam = app.iam.lock().unwrap();
-            sigv4::verify(&method, &uri, &headers, &body, |k| iam.secret_of(k)).err()
-        })
+    let expired = app.iam.lock().unwrap().expired(&akid);
+    let sig_err = expired
+        .then(|| Some(("ExpiredToken", "The security token included in the request is expired".to_string())))
+        .or_else(|| (*VERIFY && !(service == "cognito-idp" && COGNITO_PUBLIC.contains(&op.as_str())))
+            .then(|| {
+                let iam = app.iam.lock().unwrap();
+                sigv4::verify(&method, &uri, &headers, &body, |k| iam.secret_of(k)).err()
+            }))
         .flatten()
         .map(|(code, msg)| {
             let code = match (code, json_proto, matches!(svc, Svc::S3(_))) {

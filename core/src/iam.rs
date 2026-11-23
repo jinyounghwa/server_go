@@ -54,6 +54,7 @@ struct Key {
     owner: Principal,
     created: String,
     token: Option<String>,
+    expires: Option<i64>, // epoch seconds; STS session keys only
 }
 
 #[derive(Default)]
@@ -378,6 +379,11 @@ impl Iam {
         self.keys.get(akid).map_or(Principal::Root, |k| k.owner.clone())
     }
 
+    // STS session keys stop working after their Expiration (permanent user keys never expire).
+    pub fn expired(&self, akid: &str) -> bool {
+        self.keys.get(akid).is_some_and(|k| k.expires.is_some_and(|e| chrono::Utc::now().timestamp() > e))
+    }
+
     fn entity(&self, p: &Principal) -> Option<(&str, &Entity)> {
         match p {
             Principal::User(u) => self.users.get(u).map(|e| ("user", e)),
@@ -645,7 +651,7 @@ impl Iam {
                 self.users.get(&n).ok_or_else(|| missing("user", &n))?;
                 let (id, secret) = (gen_id("AKIA"), uuid::Uuid::new_v4().simple().to_string());
                 let created = now();
-                self.keys.insert(id.clone(), Key { secret: secret.clone(), owner: Principal::User(n.clone()), created: created.clone(), token: None });
+                self.keys.insert(id.clone(), Key { secret: secret.clone(), owner: Principal::User(n.clone()), created: created.clone(), token: None, expires: None });
                 json!({"AccessKey": {"UserName": n, "AccessKeyId": id, "SecretAccessKey": secret, "Status": "Active", "CreateDate": created}})
             }
             "ListAccessKeys" => {
@@ -709,14 +715,15 @@ impl Iam {
                 }
                 let secs: i64 = q.get("DurationSeconds").and_then(|d| d.parse().ok()).unwrap_or(3600);
                 let exp = (chrono::Utc::now() + chrono::Duration::seconds(secs)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                let exp_ts = (chrono::Utc::now() + chrono::Duration::seconds(secs)).timestamp();
                 let (id, secret, token) = (gen_id("ASIA"), uuid::Uuid::new_v4().simple().to_string(), uuid::Uuid::new_v4().simple().to_string());
                 let owner = Principal::Role { role: rn.into(), session: session.into() };
                 let out = json!({
                     "Credentials": {"AccessKeyId": id, "SecretAccessKey": secret, "SessionToken": token, "Expiration": exp},
                     "AssumedRoleUser": {"AssumedRoleId": format!("{}:{session}", role.id), "Arn": owner.arn()},
                 });
-                // ponytail: session keys never expire inside the emulator.
-                self.keys.insert(id, Key { secret, owner, created: now(), token: Some(token) });
+                // Session keys expire at Expiration (DurationSeconds is not range-checked, unlike AWS 900..43200).
+                self.keys.insert(id, Key { secret, owner, created: now(), token: Some(token), expires: Some(exp_ts) });
                 out
             }
             _ => return Err(err("InvalidAction", format!("{action} is not supported yet"))),
@@ -731,7 +738,7 @@ impl Iam {
         }
         let (id, secret, token) = (gen_id("ASIA"), uuid::Uuid::new_v4().simple().to_string(), uuid::Uuid::new_v4().simple().to_string());
         let owner = Principal::Role { role: rn.into(), session: session.into() };
-        self.keys.insert(id.clone(), Key { secret: secret.clone(), owner, created: now(), token: Some(token.clone()) });
+        self.keys.insert(id.clone(), Key { secret: secret.clone(), owner, created: now(), token: Some(token.clone()), expires: None }); // per-invoke service session
         Some((id, secret, token))
     }
 
@@ -802,7 +809,7 @@ impl Iam {
                 Principal::User(u) => ("user", u.as_str(), ""),
                 Principal::Role { role, session } => ("role", role.as_str(), session.as_str()),
             };
-            json!({"akid": akid, "secret": k.secret, "kind": kind, "a": a, "b": b, "created": k.created, "token": k.token})
+            json!({"akid": akid, "secret": k.secret, "kind": kind, "a": a, "b": b, "created": k.created, "token": k.token, "expires": k.expires})
         }).collect();
         json!({"users": ent(&self.users), "roles": ent(&self.roles), "policies": policies, "keys": keys})
     }
@@ -845,6 +852,7 @@ impl Iam {
                 secret: k["secret"].as_str().unwrap_or("").into(), owner,
                 created: k["created"].as_str().map(String::from).unwrap_or_else(now),
                 token: k["token"].as_str().map(String::from),
+                expires: k["expires"].as_i64(),
             });
         }
     }
@@ -866,6 +874,19 @@ mod tests {
         assert!(service_may(Some(&allow), "events.amazonaws.com", "sqs:SendMessage", q, topic, true).is_err(), "other service");
         let deny = json!({"Statement": [allow["Statement"][0].clone(), {"Effect": "Deny", "Principal": "*", "Action": "sqs:*", "Resource": q}]});
         assert!(service_may(Some(&deny), "sns.amazonaws.com", "sqs:SendMessage", q, topic, true).is_err(), "deny wins");
+    }
+
+    #[test]
+    fn session_keys_expire() {
+        let mut iam = Iam::default();
+        let key = |expires: Option<i64>| Key { secret: "s".into(), owner: Principal::Root, created: now(), token: expires.map(|_| "t".into()), expires };
+        iam.keys.insert("ASIAOLD".into(), key(Some(chrono::Utc::now().timestamp() - 1)));
+        iam.keys.insert("ASIANEW".into(), key(Some(chrono::Utc::now().timestamp() + 3600)));
+        iam.keys.insert("AKIAPERMANENT".into(), key(None));
+        assert!(iam.expired("ASIAOLD"));
+        assert!(!iam.expired("ASIANEW"));
+        assert!(!iam.expired("AKIAPERMANENT"), "user keys never expire");
+        assert!(!iam.expired("unknown"), "unregistered keys stay root");
     }
 
     #[test]

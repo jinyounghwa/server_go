@@ -293,6 +293,14 @@ def test_iam():
     rq.delete_queue(QueueUrl=rq.create_queue(QueueName=f"rq{run}")["QueueUrl"])
     assert code(boto3.client("s3", **rkw).list_buckets) == "AccessDenied"
 
+    # Session credentials stop working after their Expiration. boto3 refuses DurationSeconds<900
+    # client-side, so validation is off for this one call; the emulator does not range-check either.
+    raw = boto3.client("sts", config=Config(parameter_validation=False), **akw)
+    short = raw.assume_role(RoleArn=f"arn:aws:iam::000000000000:role/{r}", RoleSessionName="short", DurationSeconds=1)["Credentials"]
+    time.sleep(2.5)  # expiry compares whole seconds, so wait past any rounding
+    skw = dict(kw, aws_access_key_id=short["AccessKeyId"], aws_secret_access_key=short["SecretAccessKey"], aws_session_token=short["SessionToken"])
+    assert code(boto3.client("s3", **skw).list_buckets) == "ExpiredToken"
+
     iam.create_role(RoleName=f"lambda{run}", AssumeRolePolicyDocument=json.dumps(
         {"Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]}))
     assert code(boto3.client("sts", **akw).assume_role, RoleArn=f"arn:aws:iam::000000000000:role/lambda{run}", RoleSessionName="xx") == "AccessDenied"

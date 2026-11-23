@@ -91,7 +91,7 @@ All options can be set via environment variables or a `KEY=VALUE` file pointed t
 | **DynamoDB** | Create/Describe/List/DeleteTable, Put/Get/Update/DeleteItem, Query, Scan, BatchWrite/GetItem, TransactWrite/GetItems, GSI/LSI, condition/filter/update/projection expressions with nested `a.b[0]` document paths, 400 KB item limit |
 | **S3** | List/Create/Head/DeleteBucket, Put/Get/Head/Delete/CopyObject, Range reads, ListObjects(V2) with prefix/delimiter/paging, DeleteObjects, multipart upload, SigV4 presigned URLs |
 | **SQS** | Create/Delete/List/PurgeQueue, GetQueueUrl, Get/SetQueueAttributes, Send/Receive/DeleteMessage (+Batch), ChangeMessageVisibility, long polling, DLQs, FIFO queues (`MessageGroupId` ordering, deduplication IDs & content-based dedup, 5-min window), 256 KiB message limit |
-| **IAM / STS** | Users, roles, managed & inline policies, access keys, `SimulatePrincipalPolicy`, `AssumeRole` (trust policy checked), `GetCallerIdentity` |
+| **IAM / STS** | Users, roles, managed & inline policies, access keys, `SimulatePrincipalPolicy`, `AssumeRole` (trust policy checked, session credentials expire at `Expiration` with `ExpiredToken`), `GetCallerIdentity` |
 | **SNS** | Topics, subscriptions (SQS, Lambda), filter policies (exact/prefix/suffix/anything-but/exists, numeric ranges), raw delivery, topic/subscription attributes |
 | **Secrets Manager** | Create/Get/Put/Update/Describe/List/Delete/RestoreSecret, version stages, `GetRandomPassword` |
 | **SSM** | Parameter Store: Put/Get/GetParameters(ByPath)/Delete/DescribeParameters, `SecureString` |
