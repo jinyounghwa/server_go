@@ -70,6 +70,7 @@ All options can be set via environment variables or a `KEY=VALUE` file pointed t
 | `REGION` | `us-east-1` | Default region for ARNs and responses |
 | `ENFORCE_IAM` | `0` | Set `1` to enforce IAM policy decisions (otherwise logged only) |
 | `VERIFY_SIGV4` | `0` | Set `1` to verify SigV4 header and presigned query signatures |
+| `STRICT_DELIVERY` | `0` | With `ENFORCE_IAM=1`, refuse SNS/EventBridge/S3 deliveries to targets with no resource policy (AWS behavior) |
 | `RC_ROOT_SECRET` | `test` | Secret key used for unregistered (root) access keys when `VERIFY_SIGV4=1` |
 | `RC_CONFIG` | *(unset)* | Path to a `KEY=VALUE` configuration file (`#` comments supported) |
 | `RC_STATE_FILE` | *(unset)* | JSON snapshot file auto-loaded on startup and written via `POST /_admin/snapshot/save` |

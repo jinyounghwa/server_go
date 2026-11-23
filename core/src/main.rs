@@ -62,6 +62,10 @@ pub fn endpoint() -> String {
 // ENFORCE_IAM=1 rejects denied requests; otherwise decisions are only reported in events.
 pub(crate) static ENFORCE: LazyLock<bool> = LazyLock::new(|| std::env::var("ENFORCE_IAM").is_ok_and(|v| v == "1"));
 
+// STRICT_DELIVERY=1 (with ENFORCE_IAM=1) refuses SNS/EventBridge/S3 deliveries to targets with no resource
+// policy, as AWS does. The default stays lenient so local flows work without policies.
+pub(crate) static STRICT: LazyLock<bool> = LazyLock::new(|| std::env::var("STRICT_DELIVERY").is_ok_and(|v| v == "1"));
+
 #[derive(Debug)]
 pub struct ApiErr {
     pub status: u16,
@@ -693,7 +697,7 @@ fn service_gate(app: &Arc<App>, rid: &str, from: &str, target: &str, src: &str) 
     } else {
         ("queue policy", "sqs:SendMessage", app.sqs.lock().unwrap().policy(target.rsplit(':').next().unwrap_or("")))
     };
-    let Err(reason) = iam::service_may(doc.as_ref(), &format!("{from}.amazonaws.com"), action, target, src) else { return true };
+    let Err(reason) = iam::service_may(doc.as_ref(), &format!("{from}.amazonaws.com"), action, target, src, *STRICT) else { return true };
     emit(app, json!({"ts": chrono::Utc::now().to_rfc3339(), "request_id": rid, "service": from, "op": "Deliver", "target": target, "status": 403,
                      "auth": {"decision": "explicitDeny", "reason": reason, "enforced": true, "source": kind}}));
     false
@@ -1196,12 +1200,12 @@ fn load_config() {
     }
 }
 
-const CONFIG_KEYS: &[&str] = &["ENFORCE_IAM", "VERIFY_SIGV4", "BIND", "REGION", "RC_CONFIG", "RC_STATE_FILE", "RC_SQLITE_FILE", "RC_TOWN_ORIGIN",
+const CONFIG_KEYS: &[&str] = &["ENFORCE_IAM", "VERIFY_SIGV4", "STRICT_DELIVERY", "BIND", "REGION", "RC_CONFIG", "RC_STATE_FILE", "RC_SQLITE_FILE", "RC_TOWN_ORIGIN",
     "RC_LLM_URL", "RC_LLM_MODEL", "RC_DNS_PORT", "RC_DOCKER", "RC_CONTAINER_MEMORY", "RC_PYTHON", "RC_NODE"];
 
 async fn get_config() -> Json<Value> {
     let vars: serde_json::Map<String, Value> = CONFIG_KEYS.iter().map(|k| (k.to_string(), json!(std::env::var(k).ok()))).collect();
-    Json(json!({"vars": vars, "endpoint": endpoint(), "enforce_iam": *ENFORCE, "verify_sigv4": *VERIFY,
+    Json(json!({"vars": vars, "endpoint": endpoint(), "enforce_iam": *ENFORCE, "verify_sigv4": *VERIFY, "strict_delivery": *STRICT,
         "root_secret": if std::env::var_os("RC_ROOT_SECRET").is_some() { "설정됨" } else { "기본값(test)" }}))
 }
 

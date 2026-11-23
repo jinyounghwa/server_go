@@ -1181,6 +1181,61 @@ def test_service_principal_policy():
     sqs.delete_queue(QueueUrl=u); sns.delete_topic(TopicArn=t); sns.delete_topic(TopicArn=other)
 
 
+def test_strict_delivery():
+    """STRICT_DELIVERY=1: SNS/EventBridge deliveries to a target with no resource policy are refused (AWS behavior).
+    Spawns a second emulator on 127.0.0.1:4567; skipped when the release binary is not built."""
+    import subprocess, urllib.request
+    exe = "core/target/release/rocalcloud"
+    if not os.path.exists(exe):
+        raise Skip("release binary not built")
+    env = dict(os.environ, ENFORCE_IAM="1", STRICT_DELIVERY="1", BIND="127.0.0.1:4567", RC_DNS_PORT="10531")
+    p = subprocess.Popen([exe], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        ep = "http://127.0.0.1:4567"
+        for _ in range(50):
+            try:
+                urllib.request.urlopen(f"{ep}/_admin/state", timeout=1)
+                break
+            except Exception:
+                time.sleep(0.1)
+        else:
+            raise AssertionError("second emulator did not start")
+        cfg = json.load(urllib.request.urlopen(f"{ep}/_admin/config"))
+        assert cfg["strict_delivery"] is True and cfg["enforce_iam"] is True, cfg
+        tkw = dict(kw, endpoint_url=ep)
+        sns, tsqs, eb = boto3.client("sns", **tkw), boto3.client("sqs", **tkw), boto3.client("events", **tkw)
+        t = sns.create_topic(Name=f"st{run}")["TopicArn"]
+        u = tsqs.create_queue(QueueName=f"st{run}")["QueueUrl"]
+        qa = tsqs.get_queue_attributes(QueueUrl=u, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+        sns.subscribe(TopicArn=t, Protocol="sqs", Endpoint=qa, Attributes={"RawMessageDelivery": "true"})
+        eb.put_rule(Name=f"st{run}", EventPattern=json.dumps({"source": ["demo"]}))
+        eb.put_targets(Rule=f"st{run}", Targets=[{"Id": "q", "Arn": qa}])
+        recv = lambda: [m["Body"] for m in tsqs.receive_message(QueueUrl=u, MaxNumberOfMessages=10).get("Messages", [])]
+        # No queue policy: both deliveries are refused under STRICT_DELIVERY=1.
+        sns.publish(TopicArn=t, Message="nope")
+        eb.put_events(Entries=[{"Source": "demo", "DetailType": "x", "Detail": "{}"}])
+        time.sleep(0.4)
+        assert recv() == []
+        # A policy granting the service principal lets them through again.
+        tsqs.set_queue_attributes(QueueUrl=u, Attributes={"Policy": json.dumps({"Statement": [
+            {"Effect": "Allow", "Principal": {"Service": "sns.amazonaws.com"}, "Action": "sqs:SendMessage", "Resource": qa,
+             "Condition": {"ArnEquals": {"aws:SourceArn": t}}},
+            {"Effect": "Allow", "Principal": {"Service": "events.amazonaws.com"}, "Action": "sqs:SendMessage", "Resource": qa}]})})
+        sns.publish(TopicArn=t, Message="ok")
+        eb.put_events(Entries=[{"Source": "demo", "DetailType": "x", "Detail": "{}"}])
+        time.sleep(0.4)
+        got = recv()
+        assert len(got) == 2, got
+        assert "ok" in got and any("demo" in m for m in got), got  # SNS raw + EventBridge envelope
+        tsqs.delete_queue(QueueUrl=u); sns.delete_topic(TopicArn=t)
+    finally:
+        p.terminate()
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill(); p.wait()
+
+
 def test_alb_rules():
     """Listener rules route by path and Host to different target groups (real local HTTP servers as targets)."""
     import http.server, socket, threading, urllib.request

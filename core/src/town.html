@@ -1905,7 +1905,7 @@ const STAGES = [
   ["2", "1등급 서비스", "DDB·S3·SQS·SNS +4", "DynamoDB(GSI·트랜잭션·400KB), S3(멀티파트·사전서명), SQS(FIFO·DLQ), SNS, Secrets, SSM, KMS, Logs"],
   ["3", "2등급 서비스", "Lambda·SFN·Cognito +5", "API Gateway, Lambda(python·node 실행), EventBridge, Step Functions(ASL), Cognito(JWT), SES, Kinesis, CloudFormation"],
   ["4", "가상 인프라", "IAM·VPC·RDS·ECS", "IAM·STS 정책 평가기, VPC 도달성 분석, RDS·ElastiCache·ECS 진짜 Docker 컨테이너, ALB TCP 리스너, Route 53 DNS"],
-  ["5", "연동·장애", "알림·트리거·Chaos", "S3 알림, SQS→Lambda, SNS·EventBridge 배달, 지연·5xx·스로틀 장애 주입"],
+  ["5", "연동·장애", "알림·트리거·Chaos", "S3 알림, SQS→Lambda, SNS·EventBridge 배달(엄격 모드 스위치), 지연·5xx·스로틀 장애 주입"],
   ["6", "GUI", "탐색기·로그·설정", "Tauri 창 + /_ui: 리소스 탐색기, 실시간 로그, IAM·VPC 시각화, 스냅샷, 장애·설정 화면"],
   ["7", "3D 마을", "SSE·애니메이션·Pages", "/_town 3D 도시, 요청마다 밴·드론·정문 경비, 결과 기호, GitHub Pages에서 로컬 에뮬레이터에 연결"],
   ["8", "LLM 해설", "Ollama·도구 4개", "우분투 Ollama qwen3.5:9b, 스키마 제한 출력, 도구 4개, LLM 없을 때 규칙 기반 설명, 파괴 작업 확인 토큰"],
@@ -1968,7 +1968,7 @@ const pans = [-3.4, 3.4].map(px => { const p = new THREE.Group(); p.position.x =
 pans[0].add(mkBox(1.2, 1.2, 1.2, mStd({ color: 0x3b82f6, emissive: 0x1d4ed8, emissiveIntensity: 0.3 }), 0, -1.05, 0));
 pans[1].add(mkBox(0.5, 0.5, 0.5, mStd({ color: 0x93c5fd }), 0, -1.4, 0));
 
-landmark("sdk", "SDK 호환성 경기장", "boto3 31 · JS v3 · Rust", "#fbbf24", -16, 156, "공식 SDK 3종(Python boto3 31개, JS @aws-sdk v3, Rust aws-sdk)으로 기본·서명 검증 두 모드를 CI가 매번 돌립니다. 전광판은 이 마을이 받은 실제 요청 수입니다.", 20, 7, 20, 7.8);
+landmark("sdk", "SDK 호환성 경기장", "boto3 32 · JS v3 · Rust", "#fbbf24", -16, 156, "공식 SDK 3종(Python boto3 32개, JS @aws-sdk v3, Rust aws-sdk)으로 기본·서명 검증 두 모드를 CI가 매번 돌립니다. 전광판은 이 마을이 받은 실제 요청 수입니다.", 20, 7, 20, 7.8);
 {
   const pts = [[6.2, 0], [10, 0], [10, 3.4], [9.5, 3.4], [6.2, 0.6]].map(([x, y]) => new THREE.Vector2(x, y));
   hp("matte", new THREE.LatheGeometry(pts, 48), 0xd1d5db, -16, 0.05, 156);

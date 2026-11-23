@@ -343,9 +343,15 @@ fn principal_grants(p: &Value, c: &Principal) -> bool {
 
 // Service-to-service delivery (SNS → SQS, EventBridge → Lambda, S3 → SNS ...) against the target's resource policy,
 // as the service principal (e.g. sns.amazonaws.com) with aws:SourceArn / aws:SourceAccount. Deny wins, an Allow is needed.
-// ponytail: a target with no resource policy accepts deliveries (AWS would refuse; kept lenient for local convenience).
-pub fn service_may(doc: Option<&Value>, service: &str, action: &str, resource: &str, source: &str) -> Result<(), String> {
-    let Some(doc) = doc else { return Ok(()) };
+// With strict=true (STRICT_DELIVERY=1) a target with no policy is refused, as AWS does; the default stays lenient.
+pub fn service_may(doc: Option<&Value>, service: &str, action: &str, resource: &str, source: &str, strict: bool) -> Result<(), String> {
+    let Some(doc) = doc else {
+        return if strict {
+            Err(format!("{service} is not authorized to perform: {action} on resource: {resource} because the resource-based policy does not exist"))
+        } else {
+            Ok(())
+        };
+    };
     let ctx = HashMap::from([("aws:SourceArn".to_string(), source.to_string()), ("aws:SourceAccount".to_string(), ACCOUNT.to_string())]);
     let mut allowed = false;
     for st in statements(doc) {
@@ -853,12 +859,13 @@ mod tests {
         let (q, topic) = ("arn:aws:sqs:us-east-1:000000000000:q", "arn:aws:sns:us-east-1:000000000000:t");
         let allow = json!({"Statement": [{"Effect": "Allow", "Principal": {"Service": "sns.amazonaws.com"}, "Action": "sqs:SendMessage",
                                           "Resource": q, "Condition": {"ArnEquals": {"aws:SourceArn": topic}}}]});
-        assert!(service_may(None, "sns.amazonaws.com", "sqs:SendMessage", q, topic).is_ok(), "no policy: lenient");
-        assert!(service_may(Some(&allow), "sns.amazonaws.com", "sqs:SendMessage", q, topic).is_ok());
-        assert!(service_may(Some(&allow), "sns.amazonaws.com", "sqs:SendMessage", q, "arn:aws:sns:us-east-1:000000000000:other").is_err(), "wrong source");
-        assert!(service_may(Some(&allow), "events.amazonaws.com", "sqs:SendMessage", q, topic).is_err(), "other service");
+        assert!(service_may(None, "sns.amazonaws.com", "sqs:SendMessage", q, topic, false).is_ok(), "no policy: lenient");
+        assert!(service_may(None, "sns.amazonaws.com", "sqs:SendMessage", q, topic, true).is_err(), "no policy: strict refuses");
+        assert!(service_may(Some(&allow), "sns.amazonaws.com", "sqs:SendMessage", q, topic, true).is_ok());
+        assert!(service_may(Some(&allow), "sns.amazonaws.com", "sqs:SendMessage", q, "arn:aws:sns:us-east-1:000000000000:other", true).is_err(), "wrong source");
+        assert!(service_may(Some(&allow), "events.amazonaws.com", "sqs:SendMessage", q, topic, true).is_err(), "other service");
         let deny = json!({"Statement": [allow["Statement"][0].clone(), {"Effect": "Deny", "Principal": "*", "Action": "sqs:*", "Resource": q}]});
-        assert!(service_may(Some(&deny), "sns.amazonaws.com", "sqs:SendMessage", q, topic).is_err(), "deny wins");
+        assert!(service_may(Some(&deny), "sns.amazonaws.com", "sqs:SendMessage", q, topic, true).is_err(), "deny wins");
     }
 
     #[test]

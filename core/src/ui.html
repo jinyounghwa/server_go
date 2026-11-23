@@ -319,7 +319,7 @@ function renderInspector() {
 async function showSettings(msg) {
   const [c, ch] = await Promise.all([fetch("/_admin/config").then(r => r.json()), fetch("/_admin/chaos").then(r => r.json())]);
   const rows = Object.entries(c.vars).map(([k, v]) => [k, v ?? "(기본값)"]);
-  showAgent(`<h2>설정</h2><div class="sub">엔드포인트 ${esc(c.endpoint)} · IAM 강제 ${c.enforce_iam ? "켜짐" : "꺼짐"} · SigV4 검증 ${c.verify_sigv4 ? "켜짐" : "꺼짐"} · 루트 시크릿 ${esc(c.root_secret)}</div>
+  showAgent(`<h2>설정</h2><div class="sub">엔드포인트 ${esc(c.endpoint)} · IAM 강제 ${c.enforce_iam ? "켜짐" : "꺼짐"} · SigV4 검증 ${c.verify_sigv4 ? "켜짐" : "꺼짐"} · 엄격 배달 ${c.strict_delivery ? "켜짐" : "꺼짐"} · 루트 시크릿 ${esc(c.root_secret)}</div>
     <h4>시작 설정</h4><div class="muted">환경변수나 RC_CONFIG 파일(KEY=VALUE)로 정하며, 바꾸려면 재시작해야 합니다.</div>${table(["변수", "값"], rows)}
     <h4>장애 주입 규칙</h4><div class="muted">예: [{"service": "dynamodb", "op": "Get*", "latency_ms": 200, "error_rate": 0.1, "throttle_rate": 0.2}]</div>
     <textarea id="chaosrules" rows="6" style="width:100%;font-family:ui-monospace,monospace">${esc(JSON.stringify(ch.rules, null, 2))}</textarea>
