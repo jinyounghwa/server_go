@@ -204,7 +204,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - 없는 Lambda 대상 + DLQ 조합에서 DLQ에 메시지 1개가 들어와야 한다.
   - 아카이브한 이벤트를 재생하면 대상 큐에 다시 들어와야 한다.
 
-## 7일차 (2026-12-01): API Gateway 인가자 (JWT·Lambda)
+## 7일차 (2026-12-01): API Gateway 인가자 (JWT·Lambda) — ✅ 완료 (`c2799e2`): `Create/Get/Update/DeleteAuthorizer`·`UpdateRoute`, 로컬 Cognito RS256 JWT 검증(외부 issuer 거부)·Lambda REQUEST simple response 2.0(`requestContext.authorizer.lambda`), 401/403 분리, 단위/boto3 테스트(42/38)·우분투 두 모드 통과
 - **`apigw.rs` 3행:** HTTP API 인가자를 넣는다. 연산은 `CreateAuthorizer`, `GetAuthorizer(s)`, `UpdateAuthorizer`, `DeleteAuthorizer`이고, 라우트의 `AuthorizationType`과 `AuthorizerId`를 연결한다.
 - **JWT 인가자:**
   - issuer와 audience를 확인한다.
