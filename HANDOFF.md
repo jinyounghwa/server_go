@@ -177,7 +177,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - 같은 중복 ID로 두 번 Publish하면 큐에는 1개만 들어와야 한다.
   - 표준 큐를 FIFO 토픽에 구독시키면 거부되어야 한다.
 
-## 5일차 (2026-11-29): Step Functions JSONPath·내장 함수
+## 5일차 (2026-11-29): Step Functions JSONPath·내장 함수 — ✅ 완료 (`744c862`): JSONPath 확장(`[*]`·`[-1]`·`['key']`·`$$` 전파·`?()` 거부), 내장 함수 12종, 단위/boto3 테스트(39/36)·우분투 두 모드 통과
 - **`sfn.rs` 3행:** JSONPath를 `$.a.b[0]` 이상으로 넓힌다.
   - `[*]`, `[-1]`, `['key']`, `$$.Execution.Id`, `$$.State.Name`, `$$.Map.Item.Value`(Context 객체)를 지원한다.
   - 필터식 `?()`는 거부하고 오류를 명확히 낸다.
