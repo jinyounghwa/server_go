@@ -102,7 +102,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
 
 ---
 
-## 2일차 (2026-11-26): Lambda 실패 처리 (ponytail 목록에서 실사용 빈도가 높은 것)
+## 2일차 (2026-11-26): Lambda 실패 처리 (ponytail 목록에서 실사용 빈도가 높은 것) — ✅ 완료 (`7b3056f`): 2-1·2-2 전부, 스위트 두 모드 통과
 
 `lambda.rs` 3행과 605행의 `ponytail:` 주석을 기준으로 한다.
 
