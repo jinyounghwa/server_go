@@ -189,7 +189,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - 각각 표준 라이브러리 수준의 짧은 코드로 쓴다.
 - 테스트: 내장 함수마다 단위 테스트를 하나씩 둔다. sdk_test.py에는 Pass 상태 `Parameters`로 여러 함수를 한 번에 쓰는 실행 하나를 넣는다.
 
-## 6일차 (2026-11-30): EventBridge 재시도·DLQ·아카이브
+## 6일차 (2026-11-30): EventBridge 재시도·DLQ·아카이브 — ✅ 완료 (`f9006b5`): 대상별 RetryPolicy·SQS DLQ(속성 포함)·아카이브/재생(스냅샷·replay-name)·API destinations 거부, 단위/boto3 테스트(40/37)·우분투 두 모드 통과
 - **대상별 재시도와 DLQ:**
   - 대상의 `RetryPolicy`(`MaximumRetryAttempts`, `MaximumEventAgeInSeconds`)와 `DeadLetterConfig.Arn`(SQS)을 지원한다.
   - 배달이 실패하면 재시도한다. 끝내 실패하면 DLQ로 보내고 `ERROR_CODE` 같은 메시지 속성을 붙인다.
