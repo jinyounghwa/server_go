@@ -2164,6 +2164,91 @@ def test_eventbridge_dlq_and_archive():
     sqs.delete_queue(QueueUrl=dlq); sqs.delete_queue(QueueUrl=out_q)
 
 
+def test_apigw_authorizers():
+    import urllib.request, urllib.error
+    gw, lam, idp = boto3.client("apigatewayv2", **kw), boto3.client("lambda", **kw), boto3.client("cognito-idp", **kw)
+    p = f"auth{run}"
+    role = "arn:aws:iam::000000000000:role/x"
+
+    # Cognito user pool + confirmed user → real RS256 ID & Access tokens
+    pool = idp.create_user_pool(PoolName=p, UsernameAttributes=["email"], AutoVerifiedAttributes=["email"])["UserPool"]["Id"]
+    cid = idp.create_user_pool_client(UserPoolId=pool, ClientName="web", ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"])["UserPoolClient"]["ClientId"]
+    email = f"{p}@example.com"
+    idp.sign_up(ClientId=cid, Username=email, Password="Str0ng!pass")
+    st = json.load(urllib.request.urlopen(f"{EP}/_admin/state"))
+    sent = next(x for x in st["cognito"] if x["name"] == p)["rows"][0][3]
+    idp.confirm_sign_up(ClientId=cid, Username=email, ConfirmationCode=sent)
+    tok = idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH", AuthParameters={"USERNAME": email, "PASSWORD": "Str0ng!pass"})["AuthenticationResult"]
+
+    # Backend echo Lambda + Lambda REQUEST authorizer (payload 2.0 simple response)
+    echo_code = 'def handler(e, c):\n    return {"authorizer": e["requestContext"].get("authorizer")}\n'
+    auth_code = (
+        'def handler(e, c):\n'
+        '    ok = e.get("identitySource") == ["Bearer allow-me"]\n'
+        '    return {"isAuthorized": ok, "context": {"user": "alice", "role": "admin"} if ok else {}}\n'
+    )
+    echo_arn = lam.create_function(FunctionName=f"{p}-echo", Runtime="python3.12", Role=role, Handler="app.handler", Code={"ZipFile": zipped({"app.py": echo_code})})["FunctionArn"]
+    auth_arn = lam.create_function(FunctionName=f"{p}-fn", Runtime="python3.12", Role=role, Handler="app.handler", Code={"ZipFile": zipped({"app.py": auth_code})})["FunctionArn"]
+
+    api = gw.create_api(Name=p, ProtocolType="HTTP")["ApiId"]
+    integ = gw.create_integration(ApiId=api, IntegrationType="AWS_PROXY", IntegrationUri=echo_arn, PayloadFormatVersion="2.0")["IntegrationId"]
+    base = gw.get_api(ApiId=api)["ApiEndpoint"]
+
+    # External JWT issuer must be refused (never fetch external JWKS)
+    assert code(gw.create_authorizer, ApiId=api, Name="ext", AuthorizerType="JWT",
+                IdentitySource=["$request.header.Authorization"],
+                JwtConfiguration={"Issuer": "https://evil.example.com", "Audience": [cid]}) == "BadRequestException"
+
+    # 1. Local Cognito JWT authorizer
+    iss = f"{EP}/_cognito/{pool}"
+    jwt_aid = gw.create_authorizer(ApiId=api, Name="cog-jwt", AuthorizerType="JWT",
+                                   IdentitySource=["$request.header.Authorization"],
+                                   JwtConfiguration={"Issuer": iss, "Audience": ["other"]})["AuthorizerId"]
+    gw.update_authorizer(ApiId=api, AuthorizerId=jwt_aid, JwtConfiguration={"Audience": [cid]})
+    assert gw.get_authorizer(ApiId=api, AuthorizerId=jwt_aid)["JwtConfiguration"]["Audience"] == [cid]
+    gw.create_route(ApiId=api, RouteKey="GET /jwt", Target=f"integrations/{integ}", AuthorizationType="JWT", AuthorizerId=jwt_aid)
+
+    def req_status(path, hdrs=None):
+        r = urllib.request.Request(base + path, headers=hdrs or {})
+        try:
+            with urllib.request.urlopen(r) as resp:
+                return resp.status, json.load(resp)
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode())
+
+    assert req_status("/jwt")[0] == 401
+    # Tampered token → 403
+    parts = tok["IdToken"].split(".")
+    bad_tok = parts[0] + "." + parts[1] + ".AAAA"
+    assert req_status("/jwt", {"Authorization": f"Bearer {bad_tok}"})[0] == 403
+    # Valid ID token → 200 with JWT claims
+    s_ok, b_ok = req_status("/jwt", {"Authorization": f"Bearer {tok['IdToken']}"})
+    assert s_ok == 200 and b_ok["authorizer"]["jwt"]["claims"]["email"] == email, (s_ok, b_ok)
+    # Valid Access token (client_id audience) → 200
+    s_acc, b_acc = req_status("/jwt", {"Authorization": f"Bearer {tok['AccessToken']}"})
+    assert s_acc == 200 and b_acc["authorizer"]["jwt"]["claims"]["token_use"] == "access", (s_acc, b_acc)
+
+    # 2. Lambda REQUEST authorizer (simple response 2.0) attached via update_route
+    lam_aid = gw.create_authorizer(ApiId=api, Name="lam-auth", AuthorizerType="REQUEST",
+                                   AuthorizerUri=f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/{auth_arn}/invocations",
+                                   AuthorizerPayloadFormatVersion="2.0", EnableSimpleResponses=True,
+                                   IdentitySource=["$request.header.Authorization"])["AuthorizerId"]
+    rid = gw.create_route(ApiId=api, RouteKey="GET /custom", Target=f"integrations/{integ}")["RouteId"]
+    gw.update_route(ApiId=api, RouteId=rid, AuthorizationType="CUSTOM", AuthorizerId=lam_aid)
+    assert len(gw.get_authorizers(ApiId=api)["Items"]) == 2
+
+    assert req_status("/custom")[0] == 401
+    assert req_status("/custom", {"Authorization": "Bearer nope"})[0] == 403
+    s_c, b_c = req_status("/custom", {"Authorization": "Bearer allow-me"})
+    assert s_c == 200 and b_c["authorizer"]["lambda"] == {"user": "alice", "role": "admin"}, (s_c, b_c)
+
+    gw.delete_authorizer(ApiId=api, AuthorizerId=jwt_aid)
+    gw.delete_authorizer(ApiId=api, AuthorizerId=lam_aid)
+    gw.delete_api(ApiId=api)
+    lam.delete_function(FunctionName=f"{p}-echo"); lam.delete_function(FunctionName=f"{p}-fn")
+    idp.delete_user_pool(UserPoolId=pool)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

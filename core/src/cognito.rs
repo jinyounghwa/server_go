@@ -33,7 +33,7 @@ fn sign(claims: &Value) -> String {
 }
 
 // Claims of a valid, unexpired token we issued.
-fn verify(token: &str) -> Option<Value> {
+pub fn verify(token: &str) -> Option<Value> {
     let (msg, sig) = token.rsplit_once('.')?;
     let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig).ok()?;
     VerifyingKey::<Sha256>::new(KEY.to_public_key()).verify(msg.as_bytes(), &rsa::pkcs1v15::Signature::try_from(sig.as_slice()).ok()?).ok()?;
@@ -125,6 +125,10 @@ impl Pool {
 }
 
 impl Cognito {
+    pub fn pool_exists(&self, pool_id: &str) -> bool {
+        self.pools.contains_key(pool_id)
+    }
+
     pub fn take_codes(&mut self) -> Vec<(String, String)> {
         std::mem::take(&mut self.codes)
     }
@@ -460,5 +464,21 @@ mod tests {
         // RFC 4231 test case 2
         let mac = super::hmac_sha256(b"Jefe", b"what do ya want for nothing?");
         assert_eq!(mac.iter().map(|b| format!("{b:02x}")).collect::<String>(), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    }
+
+    #[test]
+    fn jwt_sign_and_verify() {
+        let now = crate::epoch().floor();
+        let tok = super::sign(&serde_json::json!({"sub": "u1", "aud": "c1", "iss": super::issuer("p1"), "exp": now + 60.0}));
+        let c = super::verify(&tok).expect("valid token");
+        assert_eq!(c["sub"], "u1");
+        // Tampered payload must fail
+        let mut parts: Vec<&str> = tok.split('.').collect();
+        let bad_payload = super::b64url(br#"{"sub":"evil","exp":9999999999}"#);
+        parts[1] = &bad_payload;
+        assert!(super::verify(&parts.join(".")).is_none());
+        // Expired token must fail
+        let exp = super::sign(&serde_json::json!({"sub": "u1", "exp": now - 10.0}));
+        assert!(super::verify(&exp).is_none());
     }
 }

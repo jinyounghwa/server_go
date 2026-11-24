@@ -23,6 +23,7 @@
 - 2026-11-24 추가12: SQS 메시지별 `DelaySeconds`(표준 큐 0~900초, 음수/초과/FIFO 거부, 표준 큐 FIFO 파라미터 거부) + SNS FIFO 토픽(`.fifo`+`FifoTopic=true`, `MessageGroupId` 필수, 5분 중복 제거/`ContentBasedDeduplication`, FIFO SQS 구독만 허용, 삭제·스냅샷 복원 시 dedup 캐시 정리). `main.rs` `check_sns_subscribe`·`sqs.rs` `parse_delay_seconds` 리팩토링. 단위 테스트 37개, boto3 테스트 35개.
 - 2026-11-24 추가13: Step Functions JSONPath 확장(`[*]`, `[-1]`, `['key']`, `$$.Execution.Id`/`$$.State.Name`/`$$.Map.Item.Value`·Map 내부 컨텍스트 전파, `?()` 필터식 거부) + 내장 함수 12종(`ArrayPartition`/`Contains`/`Range`/`GetItem`/`Length`/`Unique`, `Base64Encode`/`Decode`, `Hash`(MD5/SHA-256/384/512), `StringSplit`, `JsonMerge`, `MathRandom`). 단위 테스트 39개, boto3 테스트 36개.
 - 2026-11-24 추가14: EventBridge 대상별 `RetryPolicy`·`DeadLetterConfig`(SQS DLQ, `RULE_ARN`/`TARGET_ARN`/`ERROR_CODE`/`ERROR_MESSAGE` 속성) + 아카이브(`Create/Describe/List/DeleteArchive`, 스냅샷 저장)·재생(`Start/Describe/ListReplay`, `replay-name` 부착), API destinations 거부. 단위 테스트 40개, boto3 테스트 37개.
+- 2026-11-24 추가15: API Gateway HTTP API 인가자(`Create/Get/Update/DeleteAuthorizer`, 라우트 `UpdateRoute`·`AuthorizationType`/`AuthorizerId`) — JWT 인가자(로컬 Cognito 풀 RS256·`iss`/`aud`/`client_id` 검증, 외부 issuer 거부) + Lambda `REQUEST` 인가자(payload 2.0 simple response `{isAuthorized, context}` → `requestContext.authorizer.lambda`), 토큰 없음 401·검증 실패 403. 단위 테스트 42개, boto3 테스트 38개.
 - `v0.1.0` 릴리스 완료(2026-11-21): 바이너리 3종 + SHA256SUMS, Homebrew sha256 반영.
 - `v0.1.5` 릴리스(2026-11-25): EventBridge `cron()`·InputTransformer, Kinesis→Lambda 매핑, DynamoDB 중첩 경로, Lambda 버전·별칭, IAM 조건 연산자(Numeric·Date·IpAddress·한정자), `STRICT_DELIVERY=1`, SNS 필터 numeric·suffix, SigV4 시계 오차, STS 만료, Kinesis 리샤딩, S3 알림 대상 검증, Route53 라우팅 정책, Logs 필터 패턴. 우분투 전체 검증(스위트 두 모드) 통과 뒤 태그. Homebrew는 태그 뒤 반영.
 - `v0.1.4` 릴리스(2026-11-22): ALB 요청별 규칙 라우팅, aws-chunked 트레일러 서명 검증, SNS·EventBridge·S3 배달의 대상 정책 판정(서비스 주체). Homebrew 0.1.4.
@@ -42,7 +43,7 @@ core/            Rust 단일 바이너리 (axum + tokio), 모든 서비스가 �
   src/<svc>.rs   서비스별 모듈. 상태 struct + handle() + admin()
   src/ui.html    관리 GUI (/_ui), town.html 캐릭터 마을 (/_town) — include_str!로 내장
 gui/             Tauri 2 창. /_ui를 여는 껍데기일 뿐
-tests/sdk_test.py  boto3 호환성 테스트 37개 (주 통합 테스트), tests/js·tests/rust는 JS v3(5개)·Rust SDK(4개) 스위트
+tests/sdk_test.py  boto3 호환성 테스트 38개 (주 통합 테스트), tests/js·tests/rust는 JS v3(5개)·Rust SDK(4개) 스위트
 netlify.toml     예전 Netlify 설정(지금은 GitHub Pages `pages.yml`로 배포)
 ```
 
