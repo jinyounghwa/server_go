@@ -1,6 +1,7 @@
 // EventBridge (JSON 1.1): buses, rules with event patterns or rate()/cron() schedules (UTC), targets with Input,
-// InputPath or InputTransformer. ponytail: cron L/W/# are rejected; archives/replay and API destinations are not supported.
-use crate::{err, need, ApiErr, ACCOUNT, REGION};
+// InputPath, InputTransformer, RetryPolicy and DeadLetterConfig (SQS), plus Archives and Replays.
+// ponytail: cron L/W/# are rejected; API destinations are refused (no outbound HTTP).
+use crate::{epoch, err, need, ApiErr, ACCOUNT, REGION};
 use serde_json::{json, Value};
 use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,12 +15,47 @@ pub struct Rule {
     pub generation: u64,
 }
 
+struct Archive {
+    name: String,
+    source_arn: String,
+    bus: String,
+    pattern: Option<Value>,
+    retention_days: u64,
+    desc: String,
+    created: f64,
+    events: Vec<(f64, Value)>,
+}
+
+struct Replay {
+    name: String,
+    source_arn: String,
+    dest: Value,
+    start: f64,
+    end: f64,
+    started: f64,
+    ended: f64,
+    desc: String,
+    state: &'static str,
+}
+
 #[derive(Default)]
 pub struct Events {
     buses: BTreeSet<String>,
     rules: BTreeMap<(String, String), Rule>,
+    archives: BTreeMap<String, Archive>,
+    replays: BTreeMap<String, Replay>,
     generation: u64,
     sent: u64,
+}
+
+fn archive_arn(name: &str) -> String {
+    format!("arn:aws:events:{}:{ACCOUNT}:archive/{name}", *REGION)
+}
+fn replay_arn(name: &str) -> String {
+    format!("arn:aws:events:{}:{ACCOUNT}:replay/{name}", *REGION)
+}
+fn parse_ts(v: &Value) -> Option<f64> {
+    v.as_f64().or_else(|| v.as_str().and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|t| t.timestamp_millis() as f64 / 1000.0))
 }
 
 pub fn bus_of(r: &Value) -> String {
@@ -355,6 +391,18 @@ impl Events {
                         || it["InputPathsMap"].as_object().is_some_and(|m| m.len() > 100 || m.values().any(|p| !p.as_str().is_some_and(|p| p.starts_with('$'))))) {
                         return Err(err("ValidationException", "InputTransformer needs an InputTemplate and InputPathsMap values that are $ paths (at most 100)."));
                     }
+                    if let Some(rp) = t.get("RetryPolicy").filter(|v| !v.is_null()) {
+                        if let Some(m) = rp.get("MaximumRetryAttempts").and_then(Value::as_i64) {
+                            if !(0..=185).contains(&m) {
+                                return Err(err("ValidationException", "MaximumRetryAttempts must be between 0 and 185."));
+                            }
+                        }
+                        if let Some(age) = rp.get("MaximumEventAgeInSeconds").and_then(Value::as_i64) {
+                            if !(60..=86400).contains(&age) {
+                                return Err(err("ValidationException", "MaximumEventAgeInSeconds must be between 60 and 86400."));
+                            }
+                        }
+                    }
                     rule.targets.retain(|x| x["Id"] != t["Id"]);
                     rule.targets.push(t.clone());
                 }
@@ -383,6 +431,16 @@ impl Events {
                         continue;
                     };
                     let ev = envelope(src, dt, detail, e["Resources"].clone().as_array().map_or(json!([]), |a| json!(a)));
+                    let now = epoch();
+                    for a in self.archives.values_mut() {
+                        if a.bus == b && a.pattern.as_ref().is_none_or(|p| matches(p, &ev)) {
+                            if a.retention_days > 0 {
+                                let cutoff = now - (a.retention_days as f64) * 86400.0;
+                                a.events.retain(|(t, _)| *t >= cutoff);
+                            }
+                            a.events.push((now, ev.clone()));
+                        }
+                    }
                     for ((rb, rn), rule) in &self.rules {
                         if *rb == b && rule.enabled && rule.pattern.as_ref().is_some_and(|p| matches(p, &ev)) {
                             out.extend(rule.targets.iter().map(|t| {
@@ -398,9 +456,157 @@ impl Events {
                 }
                 json!({"FailedEntryCount": failed, "Entries": results})
             }
+            "CreateArchive" => {
+                let name = need(r, "ArchiveName")?;
+                let src = need(r, "EventSourceArn")?;
+                let bus_name = src.rsplit('/').next().unwrap_or("default").to_string();
+                self.bus_ok(&bus_name)?;
+                if self.archives.contains_key(name) {
+                    return Err(err("ResourceAlreadyExistsException", format!("Archive {name} already exists.")));
+                }
+                let pattern = r["EventPattern"].as_str().map(serde_json::from_str::<Value>).transpose()
+                    .map_err(|e| err("InvalidEventPatternException", format!("Event pattern is not valid: {e}")))?;
+                let retention_days = r["RetentionDays"].as_u64().unwrap_or(0);
+                let created = epoch();
+                self.archives.insert(name.into(), Archive {
+                    name: name.into(), source_arn: src.into(), bus: bus_name, pattern, retention_days,
+                    desc: r["Description"].as_str().unwrap_or("").into(), created, events: vec![],
+                });
+                json!({"ArchiveArn": archive_arn(name), "State": "ENABLED", "CreationTime": created})
+            }
+            "DescribeArchive" => {
+                let name = need(r, "ArchiveName")?;
+                let a = self.archives.get(name).ok_or_else(|| err("ResourceNotFoundException", format!("Archive {name} does not exist.")))?;
+                let size: usize = a.events.iter().map(|(_, e)| e.to_string().len()).sum();
+                let mut v = json!({"ArchiveArn": archive_arn(&a.name), "ArchiveName": a.name, "EventSourceArn": a.source_arn,
+                    "Description": a.desc, "State": "ENABLED", "RetentionDays": a.retention_days,
+                    "SizeBytes": size, "EventCount": a.events.len(), "CreationTime": a.created});
+                if let Some(p) = &a.pattern {
+                    v["EventPattern"] = p.to_string().into();
+                }
+                v
+            }
+            "ListArchives" => {
+                let pre = r["NamePrefix"].as_str().unwrap_or("");
+                let src = r["EventSourceArn"].as_str();
+                let list: Vec<Value> = self.archives.values()
+                    .filter(|a| a.name.starts_with(pre) && src.is_none_or(|s| a.source_arn == s))
+                    .map(|a| {
+                        let size: usize = a.events.iter().map(|(_, e)| e.to_string().len()).sum();
+                        json!({"ArchiveName": a.name, "EventSourceArn": a.source_arn, "State": "ENABLED",
+                               "RetentionDays": a.retention_days, "SizeBytes": size, "EventCount": a.events.len(), "CreationTime": a.created})
+                    })
+                    .collect();
+                json!({"Archives": list})
+            }
+            "DeleteArchive" => {
+                let name = need(r, "ArchiveName")?;
+                self.archives.remove(name).ok_or_else(|| err("ResourceNotFoundException", format!("Archive {name} does not exist.")))?;
+                json!({})
+            }
+            "StartReplay" => {
+                let name = need(r, "ReplayName")?;
+                if self.replays.contains_key(name) {
+                    return Err(err("ResourceAlreadyExistsException", format!("Replay {name} already exists.")));
+                }
+                let src = need(r, "EventSourceArn")?;
+                let arch_name = src.rsplit('/').next().unwrap_or(src);
+                let arch = self.archives.get(arch_name).ok_or_else(|| err("ResourceNotFoundException", format!("Archive {arch_name} does not exist.")))?;
+                let start = parse_ts(&r["EventStartTime"]).ok_or_else(|| err("ValidationException", "EventStartTime is required"))?;
+                let end = parse_ts(&r["EventEndTime"]).ok_or_else(|| err("ValidationException", "EventEndTime is required"))?;
+                if end <= start {
+                    return Err(err("ValidationException", "EventEndTime must be after EventStartTime"));
+                }
+                let dest = r["Destination"].clone();
+                let dest_bus = dest["Arn"].as_str().map(|s| s.rsplit('/').next().unwrap_or("default")).unwrap_or(&arch.bus).to_string();
+                self.bus_ok(&dest_bus)?;
+                let filter_arns: Vec<String> = dest["FilterArns"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect();
+                let matched_events: Vec<Value> = arch.events.iter()
+                    .filter(|(t, _)| *t >= start && *t <= end)
+                    .map(|(_, ev)| {
+                        let mut e = ev.clone();
+                        e["replay-name"] = json!(name);
+                        e
+                    })
+                    .collect();
+                for ev in matched_events {
+                    for ((rb, rn), rule) in &self.rules {
+                        let rarn = rule_arn(&dest_bus, rn);
+                        if *rb == dest_bus && rule.enabled
+                            && (filter_arns.is_empty() || filter_arns.contains(&rarn))
+                            && rule.pattern.as_ref().is_some_and(|p| matches(p, &ev))
+                        {
+                            out.extend(rule.targets.iter().map(|t| {
+                                let mut t = t.clone();
+                                t["_RuleArn"] = json!(rarn);
+                                let p = payload(&t, &ev);
+                                (t, p)
+                            }));
+                        }
+                    }
+                }
+                let now = epoch();
+                self.replays.insert(name.into(), Replay {
+                    name: name.into(), source_arn: src.into(), dest, start, end,
+                    started: now, ended: now, desc: r["Description"].as_str().unwrap_or("").into(), state: "COMPLETED",
+                });
+                json!({"ReplayArn": replay_arn(name), "State": "COMPLETED", "ReplayStartTime": now})
+            }
+            "DescribeReplay" => {
+                let name = need(r, "ReplayName")?;
+                let rp = self.replays.get(name).ok_or_else(|| err("ResourceNotFoundException", format!("Replay {name} does not exist.")))?;
+                json!({"ReplayName": rp.name, "ReplayArn": replay_arn(&rp.name), "Description": rp.desc, "State": rp.state,
+                       "EventSourceArn": rp.source_arn, "Destination": rp.dest, "EventStartTime": rp.start, "EventEndTime": rp.end,
+                       "ReplayStartTime": rp.started, "ReplayEndTime": rp.ended})
+            }
+            "ListReplays" => {
+                let pre = r["NamePrefix"].as_str().unwrap_or("");
+                let src = r["EventSourceArn"].as_str();
+                let list: Vec<Value> = self.replays.values()
+                    .filter(|rp| rp.name.starts_with(pre) && src.is_none_or(|s| rp.source_arn == s))
+                    .map(|rp| json!({"ReplayName": rp.name, "EventSourceArn": rp.source_arn, "State": rp.state,
+                                     "EventStartTime": rp.start, "EventEndTime": rp.end, "ReplayStartTime": rp.started, "ReplayEndTime": rp.ended}))
+                    .collect();
+                json!({"Replays": list})
+            }
+            "CreateApiDestination" | "CreateConnection" => {
+                return Err(err("UnsupportedOperationException", format!("{op} is not supported locally (outbound HTTP is disabled)")));
+            }
             _ => return Err(err("UnknownOperationException", format!("{op} is not supported yet"))),
         };
         Ok((v, out))
+    }
+
+    pub fn snap_save(&self) -> Value {
+        let archives: Vec<Value> = self.archives.values().map(|a| json!({
+            "name": a.name, "source_arn": a.source_arn, "bus": a.bus, "pattern": a.pattern,
+            "retention_days": a.retention_days, "desc": a.desc, "created": a.created,
+            "events": a.events.iter().map(|(t, e)| json!([t, e])).collect::<Vec<_>>(),
+        })).collect();
+        json!({"buses": self.buses, "archives": archives})
+    }
+
+    pub fn snap_load(&mut self, v: &Value) {
+        self.buses.clear();
+        self.archives.clear();
+        self.replays.clear();
+        for b in v["buses"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+            self.buses.insert(b.into());
+        }
+        for a in v["archives"].as_array().into_iter().flatten() {
+            let (Some(name), Some(src), Some(bus)) = (a["name"].as_str(), a["source_arn"].as_str(), a["bus"].as_str()) else { continue };
+            let events: Vec<(f64, Value)> = a["events"].as_array().into_iter().flatten().filter_map(|p| {
+                Some((p[0].as_f64()?, p[1].clone()))
+            }).collect();
+            self.archives.insert(name.into(), Archive {
+                name: name.into(), source_arn: src.into(), bus: bus.into(),
+                pattern: (!a["pattern"].is_null()).then(|| a["pattern"].clone()),
+                retention_days: a["retention_days"].as_u64().unwrap_or(0),
+                desc: a["desc"].as_str().unwrap_or("").into(),
+                created: a["created"].as_f64().unwrap_or(0.0),
+                events,
+            });
+        }
     }
 
     pub fn admin(&self) -> Value {
@@ -460,5 +666,41 @@ mod tests {
         for bad in ["cron(0 12 * * * *)", "cron(0 12 ? * ? *)", "cron(61 * * * ? *)", "cron(0 12 L * ? *)", "cron(0 12 * *)"] {
             assert!(cron_parse(bad).is_none(), "{bad}");
         }
+    }
+
+    #[test]
+    fn archives_and_replay() {
+        let mut eb = Events::default();
+        eb.handle("PutRule", &json!({"Name": "r1", "EventPattern": "{\"source\":[\"shop\"]}"})).unwrap();
+        eb.handle("PutTargets", &json!({"Rule": "r1", "Targets": [{"Id": "t1", "Arn": "arn:aws:sqs:us-east-1:000000000000:q1"}]})).unwrap();
+        let bus_arn = format!("arn:aws:events:{}:{ACCOUNT}:event-bus/default", *REGION);
+        let (a, _) = eb.handle("CreateArchive", &json!({"ArchiveName": "a1", "EventSourceArn": bus_arn, "EventPattern": "{\"source\":[\"shop\"]}", "RetentionDays": 7})).unwrap();
+        let aarn = a["ArchiveArn"].as_str().unwrap().to_string();
+        assert!(eb.handle("CreateArchive", &json!({"ArchiveName": "a1", "EventSourceArn": bus_arn})).is_err());
+        let t0 = epoch() - 5.0;
+        eb.handle("PutEvents", &json!({"Entries": [
+            {"Source": "shop", "DetailType": "Order", "Detail": "{\"n\":1}"},
+            {"Source": "other", "DetailType": "Noise", "Detail": "{}"}
+        ]})).unwrap();
+        let t1 = epoch() + 5.0;
+        let (desc, _) = eb.handle("DescribeArchive", &json!({"ArchiveName": "a1"})).unwrap();
+        assert_eq!(desc["EventCount"], 1);
+        // Snapshot round-trip preserves archived events
+        let snap = eb.snap_save();
+        let mut eb2 = Events::default();
+        eb2.snap_load(&snap);
+        let (desc2, _) = eb2.handle("DescribeArchive", &json!({"ArchiveName": "a1"})).unwrap();
+        assert_eq!(desc2["EventCount"], 1);
+        // Replay adds replay-name and dispatches matching rule targets
+        let (rp, sends) = eb.handle("StartReplay", &json!({
+            "ReplayName": "rep1", "EventSourceArn": aarn,
+            "EventStartTime": t0, "EventEndTime": t1,
+            "Destination": {"Arn": bus_arn}
+        })).unwrap();
+        assert_eq!(rp["State"], "COMPLETED");
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].1["replay-name"], "rep1");
+        assert_eq!(sends[0].1["detail"]["n"], 1);
+        assert!(eb.handle("CreateApiDestination", &json!({"Name": "x"})).is_err());
     }
 }

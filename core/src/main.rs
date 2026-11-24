@@ -567,7 +567,7 @@ async fn handle(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<std:
             let r = serde_json::from_slice::<Value>(&body).map_err(|e| err("SerializationException", e.to_string())).and_then(|j| {
                 let (v, sends) = app.eb.lock().unwrap().handle(&op, &j)?;
                 for (t, payload) in sends {
-                    send_to_target(&app, &rid, t["Arn"].as_str().unwrap_or(""), payload, "events", t["_RuleArn"].as_str().unwrap_or(""));
+                    dispatch_eb_target(&app, &rid, t, payload);
                 }
                 if op == "PutRule" {
                     start_schedule(app.clone(), events::bus_of(&j), j["Name"].as_str().unwrap_or("").into());
@@ -763,6 +763,80 @@ pub fn send_to_target(app: &Arc<App>, rid: &str, arn: &str, payload: Value, from
     }
 }
 
+// Dispatch an EventBridge target. Plain targets without RetryPolicy/DeadLetterConfig use send_to_target
+// directly (synchronous SQS/SNS delivery); targets with retry or DLQ run async retries then deliver to DLQ SQS.
+fn dispatch_eb_target(app: &Arc<App>, rid: &str, target: Value, payload: Value) {
+    let arn = target["Arn"].as_str().unwrap_or("").to_string();
+    let rule_arn = target["_RuleArn"].as_str().unwrap_or("").to_string();
+    let dlq = target["DeadLetterConfig"]["Arn"].as_str().map(String::from);
+    let has_retry = target.get("RetryPolicy").is_some_and(|v| v.is_object());
+    if dlq.is_none() && !has_retry {
+        send_to_target(app, rid, &arn, payload, "events", &rule_arn);
+        return;
+    }
+    let retries = target["RetryPolicy"]["MaximumRetryAttempts"].as_u64().unwrap_or(0).min(3);
+    let (app, rid) = (app.clone(), rid.to_string());
+    tokio::spawn(async move {
+        let text = match &payload { Value::String(s) => s.clone(), v => v.to_string() };
+        let mut last_err = ("DELIVERY_FAILED", "Target delivery failed".to_string());
+        for attempt in 0..=retries {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            if !service_gate(&app, &rid, "events", &arn, &rule_arn) {
+                last_err = ("ACCESS_DENIED", format!("Target resource policy denied delivery to {arn}"));
+                continue;
+            }
+            let res: Result<(), (&'static str, String)> = if arn.starts_with("arn:aws:lambda:") {
+                let base = lambda::name_of(&arn);
+                if !app.lambda.lock().unwrap().exists(&base) {
+                    Err(("NO_SUCH_RESOURCE", format!("Lambda function {arn} does not exist")))
+                } else if lambda::invoke_logged(&app, &arn, payload.clone(), "events").await {
+                    Ok(())
+                } else {
+                    Err(("LAMBDA_INVOCATION_FAILED", format!("Lambda {arn} returned an error")))
+                }
+            } else if arn.starts_with("arn:aws:sqs:") {
+                let q = arn.rsplit(':').next().unwrap_or("");
+                if app.sqs.lock().unwrap().deliver(q, text.clone(), &Value::Null, None, None) {
+                    emit(&app, json!({"ts": chrono::Utc::now().to_rfc3339(), "request_id": rid, "service": "events", "op": "Deliver", "target": arn, "protocol": "sqs", "status": 200}));
+                    Ok(())
+                } else {
+                    Err(("NO_SUCH_RESOURCE", format!("SQS queue {arn} does not exist")))
+                }
+            } else if arn.starts_with("arn:aws:sns:") {
+                if !app.sns.lock().unwrap().exists(&arn) {
+                    Err(("NO_SUCH_RESOURCE", format!("SNS topic {arn} does not exist")))
+                } else {
+                    let q: HashMap<String, String> = [("Action", "Publish"), ("TopicArn", arn.as_str()), ("Message", text.as_str())].map(|(k, v)| (k.to_string(), v.to_string())).into();
+                    let r = app.sns.lock().unwrap().handle(&q);
+                    for d in r.map(|(_, ds)| ds).unwrap_or_default() {
+                        deliver(&app, &rid, &d, "sns", &arn);
+                    }
+                    Ok(())
+                }
+            } else {
+                Err(("UNSUPPORTED_TARGET", format!("Unsupported EventBridge target {arn}")))
+            };
+            if res.is_ok() {
+                return;
+            }
+            last_err = res.unwrap_err();
+        }
+        if let Some(dlq_arn) = dlq {
+            let q = dlq_arn.rsplit(':').next().unwrap_or("");
+            let attrs = json!({
+                "RULE_ARN": {"DataType": "String", "StringValue": rule_arn},
+                "TARGET_ARN": {"DataType": "String", "StringValue": arn},
+                "ERROR_CODE": {"DataType": "String", "StringValue": last_err.0},
+                "ERROR_MESSAGE": {"DataType": "String", "StringValue": last_err.1},
+            });
+            let ok = app.sqs.lock().unwrap().deliver(q, text, &attrs, None, None);
+            emit(&app, json!({"ts": chrono::Utc::now().to_rfc3339(), "request_id": rid, "service": "events", "op": "Deliver", "target": dlq_arn, "protocol": "sqs", "dlq": true, "status": if ok { 200 } else { 404 }}));
+        }
+    });
+}
+
 // Ticker for a rate() rule; it stops when the rule is replaced or deleted.
 fn start_schedule(app: Arc<App>, bus: String, name: String) {
     let Some((expr, generation)) = app.eb.lock().unwrap().schedule_of(&bus, &name) else { return };
@@ -774,10 +848,11 @@ fn start_schedule(app: Arc<App>, bus: String, name: String) {
             match due {
                 None => return,
                 Some(None) => continue, // disabled
-                Some(Some((targets, rule_arn))) => {
-                    let ev = events::envelope("aws.events", "Scheduled Event", json!({}), json!([rule_arn]));
+                Some(Some((targets, _rule_arn))) => {
+                    let ev = events::envelope("aws.events", "Scheduled Event", json!({}), json!([_rule_arn]));
                     for t in targets {
-                        send_to_target(&app, "schedule", t["Arn"].as_str().unwrap_or(""), events::payload(&t, &ev), "events", &rule_arn);
+                        let p = events::payload(&t, &ev);
+                        dispatch_eb_target(&app, "schedule", t, p);
                     }
                 }
             }
@@ -969,6 +1044,7 @@ fn export_snapshot(app: &App) -> Value {
             "ssm": app.ssm.lock().unwrap().snap_save(),
             "secrets": app.secrets.lock().unwrap().snap_save(),
             "kms": app.kms.lock().unwrap().snap_save(),
+            "events": app.eb.lock().unwrap().snap_save(),
         }
     })
 }
@@ -983,6 +1059,7 @@ fn import_snapshot(app: &App, snap: &Value) {
     if s["ssm"].is_array() { app.ssm.lock().unwrap().snap_load(&s["ssm"]); }
     if s["secrets"].is_array() { app.secrets.lock().unwrap().snap_load(&s["secrets"]); }
     if s["kms"].is_object() { app.kms.lock().unwrap().snap_load(&s["kms"]); }
+    if s["events"].is_object() { app.eb.lock().unwrap().snap_load(&s["events"]); }
 }
 
 async fn get_snapshot(State(app): State<Arc<App>>) -> Response {

@@ -2096,6 +2096,74 @@ def test_sfn_jsonpath_and_intrinsics():
     sfn.delete_state_machine(stateMachineArn=sm_bad); sfn.delete_state_machine(stateMachineArn=sm)
 
 
+def test_eventbridge_dlq_and_archive():
+    """Day 6: EventBridge target RetryPolicy + DeadLetterConfig (SQS) and Archives / Replays."""
+    from datetime import datetime, timezone, timedelta
+    eb = boto3.client("events", **kw)
+    p = f"d6{run}"
+    bus = eb.create_event_bus(Name=p)["EventBusArn"]
+    dlq = sqs.create_queue(QueueName=f"{p}-dlq")["QueueUrl"]
+    dlq_arn = sqs.get_queue_attributes(QueueUrl=dlq, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    out_q = sqs.create_queue(QueueName=f"{p}-out")["QueueUrl"]
+    out_arn = sqs.get_queue_attributes(QueueUrl=out_q, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+
+    # 1. Missing Lambda target with RetryPolicy + DeadLetterConfig routes failed event to DLQ with ERROR_CODE attribute
+    r_dlq = eb.put_rule(Name=f"{p}-dlq", EventBusName=p, EventPattern=json.dumps({"source": [f"{p}.fail"]}))["RuleArn"]
+    eb.put_targets(Rule=f"{p}-dlq", EventBusName=p, Targets=[{
+        "Id": "missing-fn",
+        "Arn": f"arn:aws:lambda:us-east-1:000000000000:function:{p}-does-not-exist",
+        "RetryPolicy": {"MaximumRetryAttempts": 1, "MaximumEventAgeInSeconds": 300},
+        "DeadLetterConfig": {"Arn": dlq_arn},
+    }])
+    assert code(eb.put_targets, Rule=f"{p}-dlq", EventBusName=p, Targets=[{
+        "Id": "bad", "Arn": out_arn, "RetryPolicy": {"MaximumRetryAttempts": 999},
+    }]) == "ValidationException"
+    eb.put_events(Entries=[{"EventBusName": p, "Source": f"{p}.fail", "DetailType": "Boom", "Detail": json.dumps({"k": 1})}])
+    dlq_msgs = []
+    for _ in range(30):
+        dlq_msgs = sqs.receive_message(QueueUrl=dlq, MessageAttributeNames=["All"], MaxNumberOfMessages=5).get("Messages", [])
+        if dlq_msgs:
+            break
+        time.sleep(0.1)
+    assert len(dlq_msgs) == 1, dlq_msgs
+    attrs = dlq_msgs[0].get("MessageAttributes", {})
+    assert attrs["ERROR_CODE"]["StringValue"] == "NO_SUCH_RESOURCE" and attrs["RULE_ARN"]["StringValue"] == r_dlq, attrs
+    assert json.loads(dlq_msgs[0]["Body"])["detail"] == {"k": 1}
+
+    # 2. Archive + StartReplay delivers matching archived events with replay-name
+    arch_arn = eb.create_archive(ArchiveName=f"{p}-arch", EventSourceArn=bus,
+                                 EventPattern=json.dumps({"source": [f"{p}.ok"]}), RetentionDays=7)["ArchiveArn"]
+    assert code(eb.create_archive, ArchiveName=f"{p}-arch", EventSourceArn=bus) == "ResourceAlreadyExistsException"
+    r_ok = eb.put_rule(Name=f"{p}-ok", EventBusName=p, EventPattern=json.dumps({"source": [f"{p}.ok"]}))["RuleArn"]
+    eb.put_targets(Rule=f"{p}-ok", EventBusName=p, Targets=[{"Id": "q", "Arn": out_arn}])
+    t0 = datetime.now(timezone.utc) - timedelta(seconds=5)
+    eb.put_events(Entries=[{"EventBusName": p, "Source": f"{p}.ok", "DetailType": "Order", "Detail": json.dumps({"ord": 7})}])
+    t1 = datetime.now(timezone.utc) + timedelta(seconds=5)
+    # Drain original delivery
+    first = sqs.receive_message(QueueUrl=out_q, MaxNumberOfMessages=10).get("Messages", [])
+    assert len(first) == 1 and "replay-name" not in json.loads(first[0]["Body"])
+    sqs.delete_message(QueueUrl=out_q, ReceiptHandle=first[0]["ReceiptHandle"])
+    assert eb.describe_archive(ArchiveName=f"{p}-arch")["EventCount"] == 1
+    assert any(a["ArchiveName"] == f"{p}-arch" for a in eb.list_archives(NamePrefix=p)["Archives"])
+    # Replay the archived event back to the rule
+    rp = eb.start_replay(ReplayName=f"{p}-rep", EventSourceArn=arch_arn, EventStartTime=t0, EventEndTime=t1,
+                         Destination={"Arn": bus, "FilterArns": [r_ok]})
+    assert rp["State"] == "COMPLETED"
+    assert eb.describe_replay(ReplayName=f"{p}-rep")["State"] == "COMPLETED"
+    replayed = sqs.receive_message(QueueUrl=out_q, MaxNumberOfMessages=10).get("Messages", [])
+    assert len(replayed) == 1, replayed
+    rbody = json.loads(replayed[0]["Body"])
+    assert rbody["replay-name"] == f"{p}-rep" and rbody["detail"] == {"ord": 7}, rbody
+    # API Destinations refused (no outbound HTTP)
+    assert code(eb.create_api_destination, Name=f"{p}-api", ConnectionArn="arn:x", InvocationEndpoint="https://example.com", HttpMethod="POST") == "UnsupportedOperationException"
+
+    eb.delete_archive(ArchiveName=f"{p}-arch")
+    eb.remove_targets(Rule=f"{p}-dlq", EventBusName=p, Ids=["missing-fn"]); eb.delete_rule(Name=f"{p}-dlq", EventBusName=p)
+    eb.remove_targets(Rule=f"{p}-ok", EventBusName=p, Ids=["q"]); eb.delete_rule(Name=f"{p}-ok", EventBusName=p)
+    eb.delete_event_bus(Name=p)
+    sqs.delete_queue(QueueUrl=dlq); sqs.delete_queue(QueueUrl=out_q)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
