@@ -2003,6 +2003,99 @@ def test_sqs_sns_fifo_and_delay():
     sqs.delete_queue(QueueUrl=q_fifo); sqs.delete_queue(QueueUrl=q_std)
 
 
+def test_sfn_jsonpath_and_intrinsics():
+    """Day 5: Step Functions extended JSONPath ([*], [-1], ['key'], $$ context) and 12 new intrinsics."""
+    sfn = boto3.client("stepfunctions", **kw)
+    p = f"d5{run}"
+    role = "arn:aws:iam::000000000000:role/sfn"
+    defn = {
+        "StartAt": "Compute",
+        "States": {
+            "Compute": {
+                "Type": "Pass",
+                "Parameters": {
+                    "ids.$": "$.items[*].id",
+                    "last.$": "$.items[-1].id",
+                    "dotted.$": "$['a.b']['c d']",
+                    "execId.$": "$$.Execution.Id",
+                    "stateName.$": "$$.State.Name",
+                    "parts.$": "States.ArrayPartition($.nums, 2)",
+                    "has3.$": "States.ArrayContains($.nums, 3)",
+                    "rng.$": "States.ArrayRange(1, 5, 2)",
+                    "item2.$": "States.ArrayGetItem($.nums, 2)",
+                    "len.$": "States.ArrayLength($.nums)",
+                    "uniq.$": "States.ArrayUnique($.nums)",
+                    "b64.$": "States.Base64Encode('rocalcloud')",
+                    "dec.$": "States.Base64Decode('cm9jYWxjbG91ZA==')",
+                    "sha.$": "States.Hash('hello', 'SHA-256')",
+                    "md5.$": "States.Hash('hello', 'MD5')",
+                    "split.$": "States.StringSplit('x,y;z', ',;')",
+                    "merged.$": "States.JsonMerge($.o1, $.o2, false)",
+                    "rand.$": "States.MathRandom(10, 20, 7)",
+                    "items.$": "$.items",
+                },
+                "Next": "Each",
+            },
+            "Each": {
+                "Type": "Map",
+                "ItemsPath": "$.items",
+                "ResultPath": "$.mapped",
+                "ItemProcessor": {
+                    "StartAt": "Tag",
+                    "States": {
+                        "Tag": {
+                            "Type": "Pass",
+                            "Parameters": {
+                                "idx.$": "$$.Map.Item.Index",
+                                "val.$": "$$.Map.Item.Value.id",
+                            },
+                            "End": True,
+                        }
+                    },
+                },
+                "End": True,
+            },
+        },
+    }
+    sm = sfn.create_state_machine(name=p, definition=json.dumps(defn), roleArn=role)["stateMachineArn"]
+    ex = sfn.start_execution(stateMachineArn=sm, input=json.dumps({
+        "items": [{"id": 10}, {"id": 20}, {"id": 30}],
+        "a.b": {"c d": "ok"},
+        "nums": [1, 2, 2, 3],
+        "o1": {"a": 1, "b": 2},
+        "o2": {"b": 9, "c": 3},
+    }))["executionArn"]
+    for _ in range(40):
+        d = sfn.describe_execution(executionArn=ex)
+        if d["status"] != "RUNNING":
+            break
+        time.sleep(0.05)
+    assert d["status"] == "SUCCEEDED", d
+    out = json.loads(d["output"])
+    assert out["ids"] == [10, 20, 30] and out["last"] == 30 and out["dotted"] == "ok"
+    assert out["execId"] == ex and out["stateName"] == "Compute"
+    assert out["parts"] == [[1, 2], [2, 3]] and out["has3"] is True and out["rng"] == [1, 3, 5]
+    assert out["item2"] == 2 and out["len"] == 4 and out["uniq"] == [1, 2, 3]
+    assert out["b64"] == "cm9jYWxjbG91ZA==" and out["dec"] == "rocalcloud"
+    assert out["sha"] == "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    assert out["md5"] == "5d41402abc4b2a76b9719d911017c592"
+    assert out["split"] == ["x", "y", "z"] and out["merged"] == {"a": 1, "b": 9, "c": 3}
+    assert 10 <= out["rand"] < 20
+    assert out["mapped"] == [{"idx": 0, "val": 10}, {"idx": 1, "val": 20}, {"idx": 2, "val": 30}]
+
+    # Error paths: ?(...) filter expression and unsupported hash algorithm fail cleanly with States.Runtime
+    bad_def = {"StartAt": "F", "States": {"F": {"Type": "Pass", "Parameters": {"x.$": "$.items[?(@.id > 1)]"}, "End": True}}}
+    sm_bad = sfn.create_state_machine(name=f"{p}-bad", definition=json.dumps(bad_def), roleArn=role)["stateMachineArn"]
+    ex_bad = sfn.start_execution(stateMachineArn=sm_bad, input='{"items":[{"id":1}]}')["executionArn"]
+    for _ in range(40):
+        db = sfn.describe_execution(executionArn=ex_bad)
+        if db["status"] != "RUNNING":
+            break
+        time.sleep(0.05)
+    assert db["status"] == "FAILED" and db["error"] == "States.Runtime", db
+    sfn.delete_state_machine(stateMachineArn=sm_bad); sfn.delete_state_machine(stateMachineArn=sm)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

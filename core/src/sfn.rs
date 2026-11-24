@@ -1,9 +1,12 @@
 // Step Functions (JSON 1.0) with an Amazon States Language interpreter.
 // Parallel branches and Map items run concurrently (Map honours MaxConcurrency).
-// A failing branch or item stops the rest. ponytail: JSONPath supports $.a.b[0] only; no JSONata,
-// task tokens, activities, Express sync starts or state TimeoutSeconds.
-use crate::{epoch, err, need, ApiErr, App, ACCOUNT, REGION};
+// A failing branch or item stops the rest. JSONPath supports $.a.b[0], [*], [-1], ['key'], and $$ context paths;
+// filter expressions ?(...) are rejected. ponytail: no JSONata, task tokens, activities, Express sync starts or state TimeoutSeconds.
+use crate::{b64, epoch, err, need, unb64, ApiErr, App, ACCOUNT, REGION};
+use md5::Md5;
+use rand::Rng;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 struct Machine {
@@ -45,21 +48,125 @@ fn not_found(kind: &str, a: &str) -> ApiErr {
 
 // ---------- JSONPath / templates ----------
 
-pub fn jget(v: &Value, path: &str) -> Option<Value> {
-    if path == "$" {
+#[derive(Debug)]
+enum Seg {
+    Key(String),
+    Idx(isize),
+    Wild,
+}
+
+fn parse_jpath(path: &str) -> Result<Vec<Seg>, Fail> {
+    let rest = path.strip_prefix('$').ok_or_else(|| fail("States.Runtime", format!("Invalid JSONPath '{path}'")))?;
+    let mut segs = Vec::new();
+    let b = rest.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'.' => {
+                i += 1;
+                if i < b.len() && b[i] == b'.' {
+                    return Err(fail("States.Runtime", format!("Recursive descent '..' is not supported in '{path}'")));
+                }
+                let start = i;
+                while i < b.len() && b[i] != b'.' && b[i] != b'[' {
+                    i += 1;
+                }
+                if i == start {
+                    return Err(fail("States.Runtime", format!("Empty segment in JSONPath '{path}'")));
+                }
+                let key = &rest[start..i];
+                if key == "*" {
+                    segs.push(Seg::Wild);
+                } else {
+                    segs.push(Seg::Key(key.to_string()));
+                }
+            }
+            b'[' => {
+                i += 1;
+                if i >= b.len() {
+                    return Err(fail("States.Runtime", format!("Unclosed '[' in JSONPath '{path}'")));
+                }
+                if rest[i..].starts_with("?(") {
+                    return Err(fail("States.Runtime", format!("JSONPath filter expressions ?(...) are not supported: '{path}'")));
+                }
+                if b[i] == b'\'' || b[i] == b'"' {
+                    let q = b[i];
+                    i += 1;
+                    let mut key = String::new();
+                    while i < b.len() && b[i] != q {
+                        if b[i] == b'\\' && i + 1 < b.len() {
+                            i += 1;
+                        }
+                        key.push(b[i] as char);
+                        i += 1;
+                    }
+                    if i >= b.len() || b[i] != q || i + 1 >= b.len() || b[i + 1] != b']' {
+                        return Err(fail("States.Runtime", format!("Malformed quoted key in JSONPath '{path}'")));
+                    }
+                    i += 2;
+                    segs.push(Seg::Key(key));
+                } else {
+                    let start = i;
+                    while i < b.len() && b[i] != b']' {
+                        i += 1;
+                    }
+                    if i >= b.len() {
+                        return Err(fail("States.Runtime", format!("Unclosed '[' in JSONPath '{path}'")));
+                    }
+                    let inner = rest[start..i].trim();
+                    i += 1;
+                    if inner == "*" {
+                        segs.push(Seg::Wild);
+                    } else if let Ok(idx) = inner.parse::<isize>() {
+                        segs.push(Seg::Idx(idx));
+                    } else {
+                        return Err(fail("States.Runtime", format!("Unsupported bracket expression '[{inner}]' in '{path}'")));
+                    }
+                }
+            }
+            _ => return Err(fail("States.Runtime", format!("Invalid JSONPath '{path}'"))),
+        }
+    }
+    Ok(segs)
+}
+
+fn eval_segs(v: &Value, segs: &[Seg]) -> Option<Value> {
+    let Some((first, tail)) = segs.split_first() else {
         return Some(v.clone());
-    }
-    let mut cur = v;
-    for seg in path.strip_prefix("$.")?.split('.') {
-        let (name, rest) = seg.split_once('[').map_or((seg, ""), |(n, r)| (n, r));
-        if !name.is_empty() {
-            cur = cur.get(name)?;
+    };
+    match first {
+        Seg::Key(k) => eval_segs(v.get(k)?, tail),
+        Seg::Idx(idx) => {
+            let arr = v.as_array()?;
+            let pos = if *idx < 0 { arr.len().checked_add_signed(*idx)? } else { *idx as usize };
+            eval_segs(arr.get(pos)?, tail)
         }
-        for idx in rest.split('[').filter(|s| !s.is_empty()) {
-            cur = cur.get(idx.trim_end_matches(']').parse::<usize>().ok()?)?;
-        }
+        Seg::Wild => match v {
+            Value::Array(arr) => Some(Value::Array(arr.iter().filter_map(|el| eval_segs(el, tail)).collect())),
+            Value::Object(map) => Some(Value::Array(map.values().filter_map(|el| eval_segs(el, tail)).collect())),
+            _ => None,
+        },
     }
-    Some(cur.clone())
+}
+
+fn jget_res(v: &Value, path: &str) -> Result<Option<Value>, Fail> {
+    if path == "$" {
+        return Ok(Some(v.clone()));
+    }
+    let segs = parse_jpath(path)?;
+    Ok(eval_segs(v, &segs))
+}
+
+pub fn jget(v: &Value, path: &str) -> Option<Value> {
+    jget_res(v, path).ok().flatten()
+}
+
+fn jget_ctx_res(input: &Value, ctx: &Value, path: &str) -> Result<Option<Value>, Fail> {
+    if let Some(rest) = path.strip_prefix("$$") {
+        jget_res(ctx, &format!("${rest}"))
+    } else {
+        jget_res(input, path)
+    }
 }
 
 fn jset(mut target: Value, path: &str, val: Value) -> Value {
@@ -79,14 +186,24 @@ fn jset(mut target: Value, path: &str, val: Value) -> Value {
     target
 }
 
-// Split intrinsic arguments on commas outside quotes.
+// Split intrinsic arguments on commas outside quotes, parentheses, and brackets.
 fn args(s: &str) -> Vec<String> {
-    let (mut out, mut cur, mut quoted, mut depth) = (vec![], String::new(), false, 0);
+    let (mut out, mut cur, mut quoted, mut esc, mut depth) = (vec![], String::new(), false, false, 0i32);
     for c in s.chars() {
+        if esc {
+            cur.push(c);
+            esc = false;
+            continue;
+        }
         match c {
+            '\\' if quoted => {
+                cur.push(c);
+                esc = true;
+                continue;
+            }
             '\'' => quoted = !quoted,
-            '(' if !quoted => depth += 1,
-            ')' if !quoted => depth -= 1,
+            '(' | '[' if !quoted => depth += 1,
+            ')' | ']' if !quoted => depth -= 1,
             ',' if !quoted && depth == 0 => {
                 out.push(cur.trim().to_string());
                 cur.clear();
@@ -105,13 +222,13 @@ fn args(s: &str) -> Vec<String> {
 fn value_of(expr: &str, input: &Value, ctx: &Value) -> Result<Value, Fail> {
     let e = expr.trim();
     if let Some(s) = e.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
-        return Ok(Value::String(s.into()));
+        return Ok(Value::String(s.replace("\\'", "'")));
     }
     if let Some(rest) = e.strip_prefix("$$") {
-        return jget(ctx, &format!("${rest}")).ok_or_else(|| fail("States.Runtime", format!("Context path {e} not found")));
+        return jget_res(ctx, &format!("${rest}"))?.ok_or_else(|| fail("States.Runtime", format!("Context path {e} not found")));
     }
     if e.starts_with('$') {
-        return jget(input, e).ok_or_else(|| fail("States.Runtime", format!("The JSONPath '{e}' could not be found in the input")));
+        return jget_res(input, e)?.ok_or_else(|| fail("States.Runtime", format!("The JSONPath '{e}' could not be found in the input")));
     }
     if e.starts_with("States.") {
         return intrinsic(e, input, ctx);
@@ -119,7 +236,36 @@ fn value_of(expr: &str, input: &Value, ctx: &Value) -> Result<Value, Fail> {
     serde_json::from_str(e).map_err(|_| fail("States.Runtime", format!("Invalid argument {e}")))
 }
 
-// ponytail: Format, StringToJson, JsonToString, Array, UUID, MathAdd only.
+fn merge_obj(a: &Map<String, Value>, b: &Map<String, Value>, deep: bool) -> Map<String, Value> {
+    let mut out = a.clone();
+    for (k, v) in b {
+        if deep {
+            if let (Some(Value::Object(oa)), Value::Object(ob)) = (out.get(k), v) {
+                out.insert(k.clone(), Value::Object(merge_obj(oa, ob, true)));
+                continue;
+            }
+        }
+        out.insert(k.clone(), v.clone());
+    }
+    out
+}
+
+fn as_i64(v: Option<&Value>, label: &str) -> Result<i64, Fail> {
+    let v = v.ok_or_else(|| fail("States.Runtime", format!("Missing integer argument: {label}")))?;
+    v.as_i64()
+        .or_else(|| v.as_f64().map(|f| f.round() as i64))
+        .ok_or_else(|| fail("States.Runtime", format!("Expected integer for {label}")))
+}
+
+fn as_arr<'a>(v: Option<&'a Value>, name: &str) -> Result<&'a Vec<Value>, Fail> {
+    v.and_then(Value::as_array).ok_or_else(|| fail("States.Runtime", format!("{name} requires an array argument")))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// ponytail: States.Hash supports MD5, SHA-256, SHA-384, SHA-512 (no SHA-1 crate); other algorithms return States.Runtime.
 fn intrinsic(e: &str, input: &Value, ctx: &Value) -> Result<Value, Fail> {
     let (name, rest) = e.split_once('(').ok_or_else(|| fail("States.Runtime", format!("Bad intrinsic {e}")))?;
     let a: Vec<Value> = args(rest.strip_suffix(')').unwrap_or(rest)).iter().map(|x| value_of(x, input, ctx)).collect::<Result<_, _>>()?;
@@ -138,8 +284,112 @@ fn intrinsic(e: &str, input: &Value, ctx: &Value) -> Result<Value, Fail> {
         "States.StringToJson" => serde_json::from_str(&a.first().map(text).unwrap_or_default()).map_err(|e| fail("States.Runtime", e.to_string()))?,
         "States.JsonToString" => Value::String(a.first().cloned().unwrap_or_default().to_string()),
         "States.Array" => Value::Array(a),
+        "States.ArrayPartition" => {
+            let arr = as_arr(a.first(), name)?;
+            let sz = as_i64(a.get(1), "chunkSize")?;
+            if sz <= 0 {
+                return Err(fail("States.Runtime", "States.ArrayPartition chunkSize must be a positive integer"));
+            }
+            Value::Array(arr.chunks(sz as usize).map(|c| Value::Array(c.to_vec())).collect())
+        }
+        "States.ArrayContains" => {
+            let arr = as_arr(a.first(), name)?;
+            let needle = a.get(1).ok_or_else(|| fail("States.Runtime", "States.ArrayContains requires 2 arguments"))?;
+            Value::Bool(arr.iter().any(|x| x == needle))
+        }
+        "States.ArrayRange" => {
+            let (start, end, step) = (as_i64(a.first(), "start")?, as_i64(a.get(1), "end")?, as_i64(a.get(2), "step")?);
+            if step == 0 {
+                return Err(fail("States.Runtime", "States.ArrayRange step must not be 0"));
+            }
+            let mut out = Vec::new();
+            let mut cur = start;
+            while (step > 0 && cur <= end) || (step < 0 && cur >= end) {
+                if out.len() >= 1000 {
+                    return Err(fail("States.Runtime", "States.ArrayRange exceeds 1000 elements"));
+                }
+                out.push(json!(cur));
+                cur = match cur.checked_add(step) { Some(n) => n, None => break };
+            }
+            Value::Array(out)
+        }
+        "States.ArrayGetItem" => {
+            let arr = as_arr(a.first(), name)?;
+            let idx = as_i64(a.get(1), "index")?;
+            if idx < 0 || (idx as usize) >= arr.len() {
+                return Err(fail("States.Runtime", format!("States.ArrayGetItem index {idx} out of range")));
+            }
+            arr[idx as usize].clone()
+        }
+        "States.ArrayLength" => json!(as_arr(a.first(), name)?.len()),
+        "States.ArrayUnique" => {
+            let arr = as_arr(a.first(), name)?;
+            let mut out = Vec::new();
+            for item in arr {
+                if !out.contains(item) {
+                    out.push(item.clone());
+                }
+            }
+            Value::Array(out)
+        }
+        "States.Base64Encode" => {
+            let s = a.first().and_then(Value::as_str).ok_or_else(|| fail("States.Runtime", "States.Base64Encode requires a string"))?;
+            Value::String(b64(s.as_bytes()))
+        }
+        "States.Base64Decode" => {
+            let s = a.first().and_then(Value::as_str).ok_or_else(|| fail("States.Runtime", "States.Base64Decode requires a string"))?;
+            let bytes = unb64(s).ok_or_else(|| fail("States.Runtime", "States.Base64Decode invalid base64"))?;
+            Value::String(String::from_utf8(bytes).map_err(|e| fail("States.Runtime", format!("States.Base64Decode invalid UTF-8: {e}")))?)
+        }
+        "States.Hash" => {
+            let data = a.first().and_then(Value::as_str).ok_or_else(|| fail("States.Runtime", "States.Hash data must be a string"))?;
+            let algo = a.get(1).and_then(Value::as_str).ok_or_else(|| fail("States.Runtime", "States.Hash algorithm must be a string"))?;
+            let digest = match algo {
+                "MD5" => hex_lower(&Md5::digest(data.as_bytes())),
+                "SHA-256" => hex_lower(&Sha256::digest(data.as_bytes())),
+                "SHA-384" => hex_lower(&Sha384::digest(data.as_bytes())),
+                "SHA-512" => hex_lower(&Sha512::digest(data.as_bytes())),
+                _ => return Err(fail("States.Runtime", format!("Unsupported hash algorithm {algo}"))),
+            };
+            Value::String(digest)
+        }
+        "States.StringSplit" => {
+            let s = a.first().and_then(Value::as_str).ok_or_else(|| fail("States.Runtime", "States.StringSplit requires a string"))?;
+            let delim = a.get(1).and_then(Value::as_str).ok_or_else(|| fail("States.Runtime", "States.StringSplit requires a delimiter string"))?;
+            let parts: Vec<Value> = if delim.is_empty() {
+                s.split_whitespace().map(|p| Value::String(p.into())).collect()
+            } else {
+                s.split(|c: char| delim.contains(c)).filter(|p| !p.is_empty()).map(|p| Value::String(p.into())).collect()
+            };
+            Value::Array(parts)
+        }
+        "States.JsonMerge" => {
+            let o1 = a.first().and_then(Value::as_object).ok_or_else(|| fail("States.Runtime", "States.JsonMerge first argument must be an object"))?;
+            let o2 = a.get(1).and_then(Value::as_object).ok_or_else(|| fail("States.Runtime", "States.JsonMerge second argument must be an object"))?;
+            let deep = a.get(2).and_then(Value::as_bool).ok_or_else(|| fail("States.Runtime", "States.JsonMerge third argument must be a boolean"))?;
+            Value::Object(merge_obj(o1, o2, deep))
+        }
+        "States.MathRandom" => {
+            let (start, end) = (as_i64(a.first(), "start")?, as_i64(a.get(1), "end")?);
+            if start >= end {
+                return Err(fail("States.Runtime", "States.MathRandom start must be less than end"));
+            }
+            let span = (end - start) as u64;
+            let n = if let Some(seed) = a.get(2) {
+                let s = as_i64(Some(seed), "seed")? as u64;
+                // Deterministic LCG step when an explicit seed is supplied.
+                let mixed = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) >> 17;
+                start + (mixed % span) as i64
+            } else {
+                rand::thread_rng().gen_range(start..end)
+            };
+            json!(n)
+        }
         "States.UUID" => Value::String(uuid::Uuid::new_v4().to_string()),
-        "States.MathAdd" => json!(a.iter().filter_map(Value::as_f64).sum::<f64>()),
+        "States.MathAdd" => {
+            let sum: f64 = a.iter().filter_map(Value::as_f64).sum();
+            if sum.fract() == 0.0 && a.iter().all(|v| v.is_i64()) { json!(sum as i64) } else { json!(sum) }
+        }
         _ => return Err(fail("States.Runtime", format!("Unsupported intrinsic {name}"))),
     })
 }
@@ -162,30 +412,30 @@ fn template(t: &Value, input: &Value, ctx: &Value) -> Result<Value, Fail> {
     })
 }
 
-fn path_or(v: &Value, p: &Value) -> Result<Value, Fail> {
+fn path_or(v: &Value, ctx: &Value, p: &Value) -> Result<Value, Fail> {
     match p {
         Value::Null => Ok(json!({})), // explicit null discards
-        Value::String(s) => jget(v, s).ok_or_else(|| fail("States.Runtime", format!("Invalid path '{s}'"))),
+        Value::String(s) => jget_ctx_res(v, ctx, s)?.ok_or_else(|| fail("States.Runtime", format!("Invalid path '{s}'"))),
         _ => Ok(v.clone()),
     }
 }
 
 // ---------- Choice ----------
 
-fn choice_ok(rule: &Value, input: &Value) -> bool {
+fn choice_ok(rule: &Value, input: &Value, ctx: &Value) -> bool {
     if let Some(a) = rule["And"].as_array() {
-        return a.iter().all(|r| choice_ok(r, input));
+        return a.iter().all(|r| choice_ok(r, input, ctx));
     }
     if let Some(a) = rule["Or"].as_array() {
-        return a.iter().any(|r| choice_ok(r, input));
+        return a.iter().any(|r| choice_ok(r, input, ctx));
     }
     if rule.get("Not").is_some() {
-        return !choice_ok(&rule["Not"], input);
+        return !choice_ok(&rule["Not"], input, ctx);
     }
-    let var = rule["Variable"].as_str().and_then(|p| jget(input, p));
+    let var = rule["Variable"].as_str().and_then(|p| jget_ctx_res(input, ctx, p).ok().flatten());
     rule.as_object().into_iter().flatten().filter(|(k, _)| *k != "Variable" && *k != "Next").all(|(k, want)| {
         let (op, want) = match k.strip_suffix("Path") {
-            Some(op) if k != "IsPresent" => (op, want.as_str().and_then(|p| jget(input, p)).unwrap_or(Value::Null)),
+            Some(op) if k != "IsPresent" => (op, want.as_str().and_then(|p| jget_ctx_res(input, ctx, p).ok().flatten()).unwrap_or(Value::Null)),
             _ => (k.as_str(), want.clone()),
         };
         match op {
@@ -303,20 +553,20 @@ fn run_states<'a>(app: &'a Arc<App>, exec: &'a str, def: &'a Value, input: Value
                 crate::emit(app, json!({"ts": chrono::Utc::now().to_rfc3339(), "service": "states", "op": "StateEntered", "target": cur, "type": ty, "status": 200,
                                         "execution": exec.rsplit(':').next()}));
             }
-            let eff = path_or(&data, st.get("InputPath").unwrap_or(&json!("$")))?;
+            let eff = path_or(&data, &sctx, st.get("InputPath").unwrap_or(&json!("$")))?;
             let params = |v: &Value| st.get("Parameters").map_or(Ok(v.clone()), |p| template(p, v, &sctx));
 
             if ty == "Choice" {
-                let next = st["Choices"].as_array().into_iter().flatten().find(|c| choice_ok(c, &eff)).and_then(|c| c["Next"].as_str())
+                let next = st["Choices"].as_array().into_iter().flatten().find(|c| choice_ok(c, &eff, &sctx)).and_then(|c| c["Next"].as_str())
                     .or(st["Default"].as_str()).ok_or_else(|| fail("States.NoChoiceMatched", format!("No Choices matched in state {cur}")))?;
-                data = path_or(&eff, st.get("OutputPath").unwrap_or(&json!("$")))?;
+                data = path_or(&eff, &sctx, st.get("OutputPath").unwrap_or(&json!("$")))?;
                 record(app, exec, "ChoiceStateExited", json!({"name": cur, "output": data.to_string()}));
                 (cur, attempts) = (next.to_string(), BTreeMap::new());
                 continue;
             }
             let result: Result<Value, Fail> = match ty {
                 "Pass" => match st.get("Result") { Some(r) => Ok(r.clone()), None => params(&eff) },
-                "Succeed" => return path_or(&eff, st.get("OutputPath").unwrap_or(&json!("$"))),
+                "Succeed" => return path_or(&eff, &sctx, st.get("OutputPath").unwrap_or(&json!("$"))),
                 "Fail" => return Err(fail(st["Error"].as_str().unwrap_or("States.Fail"), st["Cause"].as_str().unwrap_or(""))),
                 "Wait" => {
                     let ts = st["Timestamp"].as_str().map(String::from)
@@ -341,29 +591,36 @@ fn run_states<'a>(app: &'a Arc<App>, exec: &'a str, def: &'a Value, input: Value
                     Err(e) => Err(e),
                 },
                 "Map" => {
-                    let items = st["ItemsPath"].as_str().map_or(Some(eff.clone()), |p| jget(&eff, p));
+                    let items_res = match st["ItemsPath"].as_str() {
+                        Some(p) => jget_ctx_res(&eff, &sctx, p),
+                        None => Ok(Some(eff.clone())),
+                    };
                     let proc_def = st.get("ItemProcessor").or(st.get("Iterator")).cloned().unwrap_or_default();
-                    match items.as_ref().and_then(Value::as_array) {
-                        None => Err(fail("States.Runtime", "Map ItemsPath did not select an array")),
-                        Some(items) => {
-                            let sel = st.get("ItemSelector").or(st.get("Parameters"));
-                            let inputs: Result<Vec<Value>, Fail> = items.iter().enumerate().map(|(i, item)| {
-                                let mut mctx = sctx.clone();
-                                mctx["Map"] = json!({"Item": {"Index": i, "Value": item}});
-                                sel.map_or(Ok(item.clone()), |s| template(s, &eff, &mctx))
-                            }).collect();
-                            match inputs {
-                                Err(e) => Err(e),
-                                // Items run concurrently up to MaxConcurrency (0 or absent = no limit); results keep item order.
-                                Ok(inputs) => {
-                                    let limit = st["MaxConcurrency"].as_u64().filter(|n| *n > 0).map_or(inputs.len().max(1), |n| n as usize);
-                                    let runs = inputs.into_iter().map(|v| run_states(app, exec, &proc_def, v, ctx.clone()));
-                                    use futures_util::{StreamExt, TryStreamExt};
-                                    // A failing item stops the Map: remaining items are not started and running ones are dropped.
-                                    futures_util::stream::iter(runs).buffered(limit).try_collect::<Vec<_>>().await.map(Value::Array)
+                    match items_res {
+                        Err(e) => Err(e),
+                        Ok(items) => match items.as_ref().and_then(Value::as_array) {
+                            None => Err(fail("States.Runtime", "Map ItemsPath did not select an array")),
+                            Some(items) => {
+                                let sel = st.get("ItemSelector").or(st.get("Parameters"));
+                                let inputs: Result<Vec<(Value, Value)>, Fail> = items.iter().enumerate().map(|(i, item)| {
+                                    let mut mctx = sctx.clone();
+                                    mctx["Map"] = json!({"Item": {"Index": i, "Value": item}});
+                                    let v = sel.map_or(Ok(item.clone()), |s| template(s, &eff, &mctx))?;
+                                    Ok((v, mctx))
+                                }).collect();
+                                match inputs {
+                                    Err(e) => Err(e),
+                                    // Items run concurrently up to MaxConcurrency (0 or absent = no limit); results keep item order.
+                                    Ok(inputs) => {
+                                        let limit = st["MaxConcurrency"].as_u64().filter(|n| *n > 0).map_or(inputs.len().max(1), |n| n as usize);
+                                        let runs = inputs.into_iter().map(|(v, mctx)| run_states(app, exec, &proc_def, v, mctx));
+                                        use futures_util::{StreamExt, TryStreamExt};
+                                        // A failing item stops the Map: remaining items are not started and running ones are dropped.
+                                        futures_util::stream::iter(runs).buffered(limit).try_collect::<Vec<_>>().await.map(Value::Array)
+                                    }
                                 }
                             }
-                        }
+                        },
                     }
                 }
                 other => Err(fail("States.Runtime", format!("Unsupported state type {other}"))),
@@ -376,7 +633,7 @@ fn run_states<'a>(app: &'a Arc<App>, exec: &'a str, def: &'a Value, input: Value
                         Some(Value::String(p)) => jset(data, p, r),
                         _ => r,
                     };
-                    data = path_or(&data, st.get("OutputPath").unwrap_or(&json!("$")))?;
+                    data = path_or(&data, &sctx, st.get("OutputPath").unwrap_or(&json!("$")))?;
                     record(app, exec, &format!("{ty}StateExited"), json!({"name": cur, "output": data.to_string()}));
                     if st["End"] == true {
                         return Ok(data);
@@ -581,7 +838,53 @@ mod tests {
         assert_eq!(jset(v.clone(), "$.r.s", json!(5))["r"]["s"], 5);
         let t = json!({"msg.$": "States.Format('n={} c={}', $.n, $.a.b[1].c)", "fixed": 1, "all.$": "$.n"});
         assert_eq!(template(&t, &v, &json!({})).unwrap(), json!({"msg": "n=2 c=x", "fixed": 1, "all": 2}));
-        assert!(choice_ok(&json!({"And": [{"Variable": "$.n", "NumericGreaterThan": 1}, {"Variable": "$.a.b[1].c", "StringEquals": "x"}]}), &v));
-        assert!(!choice_ok(&json!({"Variable": "$.missing", "IsPresent": true}), &v));
+        assert!(choice_ok(&json!({"And": [{"Variable": "$.n", "NumericGreaterThan": 1}, {"Variable": "$.a.b[1].c", "StringEquals": "x"}]}), &v, &json!({})));
+        assert!(!choice_ok(&json!({"Variable": "$.missing", "IsPresent": true}), &v, &json!({})));
+    }
+
+    #[test]
+    fn jsonpath_extended_and_context() {
+        let v = json!({"items": [{"id": 1}, {"id": 2}, {"id": 3}], "a.b": {"c d": 99}});
+        let ctx = json!({"Execution": {"Id": "exec-1"}, "State": {"Name": "Run"}, "Map": {"Item": {"Index": 2, "Value": "z"}}});
+        assert_eq!(jget(&v, "$.items[*].id"), Some(json!([1, 2, 3])));
+        assert_eq!(jget(&v, "$.items[-1].id"), Some(json!(3)));
+        assert_eq!(jget(&v, "$.items[-3].id"), Some(json!(1)));
+        assert_eq!(jget(&v, "$['a.b']['c d']"), Some(json!(99)));
+        assert_eq!(value_of("$$.Execution.Id", &v, &ctx).unwrap(), json!("exec-1"));
+        assert_eq!(value_of("$$.State.Name", &v, &ctx).unwrap(), json!("Run"));
+        assert_eq!(value_of("$$.Map.Item.Value", &v, &ctx).unwrap(), json!("z"));
+        // Filter expressions ?(...) must be rejected with a clear error
+        assert!(jget_res(&v, "$.items[?(@.id > 1)]").is_err());
+        assert!(value_of("$.items[?(@.id > 1)]", &v, &ctx).is_err());
+    }
+
+    #[test]
+    fn intrinsics_all_day5() {
+        let inp = json!({"arr": [1, 2, 2, 3, 4], "s": "hello", "csv": "a,b;c,,d", "o1": {"a": 1, "b": {"x": 1}}, "o2": {"b": {"y": 2}, "c": 3}});
+        let ev = |e: &str| value_of(e, &inp, &json!({}));
+        assert_eq!(ev("States.ArrayPartition($.arr, 2)").unwrap(), json!([[1, 2], [2, 3], [4]]));
+        assert!(ev("States.ArrayPartition($.arr, 0)").is_err());
+        assert_eq!(ev("States.ArrayContains($.arr, 3)").unwrap(), json!(true));
+        assert_eq!(ev("States.ArrayContains($.arr, 9)").unwrap(), json!(false));
+        assert_eq!(ev("States.ArrayRange(1, 5, 2)").unwrap(), json!([1, 3, 5]));
+        assert_eq!(ev("States.ArrayRange(5, 1, -2)").unwrap(), json!([5, 3, 1]));
+        assert!(ev("States.ArrayRange(1, 5, 0)").is_err());
+        assert_eq!(ev("States.ArrayGetItem($.arr, 3)").unwrap(), json!(3));
+        assert!(ev("States.ArrayGetItem($.arr, 99)").is_err());
+        assert_eq!(ev("States.ArrayLength($.arr)").unwrap(), json!(5));
+        assert_eq!(ev("States.ArrayUnique($.arr)").unwrap(), json!([1, 2, 3, 4]));
+        assert_eq!(ev("States.Base64Encode($.s)").unwrap(), json!("aGVsbG8="));
+        assert_eq!(ev("States.Base64Decode('aGVsbG8=')").unwrap(), json!("hello"));
+        assert!(ev("States.Base64Decode('!!!')").is_err());
+        assert_eq!(ev("States.Hash('hello', 'SHA-256')").unwrap(), json!("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"));
+        assert_eq!(ev("States.Hash('hello', 'MD5')").unwrap(), json!("5d41402abc4b2a76b9719d911017c592"));
+        assert!(ev("States.Hash('hello', 'SHA-1')").is_err());
+        assert_eq!(ev("States.StringSplit($.csv, ',;')").unwrap(), json!(["a", "b", "c", "d"]));
+        assert_eq!(ev("States.JsonMerge($.o1, $.o2, false)").unwrap(), json!({"a": 1, "b": {"y": 2}, "c": 3}));
+        assert_eq!(ev("States.JsonMerge($.o1, $.o2, true)").unwrap(), json!({"a": 1, "b": {"x": 1, "y": 2}, "c": 3}));
+        let r1 = ev("States.MathRandom(1, 100, 42)").unwrap().as_i64().unwrap();
+        let r2 = ev("States.MathRandom(1, 100, 42)").unwrap().as_i64().unwrap();
+        assert!(r1 == r2 && (1..100).contains(&r1));
+        assert!(ev("States.MathRandom(10, 10)").is_err());
     }
 }
