@@ -96,7 +96,7 @@ All options can be set via environment variables or a `KEY=VALUE` file pointed t
 | **Secrets Manager** | Create/Get/Put/Update/Describe/List/Delete/RestoreSecret, version stages, `GetRandomPassword` |
 | **SSM** | Parameter Store: Put/Get/GetParameters(ByPath)/Delete/DescribeParameters, `SecureString` |
 | **KMS** | Keys, aliases, Encrypt/Decrypt with encryption context, `GenerateDataKey`, enable/disable, scheduled deletion *(local obfuscation only, not real cryptography)* |
-| **CloudWatch Logs** | Log groups, streams, `PutLogEvents`, `GetLogEvents`, `FilterLogEvents` (plain terms), retention |
+| **CloudWatch Logs** | Log groups, streams, `PutLogEvents`, `GetLogEvents`, `FilterLogEvents` (plain terms, `?OR` lists, JSON `{ $.a = "x" $.n != 2 }` patterns), retention |
 | **Lambda** | `python*` / `nodejs*` functions run as local processes; `Invoke` (sync, Event, DryRun, log tail), timeouts, errors, env vars, execution-role credentials, versions (`PublishVersion`) and aliases (`fn:alias` / `Qualifier`), SQS and Kinesis event source mappings (Kinesis: per-shard order, `TRIM_HORIZON`/`LATEST`, `MaximumRetryAttempts`), logs to CloudWatch Logs |
 | **EventBridge** | Buses, rules (event patterns incl. prefix/numeric/exists/anything-but, `rate()`/`cron()` schedules in UTC), SQS/SNS/Lambda targets, `Input`/`InputPath`/`InputTransformer` |
 | **Step Functions** | ASL interpreter: Pass, Task (`lambda:invoke`, `sqs:sendMessage`, `sns:publish`, `dynamodb:*`), Choice, Wait, Succeed, Fail, Parallel, Map, Retry/Catch, Parameters/ResultSelector/ResultPath/OutputPath, intrinsics (`Format`, `StringToJson`, `JsonToString`, `Array`, `UUID`, `MathAdd`), execution history, `StopExecution` |

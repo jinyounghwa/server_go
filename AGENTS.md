@@ -1,4 +1,4 @@
-# rocalcloud — 인수인계 지침 (2026-11-22)
+# rocalcloud — 인수인계 지침 (2026-11-25)
 
 다음 작업자(모델)가 바로 이어서 코딩할 수 있도록 현재 상태, 규칙, 남은 일을 정리한 문서다.
 **2026-11-25~27 임시 작업자는 `HANDOFF.md`(3일 계획 2차)를 먼저 본다.** 계획 원본은 `local-cloud-emulator-plan.md`. 이 문서와 충돌하면 계획서가 목표, 이 문서가 현재 사실이다.
@@ -19,6 +19,7 @@
 - 2026-11-23 추가8: Route53 라우팅 정책 — 가중치(무작위, 0은 당첨 안 됨)·페일오버(PRIMARY 우선)·지연시간(첫 세트; 클라이언트 리전을 모름). 레코드 세트 정체성이 (이름·타입·SetIdentifier)로 확장, List에 정책 속성 표시.
 - 2026-11-23 추가9: CloudWatch Logs 필터 패턴(`?OR` 리스트, JSON `{ $.a.b = "x" $.n != 2 }`, `*` 존재 체크) + 미검증 경계 경로 테스트(`test_handoff_edge_paths`: Kinesis→Lambda 재시도·건너뛰기, SNS/EB→Lambda 별칭 버전, S3/EB→SQS 큐 정책 Deny, `cron_next` 월말·윤년·요일·과거연도 단위 테스트). boto3 테스트 33개.
 - `v0.1.0` 릴리스 완료(2026-11-21): 바이너리 3종 + SHA256SUMS, Homebrew sha256 반영.
+- `v0.1.5` 릴리스(2026-11-25): EventBridge `cron()`·InputTransformer, Kinesis→Lambda 매핑, DynamoDB 중첩 경로, Lambda 버전·별칭, IAM 조건 연산자(Numeric·Date·IpAddress·한정자), `STRICT_DELIVERY=1`, SNS 필터 numeric·suffix, SigV4 시계 오차, STS 만료, Kinesis 리샤딩, S3 알림 대상 검증, Route53 라우팅 정책, Logs 필터 패턴. 우분투 전체 검증(스위트 두 모드) 통과 뒤 태그. Homebrew는 태그 뒤 반영.
 - `v0.1.4` 릴리스(2026-11-22): ALB 요청별 규칙 라우팅, aws-chunked 트레일러 서명 검증, SNS·EventBridge·S3 배달의 대상 정책 판정(서비스 주체). Homebrew 0.1.4.
 - `v0.1.3` 릴리스 완료(2026-11-21): SNS·Lambda 리소스 정책, ALB 리스너 규칙, aws-chunked 서명 검증. release.yml도 Node 24 액션으로. Homebrew 0.1.3.
 - `v0.1.2` 릴리스 완료(2026-11-21): 버킷·큐 정책, SQS 메시지 속성, Step Functions 동시 실행. Homebrew 0.1.2.
@@ -36,7 +37,7 @@ core/            Rust 단일 바이너리 (axum + tokio), 모든 서비스가 �
   src/<svc>.rs   서비스별 모듈. 상태 struct + handle() + admin()
   src/ui.html    관리 GUI (/_ui), town.html 캐릭터 마을 (/_town) — include_str!로 내장
 gui/             Tauri 2 창. /_ui를 여는 껍데기일 뿐
-tests/sdk_test.py  boto3 호환성 테스트 28개 (주 통합 테스트), tests/js·tests/rust는 JS v3·Rust SDK 스위트
+tests/sdk_test.py  boto3 호환성 테스트 33개 (주 통합 테스트), tests/js·tests/rust는 JS v3(5개)·Rust SDK(4개) 스위트
 netlify.toml     예전 Netlify 설정(지금은 GitHub Pages `pages.yml`로 배포)
 ```
 
@@ -126,7 +127,7 @@ SQS 메시지 속성, Step Functions 동시 실행·실패 중단, ALB 경로·�
 3D 마을 브라우저·휴대폰 점검)은 모두 끝났다. 남은 한계는 각 파일의 `ponytail:` 주석(`grep -rn ponytail core/src`)이 목록이다.
 
 1. **실기기 점검**(사용자 도움 필요): 실제 휴대폰·실제 Safari·GPU가 약한 노트북에서 Pages 마을을 연다. 지금까지는 우분투 Playwright 에뮬레이션만 했다.
-   연대기 섬 숫자(SDK 테스트 32/5/4개, 시나리오 21개, GPU 65°C)는 `town.html` 12절에 손으로 적은 값이니 바뀌면 같이 고친다.
+   연대기 섬 숫자(SDK 테스트 33/5/4개, 시나리오 21개, GPU 65°C)는 `town.html` 12절에 손으로 적은 값이니 바뀌면 같이 고친다.
 2. ~~EventBridge `cron()`(UTC, L·W·#은 거부)·InputTransformer·InputPath `[0]`~~ 완료(2026-11-22).
 3. ~~Kinesis → Lambda 이벤트 소스 매핑~~ 완료(2026-11-22, `lambda.rs` `poll_kinesis`: 샤드별 순서, 실패 배치는 재시도하며 샤드를 막고 `MaximumRetryAttempts` 뒤 건너뜀).
 4. ~~DynamoDB 경로 `a.b[0]`~~ 완료(2026-11-22): 업데이트(SET 끝 너머는 추가, REMOVE는 원래 인덱스 기준)·조건·프로젝션(중첩 경로 유지).
