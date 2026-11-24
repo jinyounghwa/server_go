@@ -1968,7 +1968,7 @@ const pans = [-3.4, 3.4].map(px => { const p = new THREE.Group(); p.position.x =
 pans[0].add(mkBox(1.2, 1.2, 1.2, mStd({ color: 0x3b82f6, emissive: 0x1d4ed8, emissiveIntensity: 0.3 }), 0, -1.05, 0));
 pans[1].add(mkBox(0.5, 0.5, 0.5, mStd({ color: 0x93c5fd }), 0, -1.4, 0));
 
-landmark("sdk", "SDK 호환성 경기장", "boto3 33 · JS v3 · Rust", "#fbbf24", -16, 156, "공식 SDK 3종(Python boto3 33개, JS @aws-sdk v3, Rust aws-sdk)으로 기본·서명 검증 두 모드를 CI가 매번 돌립니다. 전광판은 이 마을이 받은 실제 요청 수입니다.", 20, 7, 20, 7.8);
+landmark("sdk", "SDK 호환성 경기장", "boto3 34 · JS v3 · Rust", "#fbbf24", -16, 156, "공식 SDK 3종(Python boto3 34개, JS @aws-sdk v3, Rust aws-sdk)으로 기본·서명 검증 두 모드를 CI가 매번 돌립니다. 전광판은 이 마을이 받은 실제 요청 수입니다.", 20, 7, 20, 7.8);
 {
   const pts = [[6.2, 0], [10, 0], [10, 3.4], [9.5, 3.4], [6.2, 0.6]].map(([x, y]) => new THREE.Vector2(x, y));
   hp("matte", new THREE.LatheGeometry(pts, 48), 0xd1d5db, -16, 0.05, 156);

@@ -249,6 +249,11 @@ impl Events {
     fn bus_ok(&self, bus: &str) -> Result<(), ApiErr> {
         if bus == "default" || self.buses.contains(bus) { Ok(()) } else { Err(err("ResourceNotFoundException", format!("Event bus {bus} does not exist."))) }
     }
+
+    // Whether a bus ARN's name is a real bus here (used by Lambda destination validation).
+    pub fn bus_exists(&self, bus: &str) -> bool {
+        self.bus_ok(bus).is_ok()
+    }
     fn rule_json(bus: &str, name: &str, r: &Rule) -> Value {
         let mut v = json!({"Name": name, "Arn": rule_arn(bus, name), "State": if r.enabled { "ENABLED" } else { "DISABLED" },
                            "Description": r.desc, "EventBusName": bus});

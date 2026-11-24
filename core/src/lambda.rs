@@ -17,6 +17,14 @@ use tokio::{io::AsyncWriteExt, process::Command, sync::Semaphore};
 // ponytail: at most 8 function processes at once, to stay inside the host's CPU budget.
 static SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(8));
 
+#[derive(Clone, Default)]
+pub struct InvokeConfig {
+    retries: Option<i64>,       // MaximumRetryAttempts (0..2, default 2 for async invokes)
+    age: Option<i64>,           // MaximumEventAgeInSeconds
+    on_success: Option<String>, // DestinationConfig ARNs
+    on_failure: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct Func {
     arn: String,
@@ -35,6 +43,7 @@ pub struct Func {
     version: String,   // "$LATEST" or the published number
     versions: Vec<Func>, // published snapshots; version n is versions[n - 1]
     aliases: BTreeMap<String, (String, String)>, // alias -> (version, description)
+    icfg: InvokeConfig, // per-function (not per-qualifier) async invoke config: retries, age, destinations
 }
 pub struct Mapping {
     source: String,
@@ -44,6 +53,8 @@ pub struct Mapping {
     modified: f64,
     start: Option<String>, // Kinesis StartingPosition
     retries: i64,          // Kinesis MaximumRetryAttempts (-1 = until it succeeds)
+    bisect: bool,          // Kinesis BisectBatchOnFunctionError
+    fail_dest: Option<String>, // Kinesis DestinationConfig.OnFailure.Arn (SQS or SNS)
 }
 
 #[derive(Default)]
@@ -106,6 +117,20 @@ fn mapping_json(id: &str, m: &Mapping) -> Value {
     if let Some(s) = &m.start {
         v["StartingPosition"] = s.clone().into();
         v["MaximumRetryAttempts"] = m.retries.into();
+        v["BisectBatchOnFunctionError"] = m.bisect.into();
+        if let Some(d) = &m.fail_dest {
+            v["DestinationConfig"] = json!({"OnFailure": {"Destination": d}});
+        }
+    }
+    v
+}
+
+fn icfg_json(n: &str, c: &InvokeConfig) -> Value {
+    let mut v = json!({"FunctionArn": arn(n), "LastModified": modified_now(),
+        "MaximumRetryAttempts": c.retries.unwrap_or(2), "MaximumEventAgeInSeconds": c.age.unwrap_or(21600)});
+    let dest = |a: &Option<String>| a.as_ref().map_or(json!({}), |s| json!({"Destination": s}));
+    if c.on_success.is_some() || c.on_failure.is_some() {
+        v["DestinationConfig"] = json!({"OnSuccess": dest(&c.on_success), "OnFailure": dest(&c.on_failure)});
     }
     v
 }
@@ -268,6 +293,10 @@ pub fn op_of(method: &str, path: &str) -> &'static str {
         ("DELETE", ["functions", _, "aliases", _]) => "DeleteAlias",
         ("GET", ["functions", _, "policy"]) => "GetPolicy",
         ("DELETE", ["functions", _, "policy", _]) => "RemovePermission",
+        ("PUT", ["functions", _, "event-invoke-config"]) => "PutFunctionEventInvokeConfig",
+        ("GET", ["functions", _, "event-invoke-config"]) => "GetFunctionEventInvokeConfig",
+        ("POST", ["functions", _, "event-invoke-config"]) => "UpdateFunctionEventInvokeConfig", // botocore sends POST for the PATCH-shaped op
+        ("DELETE", ["functions", _, "event-invoke-config"]) => "DeleteFunctionEventInvokeConfig",
         ("POST", ["event-source-mappings"]) => "CreateEventSourceMapping",
         ("GET", ["event-source-mappings"]) => "ListEventSourceMappings",
         ("GET", ["event-source-mappings", _]) => "GetEventSourceMapping",
@@ -308,6 +337,10 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
     let parts: Vec<String> = path.trim_matches('/').split('/').map(crate::s3::pct_decode).collect();
     let seg = |i: usize| parts.get(i).cloned().unwrap_or_default();
     let qual = q.get("Qualifier").cloned().or_else(|| split_qualifier(&seg(1)).1);
+    // Destinations (and mapping OnFailure targets) must exist when saved, like S3 notification targets.
+    if let Err(e) = check_dest_arns(app, op, &j) {
+        return error_reply(e);
+    }
     if op == "Invoke" {
         let event: Value = if body.is_empty() { json!({}) } else { serde_json::from_slice(body).unwrap_or(Value::String(String::from_utf8_lossy(body).into())) };
         let kind = h.get("x-amz-invocation-type").and_then(|v| v.to_str().ok()).unwrap_or("RequestResponse");
@@ -317,8 +350,9 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
         match kind {
             "DryRun" => return Response::builder().status(204).body(Body::empty()).unwrap(),
             "Event" => {
+                let icfg = app.lambda.lock().unwrap().resolve(&name, qual.as_deref()).ok().map(|f| f.icfg).unwrap_or_default();
                 let (app, name) = (app.clone(), qual.as_ref().map_or(name.clone(), |q| format!("{name}:{q}")));
-                tokio::spawn(async move { invoke_logged(&app, &name, event, "async").await });
+                tokio::spawn(async move { invoke_async(app, &name, event, icfg).await });
                 return Response::builder().status(202).body(Body::empty()).unwrap();
             }
             _ => {}
@@ -354,7 +388,7 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
                     timeout: j["Timeout"].as_u64().unwrap_or(3), memory: j["MemorySize"].as_u64().unwrap_or(128),
                     env: j["Environment"]["Variables"].as_object().cloned().unwrap_or_default(),
                     description: j["Description"].as_str().unwrap_or("").into(), dir, size, sha, modified: modified_now(), perms: vec![],
-                    version: "$LATEST".into(), versions: vec![], aliases: BTreeMap::new(),
+                    version: "$LATEST".into(), versions: vec![], aliases: BTreeMap::new(), icfg: InvokeConfig::default(),
                 };
                 let out = config(&n, &f);
                 st.f.insert(n, f);
@@ -498,6 +532,42 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
                 }
                 (204, json!({}))
             }
+            "PutFunctionEventInvokeConfig" | "UpdateFunctionEventInvokeConfig" => {
+                // Stored per function, not per qualifier (ponytail: no version/alias-specific invoke configs).
+                let f = st.f.get_mut(&name).ok_or_else(|| not_found(&name))?;
+                let mut c = if op == "PutFunctionEventInvokeConfig" { InvokeConfig::default() } else { f.icfg.clone() };
+                if let Some(v) = j["MaximumRetryAttempts"].as_i64() {
+                    if !(0..=2).contains(&v) {
+                        return Err(err("InvalidParameterValueException", "MaximumRetryAttempts must be between 0 and 2"));
+                    }
+                    c.retries = Some(v);
+                }
+                if let Some(v) = j["MaximumEventAgeInSeconds"].as_i64() {
+                    if !(60..=21600).contains(&v) {
+                        return Err(err("InvalidParameterValueException", "MaximumEventAgeInSeconds must be between 60 and 21600"));
+                    }
+                    c.age = Some(v);
+                }
+                if let Some(d) = j["DestinationConfig"].as_object() {
+                    if d.contains_key("OnSuccess") {
+                        c.on_success = d["OnSuccess"]["Destination"].as_str().map(String::from);
+                    }
+                    if d.contains_key("OnFailure") {
+                        c.on_failure = d["OnFailure"]["Destination"].as_str().map(String::from);
+                    }
+                }
+                f.icfg = c.clone();
+                (200, icfg_json(&name, &c))
+            }
+            "GetFunctionEventInvokeConfig" => {
+                let f = st.f.get(&name).ok_or_else(|| not_found(&name))?;
+                (200, icfg_json(&name, &f.icfg))
+            }
+            "DeleteFunctionEventInvokeConfig" => {
+                let f = st.f.get_mut(&name).ok_or_else(|| not_found(&name))?;
+                f.icfg = InvokeConfig::default();
+                (204, json!({}))
+            }
             "CreateEventSourceMapping" => {
                 let fname = name_of(crate::need(&j, "FunctionName")?);
                 st.f.get(&fname).ok_or_else(|| not_found(&fname))?;
@@ -522,8 +592,10 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
                     return Err(bad("MaximumRetryAttempts must be between -1 and 10000"));
                 }
                 let id = uuid::Uuid::new_v4().to_string();
+                let bisect = kinesis && j["BisectBatchOnFunctionError"].as_bool().unwrap_or(false);
+                let fail_dest = j["DestinationConfig"]["OnFailure"]["Destination"].as_str().map(String::from);
                 let m = Mapping { source: src, function: fname, batch: j["BatchSize"].as_u64().unwrap_or(dflt).clamp(1, max), enabled: j["Enabled"].as_bool().unwrap_or(true),
-                                  modified: crate::epoch(), start: start.filter(|_| kinesis), retries };
+                                  modified: crate::epoch(), start: start.filter(|_| kinesis), retries, bisect, fail_dest };
                 let out = mapping_json(&id, &m);
                 st.maps.insert(id.clone(), m);
                 let app = app.clone();
@@ -564,11 +636,95 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
 
 // Invoke and report the outcome as an event (used by async invokes, SNS and SQS triggers).
 pub async fn invoke_logged(app: &Arc<App>, name: &str, event: Value, source: &str) -> bool {
+    invoke_ev(app, name, event, source).await.0
+}
+
+// Invoke, emit the request event, and return (ok, error message).
+async fn invoke_ev(app: &Arc<App>, name: &str, event: Value, source: &str) -> (bool, Option<String>) {
     let r = invoke(app, name, event).await;
     let ok = matches!(&r, Ok(i) if i.error.is_none());
+    let msg = r.ok().and_then(|i| i.error.and_then(|_| i.payload["errorMessage"].as_str().map(String::from)));
     crate::emit(app, json!({"ts": chrono::Utc::now().to_rfc3339(), "service": "lambda", "op": "Invoke", "target": name, "trigger": source,
-        "status": if ok { 200 } else { 500 }, "error": r.as_ref().ok().and_then(|i| i.error.as_ref().map(|_| i.payload["errorMessage"].clone()))}));
-    ok
+        "status": if ok { 200 } else { 500 }, "error": msg.clone()}));
+    (ok, msg)
+}
+
+// Destination ARNs saved with Lambda Destinations or a mapping's OnFailure must point at something that exists.
+fn check_dest_arns(app: &Arc<App>, op: &str, j: &Value) -> Result<(), ApiErr> {
+    let mut arns = vec![];
+    for key in ["OnSuccess", "OnFailure"] {
+        if let Some(a) = j["DestinationConfig"][key]["Destination"].as_str() {
+            arns.push(a.to_string());
+        }
+    }
+    if arns.is_empty() {
+        return Ok(());
+    }
+    if matches!(op, "CreateEventSourceMapping") {
+        // Event source mapping OnFailure targets: SQS queues or SNS topics only (AWS).
+        if arns.iter().any(|a| !a.starts_with("arn:aws:sqs:") && !a.starts_with("arn:aws:sns:")) {
+            return Err(err("InvalidParameterValueException", "OnFailure destination for an event source mapping must be an SQS queue or SNS topic ARN"));
+        }
+    }
+    for a in &arns {
+        let ok = if a.starts_with("arn:aws:sqs:") {
+            app.sqs.lock().unwrap().exists(a.rsplit(':').next().unwrap_or(""))
+        } else if a.starts_with("arn:aws:sns:") {
+            app.sns.lock().unwrap().exists(a)
+        } else if a.starts_with("arn:aws:lambda:") {
+            app.lambda.lock().unwrap().exists(&name_of(a))
+        } else if a.starts_with("arn:aws:events:") {
+            app.eb.lock().unwrap().bus_exists(a.rsplit('/').next().unwrap_or(""))
+        } else {
+            false
+        };
+        if !ok {
+            return Err(err("InvalidParameterValueException", format!("The destination ARN {a} does not exist or is not a supported destination (SQS, SNS, Lambda, EventBridge bus)")));
+        }
+    }
+    Ok(())
+}
+
+// Asynchronous (Event) invocation with per-function destinations: retry failures up to MaximumRetryAttempts
+// (or MaximumEventAgeInSeconds), then route the AWS-shaped result envelope to OnFailure / OnSuccess.
+// Delivery reuses main.rs send_to_target; the target's resource policy is NOT evaluated for these sends
+// (AWS delivers with the function's execution role; service_gate skips non sns/events/s3 senders).
+async fn invoke_async(app: Arc<App>, name: &str, event: Value, icfg: InvokeConfig) {
+    let attempts = icfg.retries.unwrap_or(2).clamp(0, 2) as u32 + 1;
+    let age = icfg.age.filter(|a| *a > 0).map(|a| Duration::from_secs(a as u64));
+    let t0 = Instant::now();
+    let rid = uuid::Uuid::new_v4().to_string();
+    let far = name_of(name);
+    let mut count = 0u32;
+    let (failed, condition, response) = loop {
+        count += 1;
+        let (ok, payload, msg) = match invoke(&app, name, event.clone()).await {
+            Ok(i) if i.error.is_none() => (true, i.payload, None),
+            Ok(i) => (false, Value::Null, Some(i.payload["errorMessage"].clone())),
+            Err(_) => (false, Value::Null, None),
+        };
+        let failed = !ok;
+        crate::emit(&app, json!({"ts": chrono::Utc::now().to_rfc3339(), "service": "lambda", "op": "Invoke", "target": name, "trigger": "async",
+            "status": if failed { 500 } else { 200 }, "error": msg.clone(), "attempt": count}));
+        let response = if failed { msg.unwrap_or(Value::Null) } else { payload };
+        if !failed || count >= attempts || age.is_some_and(|a| t0.elapsed() > a) {
+            let condition = if failed { json!(if count >= attempts { "RetriesExhausted" } else { "EventAgeExceeded" }) } else { Value::Null };
+            break (failed, condition, response);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await; // fixed short backoff; AWS backs off up to ~1h
+    };
+    let dest = if failed { icfg.on_failure.as_deref() } else { icfg.on_success.as_deref() };
+    if let Some(dest) = dest.filter(|d| !d.is_empty()) {
+        let payload = json!({
+            "version": "1.0",
+            "timestamp": now_ms(),
+            "requestContext": {"requestId": rid, "functionArn": arn(&far), "condition": condition, "approximateInvokeCount": count},
+            "requestPayload": event,
+            "responseContext": if failed { Value::Null } else { json!({"statusCode": 200}) },
+            "responsePayload": response,
+        });
+        crate::send_to_target(&app, &rid, dest, payload, "lambda", &arn(&far));
+    }
 }
 
 // One loop per SQS event source mapping: receive a batch, invoke, delete on success.
@@ -602,16 +758,17 @@ async fn poll_sqs(app: Arc<App>, id: String) {
 
 // One loop per Kinesis event source mapping: every shard is read in order from its own position. A failed batch is
 // retried (blocking that shard, as in AWS) until it succeeds or MaximumRetryAttempts is used up, then skipped.
-// ponytail: no bisect-on-error, on-failure destinations, tumbling windows or parallelization factor.
+// BisectBatchOnFunctionError splits a failed batch in half and retries each half; a skipped batch's metadata is
+// routed to DestinationConfig.OnFailure. ponytail: no tumbling windows or parallelization factor.
 async fn poll_kinesis(app: Arc<App>, id: String) {
     let Some((src, start)) = app.lambda.lock().unwrap().maps.get(&id).map(|m| (m.source.clone(), m.start.clone())) else { return };
     let stream = src.rsplit('/').next().unwrap_or("").to_string();
     let mut pos = app.kinesis.lock().unwrap().positions(&stream, start.as_deref() == Some("LATEST"));
     let mut failures = vec![0i64; pos.len()];
     loop {
-        let Some((func, batch, enabled, retries, role)) = ({
+        let Some((func, batch, enabled, retries, role, bisect, fail_dest)) = ({
             let l = app.lambda.lock().unwrap();
-            l.maps.get(&id).map(|m| (m.function.clone(), m.batch as usize, m.enabled, m.retries, l.f.get(&m.function).map(|f| f.role.clone()).unwrap_or_default()))
+            l.maps.get(&id).map(|m| (m.function.clone(), m.batch as usize, m.enabled, m.retries, l.f.get(&m.function).map(|f| f.role.clone()).unwrap_or_default(), m.bisect, m.fail_dest.clone()))
         }) else {
             return; // mapping deleted
         };
@@ -628,16 +785,8 @@ async fn poll_kinesis(app: Arc<App>, id: String) {
                 continue;
             }
             busy = true;
-            let records: Vec<Value> = recs.iter().map(|r| json!({"kinesis": r, "eventSource": "aws:kinesis", "eventVersion": "1.0",
-                "eventID": format!("shardId-{i:012}:{}", r["sequenceNumber"].as_str().unwrap_or("")), "eventName": "aws:kinesis:record",
-                "invokeIdentityArn": role, "awsRegion": REGION.as_str(), "eventSourceARN": src})).collect();
-            if invoke_logged(&app, &func, json!({ "Records": records }), "kinesis").await || (retries >= 0 && failures[i] >= retries) {
-                pos[i] += recs.len();
-                failures[i] = 0;
-            } else {
-                failures[i] += 1;
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
+            pos[i] += try_kinesis_batch(&app, &func, i, &src, &role, recs, retries, &mut failures[i], bisect, fail_dest.clone()).await;
+            tokio::time::sleep(Duration::from_millis(100)).await; // give a failed shard a moment before the next pass
         }
         if !busy {
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -645,19 +794,99 @@ async fn poll_kinesis(app: Arc<App>, id: String) {
     }
 }
 
+// Try one (sub)batch; returns how many leading records are consumed (delivered or skipped). A failed batch is
+// bisected when enabled, so a good half keeps its progress while the bad half retries on its own budget.
+async fn try_kinesis_batch(app: &Arc<App>, func: &str, shard: usize, src: &str, role: &str, recs: Vec<Value>, retries: i64, fail: &mut i64, bisect: bool, dest: Option<String>) -> usize {
+    let records: Vec<Value> = recs.iter().map(|r| json!({"kinesis": r, "eventSource": "aws:kinesis", "eventVersion": "1.0",
+        "eventID": format!("shardId-{shard:012}:{}", r["sequenceNumber"].as_str().unwrap_or("")), "eventName": "aws:kinesis:record",
+        "invokeIdentityArn": role, "awsRegion": REGION.as_str(), "eventSourceARN": src})).collect();
+    if invoke_logged(app, func, json!({ "Records": records }), "kinesis").await {
+        *fail = 0;
+        return recs.len();
+    }
+    if bisect && recs.len() > 1 {
+        let mid = recs.len() / 2;
+        let (a, b) = recs.split_at(mid);
+        let (mut fa, mut fb) = (0i64, 0i64);
+        let done = Box::pin(try_kinesis_batch(app, func, shard, src, role, a.to_vec(), retries, &mut fa, bisect, dest.clone())).await;
+        if done < a.len() {
+            return done; // the first half still blocks the shard; the rest is retried from there
+        }
+        return done + Box::pin(try_kinesis_batch(app, func, shard, src, role, b.to_vec(), retries, &mut fb, bisect, dest)).await;
+    }
+    *fail += 1;
+    if retries >= 0 && *fail >= retries {
+        *fail = 0;
+        if let Some(d) = dest.filter(|d| !d.is_empty()) {
+            let meta = json!({
+                "StreamArn": src,
+                "ShardId": format!("shardId-{shard:012}"),
+                "StartSequenceNumber": recs.first().and_then(|r| r["sequenceNumber"].as_str()),
+                "EndSequenceNumber": recs.last().and_then(|r| r["sequenceNumber"].as_str()),
+                "BatchSize": recs.len(),
+                "ErrorCode": "Lambda.FunctionError",
+            });
+            crate::send_to_target(app, &uuid::Uuid::new_v4().to_string(), &d, meta, "lambda", src);
+        }
+        return recs.len(); // give up on this batch
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    0
+}
+
 impl Lambda {
     pub fn exists(&self, name: &str) -> bool {
         self.f.contains_key(name)
     }
+
     pub fn admin(&self) -> Value {
         self.f
             .iter()
             .map(|(n, f)| {
                 let maps: Vec<Value> = self.maps.iter().filter(|(_, m)| m.function == *n).map(|(_, m)| json!([if m.start.is_some() { "Kinesis 트리거" } else { "SQS 트리거" }, m.source, format!("배치 {}", m.batch)])).collect();
                 let mut rows = vec![json!(["런타임", f.runtime, f.handler]), json!(["역할", f.role, ""]), json!(["제한", format!("{}초", f.timeout), format!("{} MB", f.memory)])];
+                if f.icfg.on_success.is_some() || f.icfg.on_failure.is_some() {
+                    rows.push(json!(["실패 시 재시도", format!("{}회", f.icfg.retries.unwrap_or(2)), format!("최대 {}초", f.icfg.age.unwrap_or(3600))]));
+                }
+                if let Some(d) = &f.icfg.on_failure {
+                    rows.push(json!(["실패 대상", "OnFailure", d]));
+                }
+                if let Some(d) = &f.icfg.on_success {
+                    rows.push(json!(["성공 대상", "OnSuccess", d]));
+                }
                 rows.extend(maps);
                 json!({"name": n, "count": rows.len() - 3, "sub": format!("{} · 로그 그룹 /aws/lambda/{n}", f.arn), "cols": ["항목", "값", ""], "rows": rows})
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invoke_config_round_trip() {
+        let c = InvokeConfig { retries: Some(1), age: Some(600), on_success: None, on_failure: Some("arn:aws:sqs:us-east-1:000000000000:dlq".into()) };
+        let v = icfg_json("f", &c);
+        assert_eq!(v["MaximumRetryAttempts"], 1);
+        assert_eq!(v["MaximumEventAgeInSeconds"], 600);
+        assert_eq!(v["DestinationConfig"]["OnFailure"]["Destination"], "arn:aws:sqs:us-east-1:000000000000:dlq");
+        assert!(v["DestinationConfig"]["OnSuccess"].is_object(), "unset side is an empty object");
+        // Defaults mirror AWS: 2 retries, 6 hours.
+        let d = icfg_json("f", &InvokeConfig::default());
+        assert_eq!(d["MaximumRetryAttempts"], 2);
+        assert_eq!(d["MaximumEventAgeInSeconds"], 21600);
+    }
+
+    #[test]
+    fn mapping_json_carries_failure_config() {
+        let m = Mapping { source: "arn:aws:kinesis:us-east-1:000000000000:stream/s".into(), function: "f".into(), batch: 10,
+            enabled: true, modified: 0.0, start: Some("LATEST".into()), retries: 3, bisect: true,
+            fail_dest: Some("arn:aws:sqs:us-east-1:000000000000:bad".into()) };
+        let v = mapping_json("u", &m);
+        assert_eq!(v["BisectBatchOnFunctionError"], true);
+        assert_eq!(v["DestinationConfig"]["OnFailure"]["Destination"], "arn:aws:sqs:us-east-1:000000000000:bad");
+        assert_eq!(v["MaximumRetryAttempts"], 3);
     }
 }

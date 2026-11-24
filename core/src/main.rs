@@ -350,7 +350,7 @@ async fn handle(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<std:
     let principal = app.iam.lock().unwrap().principal(&akid);
     let target = headers.get("x-amz-target").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     let is_form = headers.get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|c| c.starts_with("application/x-www-form-urlencoded"));
-    let lambda_path = ["/2015-03-31/", "/2014-11-13/"].iter().find_map(|v| uri.path().strip_prefix(v)).filter(|_| scope == "lambda" || scope.is_empty());
+    let lambda_path = ["/2015-03-31/", "/2014-11-13/", "/2019-09-25/"].iter().find_map(|v| uri.path().strip_prefix(v)).filter(|_| scope == "lambda" || scope.is_empty());
     let svc = if let Some(path) = uri.path().strip_prefix("/2013-04-01/").filter(|_| scope == "route53") {
         Svc::R53(method.to_string(), path.to_string())
     } else if let Some(path) = uri.path().strip_prefix("/v2/email/").filter(|_| scope == "ses") {
@@ -707,18 +707,28 @@ fn service_gate(app: &Arc<App>, rid: &str, from: &str, target: &str, src: &str) 
     false
 }
 
-// Send a payload to an SQS queue, SNS topic or Lambda function by ARN. `src` is the sender's ARN (rule, bucket, topic).
-fn send_to_target(app: &Arc<App>, rid: &str, arn: &str, payload: Value, from: &str, src: &str) {
+// Send a payload to an SQS queue, SNS topic, Lambda function or EventBridge bus by ARN. `src` is the sender's
+// ARN (rule, bucket, topic, function). Lambda-driven sends (Destinations, mapping OnFailure) arrive with
+// from="lambda", which service_gate does not evaluate — AWS delivers those with the function's execution role.
+pub fn send_to_target(app: &Arc<App>, rid: &str, arn: &str, payload: Value, from: &str, src: &str) {
     let text = match &payload {
         Value::String(s) => s.clone(),
         v => v.to_string(),
     };
-    if !arn.starts_with("arn:aws:sqs:") && !service_gate(app, rid, from, arn, src) {
+    if !arn.starts_with("arn:aws:sqs:") && !arn.starts_with("arn:aws:events:") && !service_gate(app, rid, from, arn, src) {
         return;
     }
     if arn.starts_with("arn:aws:lambda:") {
         let (app, name, from) = (app.clone(), arn.to_string(), from.to_string()); // keeps a :version / :alias qualifier
         tokio::spawn(async move { lambda::invoke_logged(&app, &name, payload, &from).await });
+    } else if arn.starts_with("arn:aws:events:") {
+        let bus = arn.rsplit('/').next().unwrap_or("").to_string();
+        let entry = json!({"EventBusName": bus, "Source": "lambda", "DetailType": "Function Invocation Result", "Detail": text});
+        if let Ok((_, sends)) = app.eb.lock().unwrap().handle("PutEvents", &json!({"Entries": [entry]})) {
+            for (t, ev) in sends {
+                send_to_target(app, rid, t["Arn"].as_str().unwrap_or(""), ev, "events", t["_RuleArn"].as_str().unwrap_or(""));
+            }
+        }
     } else if arn.starts_with("arn:aws:sns:") {
         let subject = if from == "s3" { "Amazon S3 Notification" } else { "" };
         let mut q: HashMap<String, String> = [("Action", "Publish"), ("TopicArn", arn), ("Message", text.as_str())].map(|(k, v)| (k.to_string(), v.to_string())).into();

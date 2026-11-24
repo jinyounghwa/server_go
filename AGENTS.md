@@ -18,6 +18,7 @@
 - 2026-11-23 추가7: S3 알림 대상 저장 시 검증 — 큐·토픽·함수 ARN이 실제로 존재해야 `PutBucketNotificationConfiguration` 성공(없으면 400 `InvalidArgument`).
 - 2026-11-23 추가8: Route53 라우팅 정책 — 가중치(무작위, 0은 당첨 안 됨)·페일오버(PRIMARY 우선)·지연시간(첫 세트; 클라이언트 리전을 모름). 레코드 세트 정체성이 (이름·타입·SetIdentifier)로 확장, List에 정책 속성 표시.
 - 2026-11-23 추가9: CloudWatch Logs 필터 패턴(`?OR` 리스트, JSON `{ $.a.b = "x" $.n != 2 }`, `*` 존재 체크) + 미검증 경계 경로 테스트(`test_handoff_edge_paths`: Kinesis→Lambda 재시도·건너뛰기, SNS/EB→Lambda 별칭 버전, S3/EB→SQS 큐 정책 Deny, `cron_next` 월말·윤년·요일·과거연도 단위 테스트). boto3 테스트 33개.
+- 2026-11-24 추가10: Lambda 비동기 호출 대상(Destinations) — `Put/Get/Update/DeleteFunctionEventInvokeConfig`(2019-09-25 경로, POST 직렬화), 실패 재시도(최대 2, 고정 200ms 백오프)·이벤트 수명 뒤 `RetriesExhausted`/`EventAgeExceeded`·AWS 형식 결과 봉투로 SQS·SNS·Lambda·EventBridge 버스 배달(대상은 저장 시 검증). Kinesis 매핑 `BisectBatchOnFunctionError`(부분 성공 보존)·`DestinationConfig.OnFailure`(건너뛴 배치 메타데이터 SQS/SNS 배달). 배달은 `send_to_target` 재사용(버스 분기 추가), `service_gate`은 lambda 발신자를 판정하지 않음(실행 역할 시맨틱). boto3 테스트 34개.
 - `v0.1.0` 릴리스 완료(2026-11-21): 바이너리 3종 + SHA256SUMS, Homebrew sha256 반영.
 - `v0.1.5` 릴리스(2026-11-25): EventBridge `cron()`·InputTransformer, Kinesis→Lambda 매핑, DynamoDB 중첩 경로, Lambda 버전·별칭, IAM 조건 연산자(Numeric·Date·IpAddress·한정자), `STRICT_DELIVERY=1`, SNS 필터 numeric·suffix, SigV4 시계 오차, STS 만료, Kinesis 리샤딩, S3 알림 대상 검증, Route53 라우팅 정책, Logs 필터 패턴. 우분투 전체 검증(스위트 두 모드) 통과 뒤 태그. Homebrew는 태그 뒤 반영.
 - `v0.1.4` 릴리스(2026-11-22): ALB 요청별 규칙 라우팅, aws-chunked 트레일러 서명 검증, SNS·EventBridge·S3 배달의 대상 정책 판정(서비스 주체). Homebrew 0.1.4.
@@ -37,7 +38,7 @@ core/            Rust 단일 바이너리 (axum + tokio), 모든 서비스가 �
   src/<svc>.rs   서비스별 모듈. 상태 struct + handle() + admin()
   src/ui.html    관리 GUI (/_ui), town.html 캐릭터 마을 (/_town) — include_str!로 내장
 gui/             Tauri 2 창. /_ui를 여는 껍데기일 뿐
-tests/sdk_test.py  boto3 호환성 테스트 33개 (주 통합 테스트), tests/js·tests/rust는 JS v3(5개)·Rust SDK(4개) 스위트
+tests/sdk_test.py  boto3 호환성 테스트 34개 (주 통합 테스트), tests/js·tests/rust는 JS v3(5개)·Rust SDK(4개) 스위트
 netlify.toml     예전 Netlify 설정(지금은 GitHub Pages `pages.yml`로 배포)
 ```
 
@@ -127,7 +128,7 @@ SQS 메시지 속성, Step Functions 동시 실행·실패 중단, ALB 경로·�
 3D 마을 브라우저·휴대폰 점검)은 모두 끝났다. 남은 한계는 각 파일의 `ponytail:` 주석(`grep -rn ponytail core/src`)이 목록이다.
 
 1. **실기기 점검**(사용자 도움 필요): 실제 휴대폰·실제 Safari·GPU가 약한 노트북에서 Pages 마을을 연다. 지금까지는 우분투 Playwright 에뮬레이션만 했다.
-   연대기 섬 숫자(SDK 테스트 33/5/4개, 시나리오 21개, GPU 65°C)는 `town.html` 12절에 손으로 적은 값이니 바뀌면 같이 고친다.
+   연대기 섬 숫자(SDK 테스트 34/5/4개, 시나리오 21개, GPU 65°C)는 `town.html` 12절에 손으로 적은 값이니 바뀌면 같이 고친다.
 2. ~~EventBridge `cron()`(UTC, L·W·#은 거부)·InputTransformer·InputPath `[0]`~~ 완료(2026-11-22).
 3. ~~Kinesis → Lambda 이벤트 소스 매핑~~ 완료(2026-11-22, `lambda.rs` `poll_kinesis`: 샤드별 순서, 실패 배치는 재시도하며 샤드를 막고 `MaximumRetryAttempts` 뒤 건너뜀).
 4. ~~DynamoDB 경로 `a.b[0]`~~ 완료(2026-11-22): 업데이트(SET 끝 너머는 추가, REMOVE는 원래 인덱스 기준)·조건·프로젝션(중첩 경로 유지).
@@ -144,4 +145,4 @@ SQS 메시지 속성, Step Functions 동시 실행·실패 중단, ALB 경로·�
 aws-chunked 조각 서명·트레일러 서명 검증, 트레일러 체크섬 값 자체는 다시 계산하지 않음), 리소스 기반 정책은 S3 버킷·SQS 큐·SNS 토픽·Lambda 함수(AddPermission)를 평가, SNS·EventBridge·S3의 배달도 `ENFORCE_IAM=1`이면 대상 정책을 서비스 주체(`sns.amazonaws.com` 등)와 `aws:SourceArn`으로 판정(대상에 정책이 없으면 기본 허용, `STRICT_DELIVERY=1`이면 AWS처럼 거부), KMS는 진짜 암호 아님,
 IAM 조건 연산자는 String·Arn·Bool·Numeric·Date·IpAddress(+IfExists, ForAnyValue/ForAllValues)를 지원하지만 컨텍스트 키가 단일 값이라 다중 값 집합 시맨틱은 없음,
 ALB 리스너 규칙(path-pattern·host-header)은 요청마다 고르되 규칙이 있는 리스너는 `Connection: close`로 요청당 연결 하나, Query 프로토콜 구버전 SQS 미지원,
-ECS 태스크가 에뮬레이터를 부르려면 `BIND=0.0.0.0:4566` 필요. 세부는 각 파일의 `ponytail:` 주석.
+ECS 태스크가 에뮬레이터를 부르려면 `BIND=0.0.0.0:4566` 필요. Lambda 비동기 호출 대상 설정은 함수 단위(버전·별칙별 아님), Kinesis 매핑의 OnFailure 메시지는 배치 메타데이터(레코드 복제 아님). 세부는 각 파일의 `ponytail:` 주석.

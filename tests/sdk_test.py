@@ -656,6 +656,17 @@ def slow(event, ctx):
 """
 NODE_FN = "exports.handler = async (event, ctx) => ({ doubled: event.n * 2, name: ctx.functionName });"
 
+PY_PICK = r"""
+import base64
+def pick(event, ctx):
+    for r in event["Records"]:
+        v = base64.b64decode(r["kinesis"]["data"]).decode()
+        print("REC", v)
+        if v == "boom":
+            raise ValueError("boom")
+    return {"ok": True}
+"""
+
 
 def zipped(files):
     import io, zipfile
@@ -1047,6 +1058,102 @@ def test_cognito():
     assert "IdToken" in idp.initiate_auth(ClientId=sec["ClientId"], AuthFlow="USER_PASSWORD_AUTH", AuthParameters=params)["AuthenticationResult"]
     idp.delete_user_pool(UserPoolId=pool)
     assert code(idp.get_user, AccessToken=tok["AccessToken"]) == "NotAuthorizedException"
+
+
+def test_lambda_destinations():
+    """2-1: async invoke destinations; 2-2: Kinesis bisect + on-failure metadata."""
+    lam, logs, kin, sqc = (boto3.client(n, **kw) for n in ("lambda", "logs", "kinesis", "sqs"))
+    role = "arn:aws:iam::000000000000:role/none"  # no real role needed: invokes fall back to the root keys
+    okq = sqc.create_queue(QueueName=f"rcok{run}")["QueueUrl"]
+    badq = sqc.create_queue(QueueName=f"rcfail{run}")["QueueUrl"]
+    okarn = sqc.get_queue_attributes(QueueUrl=okq, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    badarn = sqc.get_queue_attributes(QueueUrl=badq, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    fn = f"dest{run}"
+    good = dict(Role=role, Code={"ZipFile": zipped({"app.py": PY_FN})}, Runtime="python3.12")
+    pick = dict(Role=role, Code={"ZipFile": zipped({"pick.py": PY_PICK})}, Runtime="python3.12", Handler="pick.pick")
+    lam.create_function(FunctionName=fn, Handler="app.handler", **good)
+    lam.create_function(FunctionName=fn + "-boom", Handler="app.boom", **good)
+    lam.create_function(FunctionName=fn + "-pick", Timeout=10, **pick)
+
+    # --- 2-1 Lambda Destinations -------------------------------------------------
+    lam.put_function_event_invoke_config(FunctionName=fn + "-boom", MaximumRetryAttempts=1,
+        DestinationConfig={"OnFailure": {"Destination": badarn}})
+    cfg = lam.get_function_event_invoke_config(FunctionName=fn + "-boom")
+    assert cfg["MaximumRetryAttempts"] == 1 and cfg["DestinationConfig"]["OnFailure"]["Destination"] == badarn
+    # saving a destination that does not exist is refused (same rule as S3 notifications)
+    assert code(lam.put_function_event_invoke_config, FunctionName=fn + "-boom",
+                DestinationConfig={"OnFailure": {"Destination": "arn:aws:sqs:us-east-1:000000000000:nope"}}) == "InvalidParameterValueException"
+    assert code(lam.put_function_event_invoke_config, FunctionName=fn + "-boom", MaximumRetryAttempts=5) == "InvalidParameterValueException"
+    lam.invoke(FunctionName=fn + "-boom", InvocationType="Event", Payload='{"x": 1}')
+    body = None
+    for _ in range(60):
+        msgs = sqc.receive_message(QueueUrl=badq, MaxNumberOfMessages=10).get("Messages", [])
+        if msgs:
+            body = json.loads(msgs[0]["Body"])
+            break
+        time.sleep(0.2)
+    assert body, "OnFailure delivery never arrived"
+    assert body["requestContext"]["condition"] == "RetriesExhausted"
+    assert body["requestContext"]["approximateInvokeCount"] == 2, "1 try + 1 retry"
+    assert body["requestPayload"] == {"x": 1} and "bad input" in body["responsePayload"]
+    assert body["responseContext"] in (None, {}), "failures carry no statusCode"
+    assert sqc.receive_message(QueueUrl=badq).get("Messages", []) == [], "exactly one failure record"
+
+    lam.put_function_event_invoke_config(FunctionName=fn, MaximumRetryAttempts=0,
+        DestinationConfig={"OnSuccess": {"Destination": okarn}})
+    lam.invoke(FunctionName=fn, InvocationType="Event", Payload='{"x": 5}')
+    body = None
+    for _ in range(60):
+        msgs = sqc.receive_message(QueueUrl=okq, MaxNumberOfMessages=10).get("Messages", [])
+        if msgs:
+            body = json.loads(msgs[0]["Body"])
+            break
+        time.sleep(0.2)
+    assert body, "OnSuccess delivery never arrived"
+    assert body["requestContext"]["condition"] in (None, "") and body["responseContext"]["statusCode"] == 200
+    assert body["requestPayload"] == {"x": 5} and body["responsePayload"]["echo"] == 5
+    # Update merges, Delete resets to defaults.
+    lam.update_function_event_invoke_config(FunctionName=fn, MaximumEventAgeInSeconds=300)
+    cfg = lam.get_function_event_invoke_config(FunctionName=fn)
+    assert cfg["MaximumEventAgeInSeconds"] == 300 and cfg["MaximumRetryAttempts"] == 0
+    assert cfg["DestinationConfig"]["OnSuccess"]["Destination"] == okarn, "update keeps the unset side"
+    lam.delete_function_event_invoke_config(FunctionName=fn)
+    assert lam.get_function_event_invoke_config(FunctionName=fn)["MaximumRetryAttempts"] == 2
+
+    # --- 2-2 Kinesis mapping: BisectBatchOnFunctionError + OnFailure -------------
+    stream = f"pick{run}"
+    kin.create_stream(StreamName=stream, ShardCount=1)
+    kin.get_waiter("stream_exists").wait(StreamName=stream)
+    sarn = kin.describe_stream_summary(StreamName=stream)["StreamDescriptionSummary"]["StreamARN"]
+    for v in ("a", "b", "c", "boom"):
+        kin.put_record(StreamName=stream, Data=v.encode(), PartitionKey="k")
+    esm = lam.create_event_source_mapping(EventSourceArn=sarn, FunctionName=fn + "-pick", StartingPosition="TRIM_HORIZON",
+        BatchSize=4, MaximumRetryAttempts=1, BisectBatchOnFunctionError=True,
+        DestinationConfig={"OnFailure": {"Destination": badarn}})
+    assert esm["BisectBatchOnFunctionError"] and esm["DestinationConfig"]["OnFailure"]["Destination"] == badarn
+    meta = None
+    for _ in range(100):
+        msgs = sqc.receive_message(QueueUrl=badq, MaxNumberOfMessages=10).get("Messages", [])
+        if msgs:
+            meta = json.loads(msgs[0]["Body"])
+            break
+        time.sleep(0.2)
+    assert meta, "on-failure metadata never arrived"
+    assert meta["BatchSize"] == 1, "bisect isolated the single bad record"
+    assert meta["StartSequenceNumber"] == meta["EndSequenceNumber"]
+    assert meta["StreamArn"] == sarn and meta["ShardId"] == "shardId-000000000000"
+    assert meta["ErrorCode"] == "Lambda.FunctionError"
+    ev = [e["message"] for e in logs.filter_log_events(logGroupName=f"/aws/lambda/{fn}-pick")["events"]]
+    for v in ("a", "b", "c"):
+        assert f"REC {v}" in ev, f"record {v} was processed; got {ev}"
+    time.sleep(1.0)
+    assert sqc.receive_message(QueueUrl=badq, MaxNumberOfMessages=10).get("Messages", []) == [], "only the failed record is reported"
+
+    lam.delete_event_source_mapping(UUID=esm["UUID"])
+    kin.delete_stream(StreamName=stream)
+    for f in (fn, fn + "-boom", fn + "-pick"):
+        lam.delete_function(FunctionName=f)
+    sqc.delete_queue(QueueUrl=okq); sqc.delete_queue(QueueUrl=badq)
 
 
 def test_kinesis():
