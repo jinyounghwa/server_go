@@ -1,7 +1,12 @@
-# rocalcloud 3일 작업 인계서 2차 (2026-11-25 ~ 2026-11-27)
+# rocalcloud 작업 계획서 (2026-11-25 ~ 2026-12-07, 13일)
 
 이 문서는 잠시 일을 넘겨받는 작업자(모델)를 위한 3일치 계획이다. **먼저 `AGENTS.md` 전체를 읽는다.** 구조, 요청 흐름, 서비스 추가 패턴은 거기 있다.
-이 문서와 AGENTS.md가 충돌하면 AGENTS.md가 맞다. 3일이 끝나면 AGENTS.md 7절을 갱신하고 이 문서는 지운다.
+이 문서와 AGENTS.md가 충돌하면 AGENTS.md가 맞다.
+
+**이 문서는 지우지 않는다. 계속 이어 쓰는 계획서다.**
+- 하루가 끝나면 그날 제목 옆에 `✅ 완료`, `⚠️ 일부`, `❌ 못 함` 중 하나와 커밋 해시를 적는다.
+- 못 끝낸 일은 다음 날 맨 앞으로 옮긴다. 다른 날 항목을 건너뛰어 먼저 하지 않는다.
+- 마지막 날(13일차)에는 그다음 10일 계획을 이 문서 끝에 이어 쓴다.
 
 **지난 1차(11-24~26) 결과:** 커밋 9개(`5982113`~`4e4191f`)가 들어갔고 CI는 전부 초록이다.
 - 계획했던 일: IAM 조건 연산자, `STRICT_DELIVERY=1`, 테스트하지 않은 경로 테스트(`test_handoff_edge_paths`).
@@ -148,7 +153,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - 7절: 새 할 일 목록을 만든다. 남은 `ponytail:` 주석 중에서 고른다.
   - 8절: 한계를 고친다.
 - `town.html` 12절의 숫자를 고친다.
-- 이 문서(`HANDOFF.md`)는 지우고, AGENTS.md 머리말의 HANDOFF 안내 줄도 지운다.
+- 이 문서의 3일차 제목 옆에 결과 표시를 단다(문서는 지우지 않는다).
 - 커밋·푸시하고 CI가 초록인지 확인한다. 우분투를 끈다.
 
 ### 시간이 남으면 (요청이 없으면 하지 않음)
@@ -158,8 +163,142 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
 
 ---
 
+## 4일차 (2026-11-28): SQS·SNS FIFO 보강
+- **SQS 메시지별 `DelaySeconds`:** `sqs.rs` 13행 ponytail 주석의 항목이다.
+  - 표준 큐는 SendMessage와 SendMessageBatch 항목마다 0~900초를 받는다.
+  - FIFO 큐는 메시지별 지연을 `InvalidParameterValue`로 거부한다(AWS 동작). 큐 단위 지연만 쓴다.
+- **SNS FIFO 토픽:**
+  - `.fifo` 이름이면 `FifoTopic=true`가 있어야 만들 수 있다.
+  - Publish에는 `MessageGroupId`가 필수이고, `MessageDeduplicationId` 또는 `ContentBasedDeduplication`으로 5분 안 중복을 버린다.
+  - FIFO SQS 구독으로만 배달한다. 순서와 그룹 ID를 넘긴다.
+  - `sns.rs` 2행의 "no FIFO dedup" 주석을 고친다.
+- 테스트:
+  - 지연 메시지는 지연 시간이 지나기 전에는 받을 수 없어야 한다. 1초 지연으로 확인한다.
+  - 같은 중복 ID로 두 번 Publish하면 큐에는 1개만 들어와야 한다.
+  - 표준 큐를 FIFO 토픽에 구독시키면 거부되어야 한다.
+
+## 5일차 (2026-11-29): Step Functions JSONPath·내장 함수
+- **`sfn.rs` 3행:** JSONPath를 `$.a.b[0]` 이상으로 넓힌다.
+  - `[*]`, `[-1]`, `['key']`, `$$.Execution.Id`, `$$.State.Name`, `$$.Map.Item.Value`(Context 객체)를 지원한다.
+  - 필터식 `?()`는 거부하고 오류를 명확히 낸다.
+- **`sfn.rs` 122행 내장 함수 추가:**
+  - Array 계열: `ArrayPartition`, `ArrayContains`, `ArrayRange`, `ArrayGetItem`, `ArrayLength`, `ArrayUnique`
+  - 인코딩·해시: `Base64Encode`, `Base64Decode`, `Hash`(SHA-256 등, sha2와 md-5가 이미 있다)
+  - 문자열·JSON: `StringSplit`, `JsonMerge`
+  - 숫자: `MathRandom`
+  - 각각 표준 라이브러리 수준의 짧은 코드로 쓴다.
+- 테스트: 내장 함수마다 단위 테스트를 하나씩 둔다. sdk_test.py에는 Pass 상태 `Parameters`로 여러 함수를 한 번에 쓰는 실행 하나를 넣는다.
+
+## 6일차 (2026-11-30): EventBridge 재시도·DLQ·아카이브
+- **대상별 재시도와 DLQ:**
+  - 대상의 `RetryPolicy`(`MaximumRetryAttempts`, `MaximumEventAgeInSeconds`)와 `DeadLetterConfig.Arn`(SQS)을 지원한다.
+  - 배달이 실패하면 재시도한다. 끝내 실패하면 DLQ로 보내고 `ERROR_CODE` 같은 메시지 속성을 붙인다.
+  - 대상 정책 거부나 없는 대상도 실패로 본다.
+- **아카이브와 재생:**
+  - `CreateArchive`(EventPattern 필터, 보관 기간), `DescribeArchive`, `ListArchives`, `DeleteArchive`
+  - `StartReplay`(시간 범위, 대상 규칙 ARN 목록), `DescribeReplay`
+  - 재생 이벤트에는 `replay-name` 필드를 붙인다.
+  - 보관은 메모리에 하고 스냅샷에도 저장한다.
+- API destinations는 계속 거부한다. 외부 HTTP를 호출하는 기능이라 보안 기본값과 맞지 않는다.
+- 테스트:
+  - 없는 Lambda 대상 + DLQ 조합에서 DLQ에 메시지 1개가 들어와야 한다.
+  - 아카이브한 이벤트를 재생하면 대상 큐에 다시 들어와야 한다.
+
+## 7일차 (2026-12-01): API Gateway 인가자 (JWT·Lambda)
+- **`apigw.rs` 3행:** HTTP API 인가자를 넣는다. 연산은 `CreateAuthorizer`, `GetAuthorizer(s)`, `UpdateAuthorizer`, `DeleteAuthorizer`이고, 라우트의 `AuthorizationType`과 `AuthorizerId`를 연결한다.
+- **JWT 인가자:**
+  - issuer와 audience를 확인한다.
+  - 로컬 Cognito 풀의 JWKS(`/_cognito/{pool}/.well-known/jwks.json`)로 RS256 서명을 검증한다. 이미 있는 `rsa`·`sha2` 크레이트를 쓴다.
+  - 외부 issuer URL은 가져오지 않는다. 로컬 풀만 받고, 나머지는 명확한 오류로 답한다.
+- **Lambda 인가자:**
+  - payload format 2.0의 simple response `{isAuthorized, context}`를 지원한다.
+  - context를 통합 이벤트의 `requestContext.authorizer.lambda`로 넘긴다.
+- 거부는 401(토큰 없음)과 403(검증 실패)으로 나눈다.
+- 테스트:
+  - Cognito 로그인 토큰이 있으면 200, 토큰이 없으면 401, 변조된 토큰이면 401 또는 403
+  - Lambda 인가자가 false를 돌려주면 403
+
+## 8일차 (2026-12-02): API Gateway CORS·HTTP_PROXY·스테이지 변수
+- **CORS 설정:** `CorsConfiguration`(AllowOrigins, Methods, Headers, MaxAge, Credentials)을 지원한다.
+  - `/_api/...`에 대한 OPTIONS 사전 요청에 응답하고, 실제 응답에도 헤더를 단다.
+  - **이것은 사용자 API의 CORS다.** `/_events` 관리 스트림의 CORS 규칙은 절대 건드리지 않는다.
+- **HTTP_PROXY 통합:**
+  - **대상 URL은 루프백(127.0.0.1, localhost)만 허용한다.** 그 밖은 저장할 때 거부한다. SSRF를 막기 위해서다.
+  - 메서드, 경로, 쿼리, 헤더를 전달한다.
+- **스테이지 변수:** `${stageVariables.x}`를 통합 URI에서 치환한다.
+- `apigw.rs` 180행의 "deployments are no-ops" 주석은 그대로 둔다. 필요성이 낮다.
+- 테스트:
+  - 허용된 출처의 사전 요청이면 헤더가 붙고, 다른 출처면 헤더가 없어야 한다.
+  - 루프백의 작은 HTTP 서버로 프록시가 되어야 한다. 테스트 안에서 파이썬 `http.server`를 띄운다.
+  - 외부 URL 통합은 생성할 때 거부되어야 한다.
+
+## 9일차 (2026-12-03): Cognito 그룹·Lambda 트리거
+- **`cognito.rs` 3행:** 그룹을 지원한다.
+  - 연산: `CreateGroup`, `GetGroup`, `ListGroups`, `DeleteGroup`, `AdminAddUserToGroup`, `AdminRemoveUserFromGroup`, `AdminListGroupsForUser`
+  - 토큰에 `cognito:groups` 클레임을 넣는다.
+- **Lambda 트리거:** `LambdaConfig`의 `PreSignUp`, `PostConfirmation`, `PreTokenGeneration`
+  - 이벤트 형식은 AWS와 같게 `{version, triggerSource, userPoolId, userName, request, response}`이다.
+  - PreSignUp에서 `autoConfirmUser`를 반영한다. 함수가 실패하면 `UserLambdaValidationException`으로 답한다.
+  - PreTokenGeneration에서 클레임 추가와 삭제를 반영한다.
+- 7일차 JWT 인가자와 연결해 그룹 클레임이 `requestContext`에 보이는지 확인한다.
+- 테스트: 그룹에 넣은 사용자 토큰에 클레임이 있어야 하고, PreSignUp이 거부하면 가입이 실패해야 한다.
+
+## 10일차 (2026-12-04): Kinesis 보존·샤드 수 변경 + S3 목록 정확도
+- **`kinesis.rs` 3행:**
+  - `RetentionPeriodHours`: 기본 24시간이다. `IncreaseStreamRetentionPeriod`와 `Decrease...`를 지원하고, 읽을 때 만료된 레코드를 숨긴다.
+  - `UpdateShardCount`(UNIFORM_SCALING): 기존 Split·Merge 로직을 다시 쓴다.
+- **`s3.rs` 326행 ListObjectsV2:** delimiter와 이어받기 토큰의 경계 경우를 점검한다.
+  - 공통 접두사가 `MaxKeys` 경계에 걸릴 때 키가 빠지거나 중복되지 않아야 한다.
+  - 접두사 끝 문자가 최대 코드포인트일 때도 확인한다.
+  - 수정이 필요 없으면 테스트만 남긴다.
+- 테스트:
+  - 보존 기간이 지난 레코드는 GetRecords에 나오지 않아야 한다. 시계를 주입할 수 있는 단위 테스트로 확인한다.
+  - 샤드 수를 1→2→1로 바꿔도 레코드가 유실되지 않아야 한다.
+  - 키 1,000개를 `MaxKeys=7`과 delimiter로 끝까지 페이지 넘겼을 때 전체 집합이 정확해야 한다.
+
+## 11일차 (2026-12-05): CloudFormation 제자리 업데이트·Export/ImportValue
+- **`cfn.rs` 621행:** 교체가 필요 없는 속성 변경은 그 자리에서 고친다. 대상은 SQS 속성, Lambda 환경 변수·메모리·타임아웃, SNS 표시 이름, DynamoDB 처리량·TTL 정도다. 나머지는 지금처럼 교체한다.
+  - 교체 여부 표는 리소스 타입별 짧은 목록으로 둔다.
+- **`cfn.rs` 4행:**
+  - `Outputs.Export.Name`과 `Fn::ImportValue`, `ListExports`, `ListImports`를 지원한다.
+  - 다른 스택이 import한 export는 삭제나 변경을 거부한다(AWS 동작).
+- **`cfn.rs` 665행:** 롤백할 때 교체된 리소스를 원래대로 되돌리지 못하는 한계를 이번 범위에서 줄일 수 있으면 줄인다. 안 되면 주석을 그대로 둔다.
+- 테스트:
+  - 큐의 `VisibilityTimeout`만 바꾼 업데이트에서 큐 URL(정체성)이 그대로여야 한다.
+  - import하는 스택이 있으면 export하는 스택 삭제가 실패해야 한다.
+
+## 12일차 (2026-12-06): 검증 에이전트·SDK 스위트·마을 따라잡기
+- **`inspector.rs`에 새 시나리오** (현재 21개). 결정적으로 쓰고 `rc-insp-` 리소스만 쓴다.
+  - 보안: 시계 오차 요청 거부, 만료된 STS 키 거부, `STRICT_DELIVERY`일 때 정책 없는 대상 배달 거부, JWT 인가자 우회 시도
+  - 사고: Lambda Destinations OnFailure 도착, EventBridge DLQ 도착
+  - AGENTS.md 6절의 시나리오 숫자를 고친다.
+- **JS v3·Rust SDK 스위트**(`tests/js`, `tests/rust`)에 이번 기간 기능을 대표하는 테스트를 각각 3~5개 넣는다. Lambda 별칭, FIFO 토픽, Step Functions 내장 함수, 인가자가 후보다.
+  - 이 스위트는 우분투에서만 빌드한다(맥 경량화).
+- **마을과 GUI:**
+  - 새 기능의 표시를 넣는다: `ui.html` 표, `town.html` 건물·배달 화살표.
+  - 연대기 섬 숫자를 고친다(SDK 테스트 수, 시나리오 수).
+  - 우분투 Playwright로 Pages 마을과 `/_town` 화면을 확인한다.
+
+## 13일차 (2026-12-07): v0.1.6 릴리스 + 다음 10일 계획
+- 우분투 전체 검증을 돌린다(두 모드와 `ubuntu_verify.sh`). 실패가 있으면 릴리스하지 않는다.
+- v0.1.6을 준비한다. 절차는 1일차 1-2와 같다. 버전, `Cargo.lock`, `town.html`, 문서를 고친다.
+  - **태그 푸시는 사용자 승인을 받은 뒤에만 한다.**
+  - Homebrew sha256을 반영하고, 리눅스 바이너리로 확인한다.
+- AGENTS.md를 갱신한다.
+  - 1절: v0.1.6과 이번 기간 추가분을 적는다.
+  - 7절: 할 일 목록을 고친다.
+  - 8절: 한계를 고친다.
+  - `grep -rn ponytail core/src`에서 해결한 주석이 지워졌는지 본다.
+- **이 문서 끝에 14~23일차(10일) 계획을 이어 쓴다.**
+  - 남은 `ponytail:` 주석과 7절 후보에서 고른다. 예: ECS 롤링 배포, RDS 스냅샷, Lambda 레이어, SigV4a, DynamoDB 트랜잭션·스트림 점검, Route53 헬스체크.
+  - 하루 분량은 이 문서의 하루 수준(기능 1~2개 + 테스트)으로 맞춘다.
+  - 큰 기능(API Gateway REST v1, Cognito SRP·호스팅 UI, CFN 중첩 스택·SAM)은 이틀로 나눈다.
+
+---
+
 ## 끝낼 때 보고 형식 (매일)
-- 한 일과 커밋 해시, CI 결과
+- 이 문서의 그날 제목 옆에 결과 표시와 커밋 해시를 단다.
+- 한 일과 CI 결과
 - 테스트한 것과 **테스트하지 않은 것**을 구분해 적는다.
 - 우분투 상태: 프로세스 0개, 컨테이너 0개, 전원 끔
-- 다음 날 할 일과 막힌 점(사용자 결정이 필요한 것). 릴리스 태그 승인은 1일차에 꼭 묻는다.
+- 다음 날 할 일과 막힌 점(사용자 결정이 필요한 것). 릴리스 태그 승인은 1일차와 13일차에 꼭 묻는다.
