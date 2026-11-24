@@ -163,7 +163,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
 
 ---
 
-## 4일차 (2026-11-28): SQS·SNS FIFO 보강
+## 4일차 (2026-11-28): SQS·SNS FIFO 보강 — ✅ 완료 (`2808d1c`): SQS 메시지별 DelaySeconds·SNS FIFO 토픽, 리팩토링·단위/boto3 테스트(37/35)·우분투 두 모드 통과
 - **SQS 메시지별 `DelaySeconds`:** `sqs.rs` 13행 ponytail 주석의 항목이다.
   - 표준 큐는 SendMessage와 SendMessageBatch 항목마다 0~900초를 받는다.
   - FIFO 큐는 메시지별 지연을 `InvalidParameterValue`로 거부한다(AWS 동작). 큐 단위 지연만 쓴다.
