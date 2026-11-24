@@ -614,7 +614,7 @@ async fn handle(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<std:
         }
         (Svc::Sns(_), Some(e)) => query_reply(SNS_NS, &op, &rid, Err(e)),
         (Svc::Sns(q), None) => {
-            let r = app.sns.lock().unwrap().handle(&q);
+            let r = check_sns_subscribe(&app, &q).and_then(|()| app.sns.lock().unwrap().handle(&q));
             let r = r.map(|(v, deliveries)| {
                 let topic = q.get("TopicArn").cloned().unwrap_or_default();
                 for d in deliveries {
@@ -681,6 +681,25 @@ async fn handle(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<std:
     resp
 }
 
+// FIFO SNS topics may only subscribe FIFO SQS queues (checked here where both SNS and SQS are reachable).
+fn check_sns_subscribe(app: &App, q: &HashMap<String, String>) -> Result<(), ApiErr> {
+    if q.get("Action").map(String::as_str) != Some("Subscribe") {
+        return Ok(());
+    }
+    let topic = q.get("TopicArn").map(String::as_str).unwrap_or("");
+    if !app.sns.lock().unwrap().is_fifo(topic) {
+        return Ok(());
+    }
+    if q.get("Protocol").map(String::as_str) != Some("sqs") {
+        return Err(err("InvalidParameter", "Invalid parameter: FIFO topics only support the sqs protocol"));
+    }
+    let ep = q.get("Endpoint").map(String::as_str).unwrap_or("");
+    if !app.sqs.lock().unwrap().is_fifo(ep) {
+        return Err(err("InvalidParameter", "Invalid parameter: FIFO topics can only subscribe FIFO queues"));
+    }
+    Ok(())
+}
+
 // Deliver an S3 bucket notification to SQS, SNS or Lambda.
 fn s3_note(app: &Arc<App>, rid: &str, n: s3::Note) {
     let body: Value = serde_json::from_str(&n.body).unwrap_or_default();
@@ -740,7 +759,7 @@ pub fn send_to_target(app: &Arc<App>, rid: &str, arn: &str, payload: Value, from
             deliver(app, rid, &d, "sns", arn);
         }
     } else {
-        deliver(app, rid, &sns::Delivery { protocol: "sqs".into(), endpoint: arn.into(), body: text, attrs: Value::Null }, from, src);
+        deliver(app, rid, &sns::Delivery { protocol: "sqs".into(), endpoint: arn.into(), body: text, attrs: Value::Null, group: None, dedup: None }, from, src);
     }
 }
 
@@ -772,7 +791,7 @@ fn deliver(app: &Arc<App>, rid: &str, d: &sns::Delivery, from: &str, src: &str) 
         return;
     }
     let ok = match d.protocol.as_str() {
-        "sqs" => app.sqs.lock().unwrap().deliver(d.endpoint.rsplit(':').next().unwrap_or(""), d.body.clone(), &d.attrs),
+        "sqs" => app.sqs.lock().unwrap().deliver(d.endpoint.rsplit(':').next().unwrap_or(""), d.body.clone(), &d.attrs, d.group.clone(), d.dedup.clone()),
         "lambda" => {
             let name = lambda::name_of(&d.endpoint);
             let target = d.endpoint.clone(); // keeps a :version / :alias qualifier

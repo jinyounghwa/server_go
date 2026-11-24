@@ -1938,6 +1938,71 @@ def test_handoff_edge_paths():
     sqs.delete_queue(QueueUrl=q)
 
 
+def test_sqs_sns_fifo_and_delay():
+    """Day 4: SQS per-message DelaySeconds (incl. batch & FIFO rejection) and SNS FIFO topics."""
+    sns = boto3.client("sns", **kw)
+    p = f"d4{run}"
+    # 1. Standard SQS per-message DelaySeconds (single + batch) and validation errors
+    q_std = sqs.create_queue(QueueName=f"{p}-std")["QueueUrl"]
+    q_std_arn = sqs.get_queue_attributes(QueueUrl=q_std, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    sqs.send_message(QueueUrl=q_std, MessageBody="delayed-1", DelaySeconds=1)
+    assert sqs.receive_message(QueueUrl=q_std, MaxNumberOfMessages=10).get("Messages", []) == [], "delayed msg must not be visible immediately"
+    time.sleep(1.15)
+    got = sqs.receive_message(QueueUrl=q_std, MaxNumberOfMessages=10).get("Messages", [])
+    assert [m["Body"] for m in got] == ["delayed-1"]
+    sqs.delete_message(QueueUrl=q_std, ReceiptHandle=got[0]["ReceiptHandle"])
+    # SendMessageBatch with mixed 0s and 1s per-entry DelaySeconds
+    sqs.send_message_batch(QueueUrl=q_std, Entries=[
+        {"Id": "now", "MessageBody": "b-now", "DelaySeconds": 0},
+        {"Id": "later", "MessageBody": "b-later", "DelaySeconds": 1},
+    ])
+    first = sqs.receive_message(QueueUrl=q_std, MaxNumberOfMessages=10).get("Messages", [])
+    assert [m["Body"] for m in first] == ["b-now"]
+    sqs.delete_message(QueueUrl=q_std, ReceiptHandle=first[0]["ReceiptHandle"])
+    time.sleep(1.15)
+    second = sqs.receive_message(QueueUrl=q_std, MaxNumberOfMessages=10).get("Messages", [])
+    assert [m["Body"] for m in second] == ["b-later"]
+    sqs.delete_message(QueueUrl=q_std, ReceiptHandle=second[0]["ReceiptHandle"])
+    # Invalid DelaySeconds (>900 or negative) and FIFO params on standard queue
+    assert code(sqs.send_message, QueueUrl=q_std, MessageBody="x", DelaySeconds=901) == "InvalidParameterValue"
+    assert code(sqs.send_message, QueueUrl=q_std, MessageBody="x", DelaySeconds=-1) == "InvalidParameterValue"
+    assert code(sqs.send_message, QueueUrl=q_std, MessageBody="x", MessageGroupId="g1") == "InvalidParameterValue"
+
+    # 2. FIFO SQS rejects per-message DelaySeconds
+    q_fifo = sqs.create_queue(QueueName=f"{p}.fifo", Attributes={"FifoQueue": "true"})["QueueUrl"]
+    q_fifo_arn = sqs.get_queue_attributes(QueueUrl=q_fifo, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    assert code(sqs.send_message, QueueUrl=q_fifo, MessageBody="x", MessageGroupId="g1", MessageDeduplicationId="d1", DelaySeconds=1) == "InvalidParameterValue"
+
+    # 3. SNS FIFO topics: creation rules, FIFO-only SQS subscriptions, dedup & ordered delivery
+    assert code(sns.create_topic, Name=f"{p}-bad.fifo") == "InvalidParameter"
+    assert code(sns.create_topic, Name=f"{p}-bad", Attributes={"FifoTopic": "true"}) == "InvalidParameter"
+    t_fifo = sns.create_topic(Name=f"{p}.fifo", Attributes={"FifoTopic": "true", "ContentBasedDeduplication": "true"})["TopicArn"]
+    # Standard queue and non-SQS protocols rejected on FIFO topics
+    assert code(sns.subscribe, TopicArn=t_fifo, Protocol="sqs", Endpoint=q_std_arn) == "InvalidParameter"
+    assert code(sns.subscribe, TopicArn=t_fifo, Protocol="lambda", Endpoint=f"arn:aws:lambda:us-east-1:000000000000:function:{p}") == "InvalidParameter"
+    # FIFO queue subscription succeeds
+    sns.subscribe(TopicArn=t_fifo, Protocol="sqs", Endpoint=q_fifo_arn, Attributes={"RawMessageDelivery": "true"})
+    assert code(sns.publish, TopicArn=t_fifo, Message="no-group") == "InvalidParameter"
+    # Explicit dedup id drops duplicate within 5 min and returns same MessageId
+    r1 = sns.publish(TopicArn=t_fifo, Message="m1", MessageGroupId="grp", MessageDeduplicationId="dup-1")
+    r2 = sns.publish(TopicArn=t_fifo, Message="m1-dup", MessageGroupId="grp", MessageDeduplicationId="dup-1")
+    assert r1["MessageId"] == r2["MessageId"]
+    # Content-based dedup drops identical body, allows next distinct message in order
+    c1 = sns.publish(TopicArn=t_fifo, Message="m2", MessageGroupId="grp")
+    c2 = sns.publish(TopicArn=t_fifo, Message="m2", MessageGroupId="grp")
+    assert c1["MessageId"] == c2["MessageId"]
+    received = []
+    for _ in range(3):
+        ms = sqs.receive_message(QueueUrl=q_fifo, MaxNumberOfMessages=1).get("Messages", [])
+        if not ms:
+            break
+        received.append(ms[0]["Body"])
+        sqs.delete_message(QueueUrl=q_fifo, ReceiptHandle=ms[0]["ReceiptHandle"])
+    assert received == ["m1", "m2"], f"expected ordered deduped FIFO delivery, got {received}"
+    sns.delete_topic(TopicArn=t_fifo)
+    sqs.delete_queue(QueueUrl=q_fifo); sqs.delete_queue(QueueUrl=q_std)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

@@ -1,16 +1,25 @@
 // SNS (Query protocol). Publish returns deliveries; main hands them to SQS / Lambda.
-// ponytail: http(s)/email/sms endpoints are accepted but never called; no FIFO dedup.
+// FIFO topics (".fifo" + FifoTopic=true) require MessageGroupId, drop duplicates within 5 minutes
+// (MessageDeduplicationId or ContentBasedDeduplication) and take FIFO SQS subscriptions only; the group and
+// dedup ids ride along to the queue, which keeps per-group order. ponytail: http(s)/email/sms endpoints are
+// accepted but never called, and dedup memory is not persisted in snapshots.
 use crate::{err, ApiErr, ACCOUNT, REGION};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
 
+// FIFO topic dedup window, same as SQS.
+const DEDUP_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+
 type Q = HashMap<String, String>;
 
+#[derive(Debug)]
 pub struct Delivery {
     pub protocol: String,
     pub endpoint: String,
     pub body: String,
     pub attrs: Value, // SQS-shaped message attributes for raw delivery
+    pub group: Option<String>, // FIFO: MessageGroupId passed through to the queue
+    pub dedup: Option<String>, // FIFO: MessageDeduplicationId passed through to the queue
 }
 struct Sub {
     topic: String,
@@ -24,6 +33,7 @@ pub struct Sns {
     topics: BTreeMap<String, BTreeMap<String, String>>, // topic ARN -> attributes
     subs: BTreeMap<String, Sub>,
     published: BTreeMap<String, u64>,
+    dedup: BTreeMap<String, (std::time::Instant, String)>, // FIFO "topic:dedup" -> (seen at, MessageId)
 }
 
 fn p<'a>(q: &'a Q, k: &str) -> Result<&'a str, ApiErr> {
@@ -106,6 +116,13 @@ impl Sns {
                 let n = p(q, "Name")?;
                 let arn = format!("arn:aws:sns:{}:{ACCOUNT}:{n}", *REGION);
                 let mut attrs = entries(q, "Attributes");
+                let wants_fifo = attrs.get("FifoTopic").is_some_and(|v| v == "true");
+                if n.ends_with(".fifo") != wants_fifo {
+                    return Err(err("InvalidParameter", "A FIFO topic name must end with .fifo and set FifoTopic to true"));
+                }
+                if wants_fifo {
+                    attrs.insert("FifoTopic".into(), "true".into());
+                }
                 check_policy(attrs.get("Policy"))?;
                 attrs.insert("TopicArn".into(), arn.clone());
                 attrs.insert("DisplayName".into(), attrs.get("DisplayName").cloned().unwrap_or_default());
@@ -117,6 +134,8 @@ impl Sns {
                 let t = p(q, "TopicArn")?;
                 self.topics.remove(t);
                 self.subs.retain(|_, s| s.topic != t);
+                let prefix = format!("{t}:");
+                self.dedup.retain(|k, _| !k.starts_with(&prefix));
                 json!({})
             }
             "GetTopicAttributes" => {
@@ -182,7 +201,40 @@ impl Sns {
                     return Err(not_found());
                 }
                 let msg = p(q, "Message")?;
-                let id = uuid::Uuid::new_v4().to_string();
+                let fifo = self.topics[&t].get("FifoTopic").is_some_and(|v| v == "true");
+                let (group, dedup) = if fifo {
+                    let g = q.get("MessageGroupId").cloned().ok_or_else(|| err("InvalidParameter", "The MessageGroupId parameter is required for FIFO topics"))?;
+                    let d = match q.get("MessageDeduplicationId") {
+                        Some(d) => d.clone(),
+                        None if self.topics[&t].get("ContentBasedDeduplication").is_some_and(|v| v == "true") => crate::sigv4::sha256_hex(msg.as_bytes()),
+                        None => return Err(err("InvalidParameter", "The topic should either have ContentBasedDeduplication enabled or MessageDeduplicationId provided explicitly")),
+                    };
+                    (Some(g), Some(d))
+                } else {
+                    if q.contains_key("MessageGroupId") || q.contains_key("MessageDeduplicationId") {
+                        return Err(err("InvalidParameter", "The request contains FIFO parameters, which are not valid for standard topics"));
+                    }
+                    (None, None)
+                };
+                let (id, duplicate) = if let Some(d) = &dedup {
+                    // A duplicate within 5 minutes returns the first MessageId and delivers nothing.
+                    let now = std::time::Instant::now();
+                    let key = format!("{t}:{d}");
+                    self.dedup.retain(|_, (seen, _)| now.duration_since(*seen) < DEDUP_WINDOW);
+                    match self.dedup.get(&key) {
+                        Some((_, id)) => (id.clone(), true),
+                        None => {
+                            let id = uuid::Uuid::new_v4().to_string();
+                            self.dedup.insert(key, (now, id.clone()));
+                            (id, false)
+                        }
+                    }
+                } else {
+                    (uuid::Uuid::new_v4().to_string(), false)
+                };
+                if duplicate {
+                    return Ok((json!({ "MessageId": id }), vec![]));
+                }
                 let attrs: Map<String, Value> = (1..)
                     .map_while(|i| {
                         let pre = format!("MessageAttributes.entry.{i}");
@@ -197,6 +249,12 @@ impl Sns {
                     "Signature": "LOCAL", "SigningCertURL": "", "UnsubscribeURL": ""});
                 if let Some(s) = q.get("Subject") {
                     env["Subject"] = s.clone().into();
+                }
+                if let Some(g) = &group {
+                    env["MessageGroupId"] = g.clone().into();
+                }
+                if let Some(d) = &dedup {
+                    env["MessageDeduplicationId"] = d.clone().into();
                 }
                 if !attrs.is_empty() {
                     env["MessageAttributes"] = attrs.clone().into();
@@ -217,7 +275,8 @@ impl Sns {
                         } else {
                             Map::new()
                         };
-                        Delivery { protocol: s.protocol.clone(), endpoint: s.endpoint.clone(), body: if raw { msg.to_string() } else { e.to_string() }, attrs: sqs_attrs.into() }
+                        Delivery { protocol: s.protocol.clone(), endpoint: s.endpoint.clone(), body: if raw { msg.to_string() } else { e.to_string() },
+                                   attrs: sqs_attrs.into(), group: group.clone(), dedup: dedup.clone() }
                     })
                     .collect();
                 *self.published.entry(t).or_default() += 1;
@@ -231,6 +290,11 @@ impl Sns {
     // Topic policy (the Policy attribute), consulted by the authorizer.
     pub fn policy(&self, arn: &str) -> Option<Value> {
         self.topics.get(arn)?.get("Policy").and_then(|p| serde_json::from_str(p).ok())
+    }
+
+    // Whether a topic is FIFO (main.rs checks subscriptions against FIFO queues).
+    pub fn is_fifo(&self, arn: &str) -> bool {
+        self.topics.get(arn).is_some_and(|a| a.get("FifoTopic").is_some_and(|v| v == "true"))
     }
 
     pub fn exists(&self, arn: &str) -> bool {
@@ -267,6 +331,7 @@ impl Sns {
         self.topics.clear();
         self.subs.clear();
         self.published.clear();
+        self.dedup.clear();
         if let Some(m) = v["topics"].as_object() {
             for (arn, attrs) in m {
                 let a: BTreeMap<String, String> = attrs.as_object().into_iter().flatten()
@@ -316,5 +381,46 @@ mod tests {
             let mut m = attrs("n", "5"); m.insert("f".into(), json!({"DataType": "String", "Value": "a.txt"})); m
         }));
         assert!(!filter_ok(&pol(r#"{"n": [1, {"numeric": [">", 100]}]}"#), &attrs("n", "5")), "OR of exact and range");
+    }
+
+    #[test]
+    fn fifo_topic_rules_and_dedup() {
+        let mut sns = Sns::default();
+        let q = |pairs: &[(&str, &str)]| -> Q { pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect() };
+        // Name/attribute mismatch rejected
+        assert_eq!(sns.handle(&q(&[("Action", "CreateTopic"), ("Name", "bad.fifo")])).unwrap_err().code, "InvalidParameter");
+        assert_eq!(sns.handle(&q(&[("Action", "CreateTopic"), ("Name", "bad"), ("Attributes.entry.1.key", "FifoTopic"), ("Attributes.entry.1.value", "true")])).unwrap_err().code, "InvalidParameter");
+        // Valid FIFO topic with explicit dedup
+        let (v, _) = sns.handle(&q(&[("Action", "CreateTopic"), ("Name", "ord.fifo"), ("Attributes.entry.1.key", "FifoTopic"), ("Attributes.entry.1.value", "true")])).unwrap();
+        let tarn = v["TopicArn"].as_str().unwrap().to_string();
+        assert!(sns.is_fifo(&tarn));
+        sns.handle(&q(&[("Action", "Subscribe"), ("TopicArn", &tarn), ("Protocol", "sqs"), ("Endpoint", "arn:aws:sqs:us-east-1:000000000000:q.fifo")])).unwrap();
+        // Missing MessageGroupId or MessageDeduplicationId
+        assert_eq!(sns.handle(&q(&[("Action", "Publish"), ("TopicArn", &tarn), ("Message", "m1")])).unwrap_err().code, "InvalidParameter");
+        assert_eq!(sns.handle(&q(&[("Action", "Publish"), ("TopicArn", &tarn), ("Message", "m1"), ("MessageGroupId", "g1")])).unwrap_err().code, "InvalidParameter");
+        // First publish delivers; duplicate within window returns same MessageId and delivers nothing
+        let (p1, d1) = sns.handle(&q(&[("Action", "Publish"), ("TopicArn", &tarn), ("Message", "m1"), ("MessageGroupId", "g1"), ("MessageDeduplicationId", "d1")])).unwrap();
+        assert_eq!(d1.len(), 1);
+        assert_eq!(d1[0].group.as_deref(), Some("g1"));
+        assert_eq!(d1[0].dedup.as_deref(), Some("d1"));
+        let (p2, d2) = sns.handle(&q(&[("Action", "Publish"), ("TopicArn", &tarn), ("Message", "m1"), ("MessageGroupId", "g1"), ("MessageDeduplicationId", "d1")])).unwrap();
+        assert_eq!(p1["MessageId"], p2["MessageId"]);
+        assert!(d2.is_empty());
+        // ContentBasedDeduplication hashes message body
+        let (v2, _) = sns.handle(&q(&[
+            ("Action", "CreateTopic"), ("Name", "cbd.fifo"),
+            ("Attributes.entry.1.key", "FifoTopic"), ("Attributes.entry.1.value", "true"),
+            ("Attributes.entry.2.key", "ContentBasedDeduplication"), ("Attributes.entry.2.value", "true"),
+        ])).unwrap();
+        let tarn2 = v2["TopicArn"].as_str().unwrap().to_string();
+        sns.handle(&q(&[("Action", "Subscribe"), ("TopicArn", &tarn2), ("Protocol", "sqs"), ("Endpoint", "arn:aws:sqs:us-east-1:000000000000:q.fifo")])).unwrap();
+        let (c1, cd1) = sns.handle(&q(&[("Action", "Publish"), ("TopicArn", &tarn2), ("Message", "same"), ("MessageGroupId", "g1")])).unwrap();
+        let (c2, cd2) = sns.handle(&q(&[("Action", "Publish"), ("TopicArn", &tarn2), ("Message", "same"), ("MessageGroupId", "g1")])).unwrap();
+        assert_eq!(cd1.len(), 1);
+        assert!(cd2.is_empty());
+        assert_eq!(c1["MessageId"], c2["MessageId"]);
+        // DeleteTopic clears dedup cache for that topic
+        sns.handle(&q(&[("Action", "DeleteTopic"), ("TopicArn", &tarn)])).unwrap();
+        assert!(!sns.dedup.keys().any(|k| k.starts_with(&format!("{tarn}:"))));
     }
 }

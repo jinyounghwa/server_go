@@ -10,7 +10,7 @@ use std::{
 // FIFO: MessageGroupId is required, a group with a message in flight is held back (strict per-group order),
 // and duplicates (MessageDeduplicationId or ContentBasedDeduplication) within 5 minutes return the first MessageId.
 // Message attributes are validated (≤10, AWS naming rules, String/Number/Binary types) and returned with the AWS MD5.
-// SNS raw delivery forwards attributes. ponytail: FIFO high-throughput mode and per-message DelaySeconds rules are not emulated.
+// SNS raw delivery forwards attributes; per-message DelaySeconds is 0..900 on standard queues and refused on FIFO.
 const DEDUP_WINDOW: Duration = Duration::from_secs(300);
 
 struct Msg {
@@ -142,6 +142,19 @@ pub async fn handle(app: &App, op: &str, body: &[u8], host: &str) -> Result<Valu
     }
 }
 
+fn parse_delay_seconds(e: &Value, fifo: bool, default_delay: u64) -> Result<u64, ApiErr> {
+    let Some(raw) = e.get("DelaySeconds").filter(|v| !v.is_null()) else {
+        return Ok(default_delay);
+    };
+    if fifo {
+        return Err(err("InvalidParameterValue", "The request include parameter that is not valid for this queue type: DelaySeconds is queue-level for FIFO queues"));
+    }
+    match raw.as_i64() {
+        Some(d @ 0..=900) => Ok(d as u64),
+        _ => Err(err("InvalidParameterValue", format!("Value {raw} for parameter DelaySeconds is invalid. Reason: DelaySeconds must be >= 0 and <= 900."))),
+    }
+}
+
 fn send(q: &mut Queue, e: &Value) -> Result<Value, ApiErr> {
     let body = s(e, "MessageBody")?.to_string();
     let max: usize = q.attrs["MaximumMessageSize"].parse().unwrap_or(262144);
@@ -149,8 +162,11 @@ fn send(q: &mut Queue, e: &Value) -> Result<Value, ApiErr> {
     if body.len() + attr_size > max {
         return Err(err("InvalidParameterValue", format!("Message must be shorter than {max} bytes.")));
     }
-    let delay = e["DelaySeconds"].as_u64().unwrap_or_else(|| q.attrs["DelaySeconds"].parse().unwrap_or(0));
     let fifo = q.attrs.get("FifoQueue").is_some_and(|v| v == "true");
+    if !fifo && (e["MessageGroupId"].as_str().is_some() || e["MessageDeduplicationId"].as_str().is_some()) {
+        return Err(err("InvalidParameterValue", "The request include parameter that is not valid for this queue type: MessageGroupId and MessageDeduplicationId need a FIFO queue"));
+    }
+    let delay = parse_delay_seconds(e, fifo, q.attrs["DelaySeconds"].parse().unwrap_or(0))?;
     let (group, dedup) = if fifo {
         let g = e["MessageGroupId"].as_str().ok_or_else(|| err("MissingParameter", "The request must contain the parameter MessageGroupId."))?;
         let d = match e["MessageDeduplicationId"].as_str() {
@@ -414,8 +430,22 @@ impl Queues {
             q.msgs.retain(|m| m.receipt.as_deref() != Some(receipt));
         }
     }
-    pub fn deliver(&mut self, name: &str, body: String, attrs: &Value) -> bool {
-        self.q.get_mut(name).is_some_and(|q| send(q, &json!({ "MessageBody": body, "MessageAttributes": attrs })).is_ok())
+    pub fn deliver(&mut self, name: &str, body: String, attrs: &Value, group: Option<String>, dedup: Option<String>) -> bool {
+        self.q.get_mut(name).is_some_and(|q| {
+            let mut e = json!({ "MessageBody": body, "MessageAttributes": attrs });
+            if let Some(g) = group {
+                e["MessageGroupId"] = g.into();
+            }
+            if let Some(d) = dedup {
+                e["MessageDeduplicationId"] = d.into();
+            }
+            send(q, &e).is_ok()
+        })
+    }
+
+    // Whether the queue behind an ARN is FIFO (SNS checks FIFO-topic subscriptions).
+    pub fn is_fifo(&self, arn: &str) -> bool {
+        self.q.get(arn.rsplit(':').next().unwrap_or("")).is_some_and(|q| q.attrs.get("FifoQueue").is_some_and(|v| v == "true"))
     }
 
     // GUI view: every queue with counts and up to 100 messages (peek, no receive).
@@ -484,6 +514,22 @@ impl Queues {
 mod tests {
     use super::*;
     const EXPECTED_KIND_ORDER: &str = "9e7e72847e5db084ff08f403da3c182b";
+    #[test]
+    fn per_message_delay_rules() {
+        let mut q = Queue { attrs: BTreeMap::from([("DelaySeconds".into(), "0".into()), ("MaximumMessageSize".into(), "262144".into())]), msgs: vec![], seen: BTreeMap::new(), seq: 0 };
+        assert!(send(&mut q, &json!({"MessageBody": "x", "DelaySeconds": 1})).is_ok(), "0..900 is valid");
+        let e = send(&mut q, &json!({"MessageBody": "x", "DelaySeconds": 901})).unwrap_err();
+        assert_eq!(e.code, "InvalidParameterValue");
+        assert_eq!(send(&mut q, &json!({"MessageBody": "x", "DelaySeconds": -1})).unwrap_err().code, "InvalidParameterValue", "negative delay refused");
+        assert_eq!(send(&mut q, &json!({"MessageBody": "x", "DelaySeconds": 0})).unwrap()["MessageId"].as_str().unwrap().len(), 36);
+        // FIFO queues: per-message delay is refused, MessageGroupId is required.
+        let mut f = Queue { attrs: BTreeMap::from([("FifoQueue".into(), "true".into()), ("DelaySeconds".into(), "0".into()), ("MaximumMessageSize".into(), "262144".into())]), msgs: vec![], seen: BTreeMap::new(), seq: 0 };
+        assert_eq!(send(&mut f, &json!({"MessageBody": "x", "MessageGroupId": "g", "DelaySeconds": 2})).unwrap_err().code, "InvalidParameterValue");
+        assert_eq!(send(&mut f, &json!({"MessageBody": "x", "MessageGroupId": "g", "DelaySeconds": -1})).unwrap_err().code, "InvalidParameterValue");
+        assert_eq!(send(&mut q, &json!({"MessageBody": "x", "MessageGroupId": "g"})).unwrap_err().code, "InvalidParameterValue", "group id on a standard queue");
+        assert_eq!(send(&mut q, &json!({"MessageBody": "x", "MessageDeduplicationId": "d"})).unwrap_err().code, "InvalidParameterValue", "dedup id on a standard queue");
+        assert_eq!(send(&mut f, &json!({"MessageBody": "x", "MessageGroupId": "g", "MessageDeduplicationId": "d"})).unwrap()["SequenceNumber"].as_str().unwrap(), "1");
+    }
     #[test]
     fn message_attribute_md5_and_rules() {
         // Reference value from the AWS SQS developer guide algorithm, computed independently with Python.
