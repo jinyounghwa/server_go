@@ -1,7 +1,23 @@
-# rocalcloud 3일 작업 인계서 (2026-11-24 ~ 2026-11-26)
+# rocalcloud 3일 작업 인계서 2차 (2026-11-25 ~ 2026-11-27)
 
 이 문서는 잠시 일을 넘겨받는 작업자(모델)를 위한 3일치 계획이다. **먼저 `AGENTS.md` 전체를 읽는다.** 구조, 요청 흐름, 서비스 추가 패턴은 거기 있다.
 이 문서와 AGENTS.md가 충돌하면 AGENTS.md가 맞다. 3일이 끝나면 AGENTS.md 7절을 갱신하고 이 문서는 지운다.
+
+**지난 1차(11-24~26) 결과:** 커밋 9개(`5982113`~`4e4191f`)가 들어갔고 CI는 전부 초록이다.
+- 계획했던 일: IAM 조건 연산자, `STRICT_DELIVERY=1`, 테스트하지 않은 경로 테스트(`test_handoff_edge_paths`).
+- 계획보다 더 한 일:
+  - SNS 필터 numeric·suffix
+  - SigV4 시계 오차
+  - STS 만료
+  - Kinesis 리샤딩
+  - S3 알림 대상 검증
+  - Route53 라우팅 정책
+  - Logs 필터 패턴
+- boto3 테스트는 33개다.
+- **아직 안 된 것:**
+  - v0.1.5 릴리스: 태그가 아직 `v0.1.4`이고, `Cargo.toml`도 0.1.4다.
+  - 문서 정리: AGENTS.md 2절은 아직 "테스트 28개", 머리말 날짜는 11-22다.
+  - 우분투 전체 검증: 했다는 기록이 없다.
 
 ## 0. 꼭 지킬 것 (어기면 안 됨)
 
@@ -49,102 +65,96 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
 
 ---
 
-## 1일차 (2026-11-24): 기준선 확인 + IAM 조건 연산자 (AGENTS.md 7절 6번)
+## 1일차 (2026-11-25): 지난 작업 검증 + v0.1.5 릴리스
 
-### 1-1. 기준선 (30분)
-- 우분투를 켜고 rsync한 뒤 `ubuntu_verify.sh`를 돌린다. 지금 `main`(커밋 `7ff002f` 이후)이 깨끗하게 통과하는지 먼저 확인한다.
-- 단위 테스트는 26개다. 여기서 실패가 나오면 새 작업보다 그 원인부터 고친다.
+### 1-1. 우분투 전체 검증 (가장 먼저)
+- 11-23 커밋 9개는 CI만 통과했고, 우분투에서 Docker를 포함한 전체 검증을 했는지 기록이 없다.
+- 우분투를 켜고 rsync한 뒤 `ubuntu_verify.sh`를 돌린다. SDK 스위트도 두 모드(`ENFORCE_IAM=1`, `+VERIFY_SIGV4=1`)로 돌린다.
+- `STRICT_DELIVERY=1` 테스트는 4567 포트로 두 번째 서버를 띄운다. 끝나면 그 프로세스도 남지 않았는지 본다.
+- 실패가 있으면 릴리스하지 말고 먼저 고친다.
 
-### 1-2. 조건 연산자
-현재 상태는 다음과 같다.
-- `core/src/iam.rs`의 `cond_ok()`(117행 근처)는 String\*, Arn\*, Bool과 `IfExists`만 지원한다. 나머지 연산자는 항상 불일치다.
-- 컨텍스트는 `HashMap<String, String>`이라 키 하나에 값 하나만 담긴다.
+### 1-2. v0.1.5 릴리스 (태그 푸시는 사용자 승인 후)
+포함할 것은 11-22 작업(cron·InputTransformer, Kinesis→Lambda, DynamoDB `list[i]`, Lambda 버전·별칭)과 11-23 커밋 9개 전부다.
 
-추가할 것:
-- **Numeric 연산자:** `NumericEquals`, `NumericNotEquals`, `NumericLessThan`, `NumericLessThanEquals`, `NumericGreaterThan`, `NumericGreaterThanEquals`. f64로 파싱하고, 파싱에 실패하면 불일치로 본다.
-- **Date 연산자:** `DateEquals`, `DateNotEquals`, `DateLessThan`, `DateLessThanEquals`, `DateGreaterThan`, `DateGreaterThanEquals`.
-  - 값은 ISO 8601이나 epoch 초다. 이미 있는 `chrono`를 쓴다.
-  - 컨텍스트에 `aws:CurrentTime`(ISO)과 `aws:EpochTime`을 요청 시각으로 넣는다. 넣는 곳은 `iam.rs` 158행 근처, `aws:SecureTransport`를 넣는 자리다.
-- **IP 연산자:** `IpAddress`, `NotIpAddress`.
-  - CIDR 비교는 `std::net::IpAddr`로 직접 짠다(짧다). 새 크레이트는 쓰지 않는다.
-  - 컨텍스트에 `aws:SourceIp`를 넣는다. 에뮬레이터는 127.0.0.1에서만 받으므로 실제 피어 주소를 쓴다. 피어 주소를 얻기 어려우면 `127.0.0.1`로 둔다.
-- **Null:** `"Null": {"k": "true"}`는 키가 없을 때 참이다.
-- **ForAnyValue: / ForAllValues: 접두사.**
-  - 값이 여러 개인 키(예: `aws:TagKeys`)를 위해 컨텍스트 값을 쉼표나 배열로 담는다. 바꾸는 범위는 `cond_ok` 안에서 끝나게 최소로 한다.
-  - ForAllValues는 키가 없으면 참이다(AWS 동작). ForAnyValue는 키가 없으면 거짓이다.
-- 지원하지 않는 연산자는 지금처럼 불일치로 둔다. Deny 문의 조건이라면 불일치가 덜 막는 쪽이라는 점을 `ponytail:` 주석에 적는다.
-
-테스트:
-- `glob_and_conditions` 단위 테스트를 연산자마다 참과 거짓으로 늘린다.
-- sdk_test.py 예시 두 가지를 넣는다.
-  - `DateGreaterThan`의 기준을 미래로 잡은 Deny 문 → 허용되어야 한다.
-  - `NotIpAddress 10.0.0.0/8` Deny 문 → 127.0.0.1에서 온 요청은 막혀야 한다.
-- `ponytail:` 주석(116행)을 새 지원 범위로 고친다.
-
----
-
-## 2일차 (2026-11-25): 엄격 배달 정책 스위치 (7번) + 테스트하지 않은 경로 메우기
-
-### 2-1. 엄격 배달 정책 (선택 항목이지만 할 것)
-- `iam.rs` `service_may()`는 지금 대상에 정책이 없으면 허용한다. AWS는 거부한다.
-- 설정 스위치를 추가한다.
-  - 환경 변수 `RC_STRICT_DELIVERY=1`과 `RC_CONFIG` 설정 파일 키를 같이 둔다. 기존 설정을 읽는 방식은 `main.rs`를 본다.
-  - 이 스위치가 켜져 있을 때만 정책 없음을 거부로 바꾼다.
-  - 기본값은 꺼짐이다. 기존 사용자 흐름이 깨지면 안 된다.
-- 적용 범위는 `main.rs` `service_gate`(ENFORCE_IAM이 켜져 있고 from이 sns, events, s3일 때)다. 거부되면 지금처럼 403 이벤트를 남긴다.
-- 설정 화면(`ui.html`)에 스위치 표시가 있으면 같이 넣는다.
-- 테스트: 스위치를 켜고 서버를 하나 더 띄우기는 무거우니, `service_may`의 strict 인자 단위 테스트로 판정을 확인한다. SDK 스위트는 기본 모드에서 그대로 통과해야 한다.
-
-### 2-2. 지난 세션에서 테스트하지 않은 경로 (정직하게 보고한 것들)
-아래는 코드만 있고 검증하지 않은 경로다. sdk_test.py에 짧은 테스트를 하나씩 붙인다. 실패하면 고친다.
-1. **Kinesis → Lambda 실패 재시도와 건너뛰기:** 항상 실패하는 함수에 `MaximumRetryAttempts=1`을 건다. 그다음 레코드가 결국 처리되는지(샤드가 풀리는지) 확인한다.
-2. **EventBridge·SNS 대상에 Lambda 별칭 ARN(`...:function:f:live`):** 별칭이 가리키는 버전으로 실행되는지 확인한다. 함수가 기록한 `AWS_LAMBDA_FUNCTION_VERSION`으로 본다.
-3. **SNS→SQS 이외의 배달 정책 판정:** 아래 두 경우에 Deny 정책이 실제로 막는지 확인한다.
-   - S3 알림 → SQS
-   - EventBridge → SQS
-   - 이벤트의 `auth.source`는 "queue policy"여야 한다.
-4. **cron 실제 발화:** 벽시계를 기다리지 말고 `events.rs`의 `cron_next` 단위 테스트를 경계값으로 늘린다.
-   - 경계값: 월말, 윤년 2월 29일, 요일 `MON-FRI`, 연도 필드.
-   - 실발화는 확인하지 않았다고 보고에 적는다.
-
----
-
-## 3일차 (2026-11-26): v0.1.5 릴리스 준비 + 문서 정리
-
-### 3-1. 릴리스 준비 (태그 푸시는 사용자 승인 후)
-v0.1.5에 들어갈 것:
-- EventBridge `cron()`과 InputTransformer
-- Kinesis → Lambda
-- DynamoDB `list[i]` 경로
-- Lambda 버전·별칭
-- 1~2일차 결과
-
-절차 (v0.1.4 때와 같음):
-1. 버전을 0.1.5로 올린다: `core/Cargo.toml`, 그리고 우분투 빌드 뒤 `Cargo.lock`을 scp로 가져온다. `town.html`의 "v0.1.4 발사대"와 연대기 섬 9단계 줄도 고친다.
-2. 우분투에서 `ubuntu_verify.sh` 전체를 통과시키고 커밋·푸시한다. CI가 초록인지 확인한다.
-3. **사용자에게 "v0.1.5 태그를 푸시할까요?"라고 묻는다.** 승인을 받은 뒤에만 `git tag v0.1.5 && git push origin v0.1.5`를 한다. 그러면 `release.yml`이 바이너리 3종과 `SHA256SUMS.txt`를 만든다.
-4. `gh release download v0.1.5 -p SHA256SUMS.txt`로 체크섬을 받는다. 파일명이 `SHA256SUMS`가 아니라는 점에 주의한다.
-5. `packaging/homebrew/rocalcloud.rb`에 버전과 sha256 세 개(arm, x86 mac, linux)를 반영하고 커밋·푸시한다.
-6. 우분투에서 리눅스 바이너리를 받아 다음을 확인한다.
+1. 버전을 0.1.5로 올린다.
+   - `core/Cargo.toml`을 고치고, 우분투 빌드 뒤 `Cargo.lock`을 scp로 가져온다.
+   - `town.html`의 "v0.1.4 발사대"와 연대기 섬 9단계 줄도 고친다.
+2. 문서를 맞춘다(같은 커밋).
+   - AGENTS.md 머리말 날짜를 고친다.
+   - AGENTS.md 1절에 v0.1.5 줄을 넣는다.
+   - AGENTS.md 2절의 "테스트 28개"를 실제 개수로 고친다. `grep -c "^def test_" tests/sdk_test.py`가 지금 33이다.
+   - `town.html` 12절의 SDK 숫자와 AGENTS.md 7절 1번의 "32/5/4"를 실제 값과 맞춘다. JS·Rust 스위트 개수도 센다.
+   - README 기능 목록을 고친다.
+3. 커밋·푸시하고 CI가 초록인지 확인한다.
+4. **사용자에게 "v0.1.5 태그를 푸시할까요?"라고 묻는다.** 승인을 받은 뒤에만 `git tag v0.1.5 && git push origin v0.1.5`를 한다.
+5. `gh run watch`로 Release 워크플로가 성공하는지 본다. 그다음 `gh release download v0.1.5 -p SHA256SUMS.txt`로 체크섬을 받는다. 파일명은 `SHA256SUMS.txt`다.
+6. `packaging/homebrew/rocalcloud.rb`에 버전과 sha256 세 개(arm, x86 mac, linux)를 반영하고 커밋·푸시한다.
+7. 우분투에서 리눅스 바이너리를 받아 확인한다.
    - 체크섬이 맞는다.
    - `/_admin/state`가 200을 돌려준다.
    - 종료가 2초 안에 끝난다.
-   - 맥 바이너리는 실행해 보지 않았다면 그렇다고 적는다.
+   - 맥 바이너리는 실행하지 않았으면 그렇다고 적는다.
 
-### 3-2. 문서
+---
+
+## 2일차 (2026-11-26): Lambda 실패 처리 (ponytail 목록에서 실사용 빈도가 높은 것)
+
+`lambda.rs` 3행과 605행의 `ponytail:` 주석을 기준으로 한다.
+
+### 2-1. 비동기 호출 대상 (Destinations)
+- 연산은 `PutFunctionEventInvokeConfig`, `GetFunctionEventInvokeConfig`, `UpdateFunctionEventInvokeConfig`, `DeleteFunctionEventInvokeConfig`다. 설정 항목은 `MaximumRetryAttempts`(0~2), `MaximumEventAgeInSeconds`, `DestinationConfig.OnSuccess/OnFailure`다.
+- 동작:
+  - `InvocationType=Event` 호출에 적용한다.
+  - 함수가 실패하면 재시도 횟수만큼 다시 실행한다.
+  - 끝내 실패하면 OnFailure로, 성공하면 OnSuccess로 보낸다. 대상은 SQS, SNS, Lambda, EventBridge 버스다.
+  - 보내는 일은 기존 `main.rs` `send_to_target()`을 쓴다. 새 배달 경로를 만들지 않는다.
+- 보내는 본문은 AWS 형식 `{version, timestamp, requestContext{requestId, functionArn, condition, approximateInvokeCount}, requestPayload, responseContext, responsePayload}`이다.
+- 대상 ARN이 존재하지 않으면 저장할 때 거부한다. S3 알림 검증(`0ea0373`)과 같은 방식이다.
+- 이 배달이 `service_gate`(대상 정책 판정)를 거치는지 결정하고 주석에 적는다. AWS에서는 함수 실행 역할 권한으로 보낸다. 최소 구현으로는 판정하지 않는 쪽이 맞다.
+- 테스트:
+  - 항상 실패하는 함수에 OnFailure로 SQS를 건다. 비동기 호출 한 번 뒤 큐에 `condition: RetriesExhausted` 메시지가 1개 들어오는지 본다.
+  - 성공하는 함수에 OnSuccess로 SQS를 건다.
+  - 없는 ARN을 넣으면 오류가 나는지 본다.
+
+### 2-2. 이벤트 소스 매핑 실패 처리
+- 대상은 Kinesis 매핑(`poll_kinesis`)이다.
+  - `BisectBatchOnFunctionError`: 실패한 배치를 반으로 나눠 다시 시도한다.
+  - `DestinationConfig.OnFailure`: 건너뛴 배치의 메타데이터를 SQS나 SNS로 보낸다.
+- SQS 매핑은 AWS도 DLQ(큐의 redrive)를 쓰므로 손대지 않는다.
+- 테스트: 레코드 4개 중 1개만 실패하는 함수로 나눠 시도가 일어나는지, 결국 실패 레코드 메타데이터만 OnFailure 큐로 가는지 본다.
+- 끝나면 `lambda.rs` `ponytail:` 주석에서 해결한 항목을 지운다. `ui.html` Lambda 화면에 대상 표시를 넣고, 마을에 배달 화살표가 이미 있으면 그대로 쓴다.
+
+---
+
+## 3일차 (2026-11-27): DynamoDB 정확도 + 정리
+
+### 3-1. DynamoDB 숫자 키 정밀도 (`ddb.rs` 8행)
+- 지금 N 키를 f64로 정렬해서 15자리를 넘으면 정밀도가 깨진다. 예를 들어 `12345678901234567`과 `12345678901234568`이 같은 값으로 본다.
+- 새 크레이트 없이 십진 문자열 비교로 바꾼다.
+  - 부호 → 정수부 길이 → 자릿수 순서로 비교한다. 지수 표기는 정규화하고, 앞뒤 0을 정리한다.
+  - DynamoDB 한계(38자리)를 넘으면 `ValidationException`으로 거부한다.
+- 정렬 키와 `KeyConditionExpression`의 `<`, `BETWEEN`이 모두 이 비교를 쓰게 한다.
+- 스냅샷과 SQLite 저장 형식이 바뀌면 옛 파일을 읽을 수 있는지도 확인한다.
+- 단위 테스트에 큰 수, 음수, 소수, `1e3`과 `1000`이 같은 값인지를 넣는다. sdk_test.py에는 17자리 정렬 키 Query 하나를 넣는다.
+
+### 3-2. 프로젝션 같은 원소 병합 (`ddb.rs` 649행)
+- `ProjectionExpression="a[0].x, a[0].y"`는 지금 원소 두 개가 된다. AWS는 하나로 합친다.
+- `graft`에서 같은 인덱스를 합친다. 단위 테스트를 하나 넣는다.
+
+### 3-3. 마무리 (반드시)
+- 우분투 전체 검증을 다시 돌린다.
 - AGENTS.md를 갱신한다.
-  - 1절: v0.1.5 줄을 넣는다.
-  - 7절: 끝낸 항목에 취소선을 긋는다.
-  - 8절: 한계를 새로 고친다. 조건 연산자와 엄격 모드를 반영한다.
-- 날짜(2026-11-26)를 적는다.
-- README의 기능 목록과 `local-cloud-emulator-plan.md`를 필요한 만큼만 고친다.
-- `town.html` 12절의 손으로 적은 숫자를 실제 값과 맞춘다(SDK 테스트 개수, 시나리오 21개 등).
-- `grep -rn ponytail core/src`(지금 39개)에서 이번에 해결한 항목의 주석을 지운다.
-- 이 문서(`HANDOFF.md`)는 지우고, 남은 일은 AGENTS.md 7절로 옮긴다.
+  - 1절: 11-25~27 추가분을 적는다.
+  - 7절: 새 할 일 목록을 만든다. 남은 `ponytail:` 주석 중에서 고른다.
+  - 8절: 한계를 고친다.
+- `town.html` 12절의 숫자를 고친다.
+- 이 문서(`HANDOFF.md`)는 지우고, AGENTS.md 머리말의 HANDOFF 안내 줄도 지운다.
+- 커밋·푸시하고 CI가 초록인지 확인한다. 우분투를 끈다.
 
-### 3-3. 시간이 남으면 (요청이 없으면 하지 않음)
-- 8번 IPv6 `?api=[::1]`은 하지 않는다. CSP가 IPv6 리터럴을 못 받기 때문에, 사용자가 요청할 때만 한다.
-- 실기기 점검(휴대폰, Safari, 약한 노트북)은 사용자가 있어야 한다. 사용자에게 제안만 한다.
+### 시간이 남으면 (요청이 없으면 하지 않음)
+- IPv6 `?api=[::1]`는 하지 않는다. 사용자가 요청할 때만 한다.
+- 실기기 점검(휴대폰, Safari, 약한 노트북)은 사용자에게 제안만 한다.
+- API Gateway REST v1, Cognito SRP, CFN 중첩 스택처럼 큰 기능은 시작하지 말고 AGENTS.md 7절 후보로만 적는다.
 
 ---
 
@@ -152,4 +162,4 @@ v0.1.5에 들어갈 것:
 - 한 일과 커밋 해시, CI 결과
 - 테스트한 것과 **테스트하지 않은 것**을 구분해 적는다.
 - 우분투 상태: 프로세스 0개, 컨테이너 0개, 전원 끔
-- 다음 날 할 일과 막힌 점(사용자 결정이 필요한 것)
+- 다음 날 할 일과 막힌 점(사용자 결정이 필요한 것). 릴리스 태그 승인은 1일차에 꼭 묻는다.
