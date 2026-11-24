@@ -46,6 +46,33 @@ def test_dynamodb():
     assert ddb.get_item(TableName=t, Key={"pk": {"S": "u1"}, "sk": {"N": "3"}})["Item"]["g"] == {"S": "odd"}
     assert "Item" not in ddb.get_item(TableName=t, Key={"pk": {"S": "nope"}, "sk": {"N": "1"}})
 
+    # Exact decimal keys: 17-digit numbers stay distinct (f64 would collide 565 and 567).
+    big = ["12345678901234565", "12345678901234566", "12345678901234567"]
+    for i, skv in enumerate(big):
+        ddb.put_item(TableName=t, Item={"pk": {"S": "big"}, "sk": {"N": skv}, "n": {"N": str(i)}})
+    r = ddb.query(TableName=t, KeyConditionExpression="pk = :p AND sk BETWEEN :lo AND :hi",
+                  ExpressionAttributeValues={":p": {"S": "big"}, ":lo": {"N": big[0]}, ":hi": {"N": big[2]}})
+    got = [i["sk"]["N"] for i in r["Items"]]
+    assert got == big, got
+    assert ddb.get_item(TableName=t, Key={"pk": {"S": "big"}, "sk": {"N": big[0]}})["Item"]["n"] == {"N": "0"}
+    assert ddb.get_item(TableName=t, Key={"pk": {"S": "big"}, "sk": {"N": big[2]}})["Item"]["n"] == {"N": "2"}
+    r = ddb.query(TableName=t, KeyConditionExpression="pk = :p AND sk < :hi", ScanIndexForward=False,
+                  ExpressionAttributeValues={":p": {"S": "big"}, ":hi": {"N": big[2]}})
+    assert [i["sk"]["N"] for i in r["Items"]] == big[1::-1], "reverse order, strict <"
+    ec = code(ddb.put_item, TableName=t, Item={"pk": {"S": "big"}, "sk": {"N": "123456789012345678901234567890123456789"}})
+    assert ec == "ValidationException", ec
+    ec = code(ddb.get_item, TableName=t, Key={"pk": {"S": "big"}, "sk": {"N": "123456789012345678901234567890123456789"}})
+    assert ec == "ValidationException", "reads reject oversized keys too"
+    # Projection merges same-index paths (a[0].x, a[0].y -> one list element).
+    ddb.put_item(TableName=t, Item={"pk": {"S": "p"}, "sk": {"N": "1"},
+                                     "a": {"L": [{"M": {"x": {"N": "1"}, "y": {"N": "2"}}}]}})
+    proj = ddb.get_item(TableName=t, Key={"pk": {"S": "p"}, "sk": {"N": "1"}}, ProjectionExpression="a[0].x, a[0].y")["Item"]
+    assert proj == {"a": {"L": [{"M": {"x": {"N": "1"}, "y": {"N": "2"}}}]}} or \
+        (len(proj["a"]["L"]) == 1 and proj["a"]["L"][0]["M"].keys() == {"x", "y"}), proj
+    ddb.delete_item(TableName=t, Key={"pk": {"S": "p"}, "sk": {"N": "1"}})
+    for skv in big:
+        ddb.delete_item(TableName=t, Key={"pk": {"S": "big"}, "sk": {"N": skv}})
+
     q = ddb.query(TableName=t, KeyConditionExpression="pk = :p AND sk BETWEEN :a AND :b",
                   ExpressionAttributeValues={":p": {"S": "u1"}, ":a": {"N": "1"}, ":b": {"N": "3"}}, ScanIndexForward=False)
     assert [i["sk"]["N"] for i in q["Items"]] == ["3", "2", "1"], q
@@ -66,7 +93,8 @@ def test_dynamodb():
     pages = ddb.get_paginator("query").paginate(TableName=t, KeyConditionExpression="#p = :p",
                                                  ExpressionAttributeNames={"#p": "pk"}, ExpressionAttributeValues={":p": {"S": "u1"}},
                                                  PaginationConfig={"PageSize": 2})
-    assert [i["sk"]["N"] for p in pages for i in p["Items"]] == ["0", "1", "2", "3", "4"]
+    got = [i["sk"]["N"] for p in pages for i in p["Items"]]
+    assert got == ["0", "1", "2", "3", "4"], got
 
     g = ddb.query(TableName=t, IndexName="byg", KeyConditionExpression="g = :g", ExpressionAttributeValues={":g": {"S": "even"}})
     assert g["Count"] == 3

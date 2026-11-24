@@ -5,16 +5,20 @@ use std::collections::BTreeMap;
 
 pub type Item = Map<String, Value>;
 
-// Sortable key part. ponytail: N keys are f64 (loses precision past ~15 digits); B keys sort by base64 text.
+// Sortable key part. N keys keep their exact decimal string (no f64 rounding, so 17+ digit keys stay distinct);
+// comparison is sign, then integer width, then digit order, with exponents normalized (1e3 == 1000).
+// Numbers with more than 38 significant digits are refused (DynamoDB's precision limit) when used as keys.
+// ponytail: only key attributes are checked; non-key values may carry more digits, and ADD/SET arithmetic
+// still computes in f64.
 #[derive(Clone, Debug)]
 pub enum K {
-    N(f64),
+    N(String),
     S(String),
 }
 impl Ord for K {
     fn cmp(&self, o: &Self) -> Ordering {
         match (self, o) {
-            (K::N(a), K::N(b)) => a.total_cmp(b),
+            (K::N(a), K::N(b)) => dec_cmp(a, b),
             (K::S(a), K::S(b)) => a.cmp(b),
             (K::N(_), _) => Less,
             _ => Greater,
@@ -33,14 +37,100 @@ impl PartialEq for K {
 }
 impl Eq for K {}
 
-fn kpart(av: &Value) -> Option<K> {
+fn kpart(av: &Value) -> Result<K, ApiErr> {
     if let Some(s) = av.get("S").and_then(Value::as_str) {
-        return Some(K::S(s.into()));
+        return Ok(K::S(s.into()));
     }
     if let Some(n) = av.get("N").and_then(Value::as_str) {
-        return n.parse().ok().map(K::N);
+        normalize(n)?; // rejects > 38 significant digits (and malformed numbers)
+        return Ok(K::N(n.into()));
     }
-    av.get("B").and_then(Value::as_str).map(|b| K::S(b.into()))
+    av.get("B").and_then(Value::as_str).map(|b| K::S(b.into())).ok_or_else(|| verr("Invalid attribute value type"))
+}
+
+// (negative, integer digits without leading zeros, fraction digits without trailing zeros)
+fn dec_parts(s: &str) -> Option<(bool, String, String)> {
+    let (neg, s) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let (mant, exp) = match s.split_once(['e', 'E']) {
+        Some((m, e)) => (m, e.parse::<i32>().ok()?),
+        None => (s, 0),
+    };
+    let (mut int, mut frac) = match mant.split_once('.') {
+        Some((i, f)) => (i.to_string(), f.to_string()),
+        None => (mant.to_string(), String::new()),
+    };
+    if !int.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit()) || int.is_empty() && frac.is_empty() {
+        return None;
+    }
+    // Shift the decimal point by the exponent (base-10 slide between int and frac).
+    let exp = exp.clamp(-100_000, 100_000) as i64;
+    match exp {
+        e if e > 0 => {
+            let take = (e as usize).min(frac.len());
+            int += &frac[..take];
+            frac = frac[take..].to_string();
+            if e as usize > take {
+                int += &"0".repeat(e as usize - take);
+            }
+        }
+        e if e < 0 => {
+            let drop = ((-e) as usize).min(int.len());
+            frac = format!("{}{}", &int[int.len() - drop..], frac);
+            int = int[..int.len() - drop].to_string();
+            if (-e) as usize > drop {
+                let zeros = (-e) as usize - drop; // zeros that move in front of the fraction
+                int = String::new();
+                frac = format!("{}{}", "0".repeat(zeros), frac);
+            }
+        }
+        _ => {}
+    }
+    let int = int.trim_start_matches('0').to_string();
+    let frac = frac.trim_end_matches('0').to_string();
+    Some((neg, int, frac))
+}
+
+// Parse and validate a number string: reject > 38 significant digits.
+fn normalize(s: &str) -> Result<(), ApiErr> {
+    let Some((_, int, frac)) = dec_parts(s) else {
+        return Err(err("ValidationException", format!("Supplied AttributeValue is empty or has an invalid number: {s}")));
+    };
+    if int.len() + frac.len() > 38 {
+        return Err(err("ValidationException", format!("Number overflow. Attempting to store more than 38 significant digits in {s}")));
+    }
+    Ok(())
+}
+
+// Exact decimal comparison of two number strings ("1e3" == "1000").
+fn dec_cmp(a: &str, b: &str) -> Ordering {
+    let (na, ia, fa) = dec_parts(a).unwrap_or((false, String::new(), String::new()));
+    let (nb, ib, fb) = dec_parts(b).unwrap_or((false, String::new(), String::new()));
+    let zero = |i: &str, f: &str| i.is_empty() && f.is_empty();
+    if zero(&ia, &fa) || zero(&ib, &fb) {
+        // zero sits between the negatives and the positives ("-0" == "0")
+        return match (zero(&ia, &fa), zero(&ib, &fb)) {
+            (true, true) => Equal,
+            (true, false) => if nb { Greater } else { Less },
+            (false, true) => if na { Less } else { Greater },
+            _ => unreachable!(),
+        };
+    }
+    if na != nb {
+        return if na { Less } else { Greater };
+    }
+    let ord = ia.len().cmp(&ib.len()).then_with(|| ia.cmp(&ib));
+    let ord = if na { ord.reverse() } else { ord };
+    ord.then_with(|| {
+        let n = fa.len().max(fb.len());
+        (0..n).map(|i| {
+            let x = fa.as_bytes().get(i).map_or(b'0', |b| *b);
+            let y = fb.as_bytes().get(i).map_or(b'0', |b| *b);
+            x.cmp(&y)
+        }).find(|o| *o != Equal).unwrap_or(Equal)
+    })
 }
 
 type PK = (K, Option<K>);
@@ -73,7 +163,7 @@ fn not_found() -> ApiErr {
 
 impl Table {
     fn key_of(&self, m: &Item) -> Result<PK, ApiErr> {
-        let part = |n: &String| m.get(n).and_then(kpart).ok_or_else(|| verr(format!("Missing or invalid key attribute: {n}")));
+        let part = |n: &String| m.get(n).ok_or_else(|| verr(format!("Missing or invalid key attribute: {n}"))).and_then(kpart);
         Ok((part(&self.hash)?, self.range.as_ref().map(part).transpose()?))
     }
     // A `Key` parameter must hold exactly the key attributes.
@@ -417,8 +507,9 @@ fn fmt_num(f: f64) -> String {
 }
 
 fn cmp_av(a: &Value, b: &Value) -> Option<Ordering> {
-    if let (Some(x), Some(y)) = (num(a), num(b)) {
-        return x.partial_cmp(&y);
+    // Key conditions and BETWEEN compare numbers exactly (no f64 rounding), like the sort keys themselves.
+    if let (Some(x), Some(y)) = (a.get("N").and_then(Value::as_str), b.get("N").and_then(Value::as_str)) {
+        return Some(dec_cmp(x, y));
     }
     for t in ["S", "B"] {
         if let (Some(x), Some(y)) = (a.get(t).and_then(Value::as_str), b.get(t).and_then(Value::as_str)) {
@@ -645,8 +736,9 @@ fn update(t: &mut Table, r: &Value) -> Result<(Option<Item>, Item), ApiErr> {
     Ok((old, new))
 }
 
-// Puts a projected value back under its path: maps keep their keys, list elements are compacted in order.
-// ponytail: two projected paths under the same list element (a[0].x, a[0].y) become two elements.
+// Puts a projected value back under its path: maps keep their keys; list index a[0].x and a[0].y merge into
+// ONE element (AWS behavior), a later bare a[0] replaces the merged element, and past-the-end indexes
+// compact in order (projected lists are not null-padded).
 fn graft(out: &mut Item, p: &[String], v: Value) {
     let shell = |k: &String| if index(k).is_some() { json!({"L": []}) } else { json!({"M": {}}) };
     if p.len() == 1 {
@@ -656,11 +748,19 @@ fn graft(out: &mut Item, p: &[String], v: Value) {
     let mut cur = out.entry(p[0].clone()).or_insert_with(|| shell(&p[1]));
     for (n, k) in p[1..].iter().enumerate() {
         let next = p.get(n + 2);
+        let leaf = next.is_none();
         let val = next.map_or_else(|| v.clone(), shell);
-        cur = if index(k).is_some() {
+        cur = if let Some(i) = index(k) {
             let Some(l) = cur.get_mut("L").and_then(Value::as_array_mut) else { return };
-            l.push(val);
-            l.last_mut().unwrap()
+            if i < l.len() {
+                if leaf {
+                    l[i] = v.clone(); // a[i] after a[i].x: the whole element replaces the merged shell
+                }
+                &mut l[i]
+            } else {
+                l.push(val);
+                l.last_mut().unwrap()
+            }
         } else {
             let Some(m) = cur.get_mut("M").and_then(Value::as_object_mut) else { return };
             m.entry(k.clone()).or_insert(val)
@@ -694,7 +794,7 @@ fn query(t: &Table, r: &Value, scan: bool) -> Result<Value, ApiErr> {
         Some(ix) => t.index_keys(ix)?,
         None => (t.hash.clone(), t.range.clone()),
     };
-    let sk = |i: &Item| (i.get(&h).and_then(kpart), rk.as_ref().and_then(|n| i.get(n)).and_then(kpart), t.key_of(i).ok());
+    let sk = |i: &Item| (i.get(&h).and_then(|v| kpart(v).ok()), rk.as_ref().and_then(|n| i.get(n)).and_then(|v| kpart(v).ok()), t.key_of(i).ok());
     let mut items: Vec<&Item> = t.items.values().filter(|i| i.contains_key(&h) && rk.as_ref().is_none_or(|n| i.contains_key(n))).collect();
     items.sort_by_cached_key(|i| sk(i));
     // ponytail: Query scans the whole table/index linearly; fine for local data sizes.
@@ -940,8 +1040,8 @@ impl Db {
             let mut items = BTreeMap::new();
             for it in t["items"].as_array().into_iter().flatten() {
                 if let Some(m) = it.as_object() {
-                    if let Some(hk) = m.get(hash).and_then(kpart) {
-                        let rk = range.as_deref().and_then(|r| m.get(r).and_then(kpart));
+                    if let Some(hk) = m.get(hash).and_then(|v| kpart(v).ok()) {
+                        let rk = range.as_deref().and_then(|r| m.get(r)).and_then(|v| kpart(v).ok());
                         items.insert((hk, rk), m.clone());
                     }
                 }
@@ -969,5 +1069,45 @@ mod tests {
         let p = project(&item, &json!({"ProjectionExpression": "tags[2], m.rows[1].n"})).unwrap();
         assert_eq!(Value::Object(p), json!({"tags": {"L": [{"S": "c"}]}, "m": {"M": {"rows": {"L": [{"M": {"n": {"N": "2"}}}]}}}}));
         assert!(parse_cond("tags[x] = :b", &req).is_err() && parse_cond("[0] = :b", &req).is_err());
+    }
+
+    #[test]
+    fn decimal_key_precision() {
+        let c = dec_cmp;
+        assert_eq!(c("12345678901234567", "12345678901234568"), Less, "17 digits stay distinct");
+        assert_eq!(c("12345678901234568", "12345678901234567"), Greater);
+        assert_eq!(c("12345678901234567", "12345678901234567"), Equal);
+        assert_eq!(c("1e3", "1000"), Equal);
+        assert_eq!(c("1e-3", "0.001"), Equal);
+        assert_eq!(c("0.10", "0.1"), Equal);
+        assert_eq!(c("-0", "0"), Equal);
+        assert_eq!(c("0", "1"), Less);
+        assert_eq!(c("0", "-1"), Greater);
+        assert_eq!(c("-2", "0"), Less);
+        assert_eq!(c("0", "0.0001"), Less);
+        assert_eq!(c("1000", "999"), Greater);
+        assert_eq!(c("-1", "2"), Less);
+        assert_eq!(c("-5", "-2"), Less);
+        assert_eq!(c("0.1", "0.2"), Less);
+        assert_eq!(c("1.5", "1.05"), Greater);
+        assert_eq!(c("0.5", "1"), Less);
+        assert!(K::N("5".into()) > K::N("-5".into()));
+        assert!(normalize("12345678901234567890123456789012345678").is_ok(), "38 digits fit");
+        assert!(normalize("123456789012345678901234567890123456789").is_err(), "39 digits overflow");
+        assert!(normalize("1.25e2").is_ok());
+    }
+
+    #[test]
+    fn projection_merges_same_element() {
+        let item: Item = serde_json::from_value(json!({"a": {"L": [{"M": {"x": {"N": "1"}, "y": {"N": "2"}}}]}})).unwrap();
+        let out = project(&item, &json!({"ProjectionExpression": "a[0].x, a[0].y"})).unwrap();
+        let l = out["a"]["L"].as_array().unwrap();
+        assert_eq!(l.len(), 1, "same-index paths merge into one element");
+        assert_eq!(l[0]["M"]["x"]["N"], "1");
+        assert_eq!(l[0]["M"]["y"]["N"], "2");
+        // a bare a[0] after a[0].x replaces the merged element with the whole value.
+        let out = project(&item, &json!({"ProjectionExpression": "a[0].x, a[0]"})).unwrap();
+        assert_eq!(out["a"]["L"].as_array().unwrap().len(), 1);
+        assert_eq!(out["a"]["L"][0]["M"]["y"]["N"], "2", "whole element keeps its siblings");
     }
 }
