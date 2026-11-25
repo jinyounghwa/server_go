@@ -28,6 +28,7 @@
 - 2026-11-25 추가17: Cognito 그룹·Lambda 트리거 — 그룹(`Create/Get/List/DeleteGroup` + `AdminAdd/Remove/ListGroupsForUser`, `GroupExistsException`·중복 가입 방지)으로 토큰 ID·액세스 모두 `cognito:groups` 클레임. `LambdaConfig` 트리거 3종: `PreSignUp`(함수 실패 → `UserLambdaValidationException`, `autoConfirmUser`·`autoVerifyEmail` 반영, 가입 전 실행), `PostConfirmation`(확정 후 최선 실행), `PreTokenGeneration`(`claimsToAddOrOverride`·`claimsToSuppress`를 ID 토큰에 반영해 재서명, 이벤트는 AWS 형식 `{version, triggerSource, userPoolId, userName, request, response}`). 트리거 실행은 main.rs가 오케스트레이션(cognito는 이벤트 생성만). 단위 테스트 45개, boto3 테스트 40개.
 - 2026-11-25 추가18: Kinesis 보존 기간·`UpdateShardCount` — `RetentionPeriodHours`(기본 24, `Increase/DecreaseStreamRetentionPeriod` 24..8760 범위·방향 검증, boto3 와이어의 `RetentionPeriodHours` 키도 수용), 만료 레코드는 `GetRecords`·TRIM_HORIZON·람다 폴링에서 숨김(주입 시계로 단위 테스트, 저장은 유지). `UpdateShardCount`(UNIFORM_SCALING, 1..64, 대상 수 ≠ 현재 열린 샤드 수): 열린 샤드 전부 닫고 균등 분할로 재생성, 기존 레코드는 닫힌 샤드에 그대로. S3 ListObjectsV2 경계 점검(키 1000개·MaxKeys 7·delimiter 이어받기 — 코드 수정 불필요, 테스트만 추가). 단위 테스트 47개, boto3 테스트 42개.
 - 2026-11-25 추가19: CloudFormation 제자리 업데이트·Export — 속성 변화가 타입별 in-place 목록(SQS 큐 속성·Lambda 환경/메모리/타임아웃/설명·SNS DisplayName·DDB 처리량, `UpdateTable` 신규)에 있으면 같은 물리 ID로 업데이트(이벤트 UPDATE_IN_PROGRESS/COMPLETE), 아니면 기존처럼 교체. `Outputs.Export.Name` → `ListExports`(이름 정렬)·`ListImports`·`Fn::ImportValue`(배포된 스택의 export에서 해석), import하는 스택이 있으면 export 스택 삭제·값 변경 거부. 단위 테스트 48개, boto3 테스트 43개.
+- 2026-11-25 추가20: 검증 에이전트 시나리오 6개 추가(21→27: 보안 4종 `sec-clock-skew`·`sec-sts-expired`·`sec-strict-delivery`·`sec-jwt-bypass`, 사고 2종 `inc-lambda-dest`·`inc-events-dlq`, `poll_sqs_body`·`xml_tag` 리팩토링), JS v3(5→8)·Rust SDK(4→7) 스위트 확장(FIFO·고정밀 숫자 키·중첩 경로·IAM 조건/버킷 정책·S3 페이지네이션), 연대기 섬 숫자 동기화.
 - `v0.1.0` 릴리스 완료(2026-11-21): 바이너리 3종 + SHA256SUMS, Homebrew sha256 반영.
 - `v0.1.5` 릴리스(2026-11-25): EventBridge `cron()`·InputTransformer, Kinesis→Lambda 매핑, DynamoDB 중첩 경로, Lambda 버전·별칭, IAM 조건 연산자(Numeric·Date·IpAddress·한정자), `STRICT_DELIVERY=1`, SNS 필터 numeric·suffix, SigV4 시계 오차, STS 만료, Kinesis 리샤딩, S3 알림 대상 검증, Route53 라우팅 정책, Logs 필터 패턴. 우분투 전체 검증(스위트 두 모드) 통과 뒤 태그. Homebrew는 태그 뒤 반영.
 - `v0.1.4` 릴리스(2026-11-22): ALB 요청별 규칙 라우팅, aws-chunked 트레일러 서명 검증, SNS·EventBridge·S3 배달의 대상 정책 판정(서비스 주체). Homebrew 0.1.4.
@@ -47,7 +48,7 @@ core/            Rust 단일 바이너리 (axum + tokio), 모든 서비스가 �
   src/<svc>.rs   서비스별 모듈. 상태 struct + handle() + admin()
   src/ui.html    관리 GUI (/_ui), town.html 캐릭터 마을 (/_town) — include_str!로 내장
 gui/             Tauri 2 창. /_ui를 여는 껍데기일 뿐
-tests/sdk_test.py  boto3 호환성 테스트 38개 (주 통합 테스트), tests/js·tests/rust는 JS v3(5개)·Rust SDK(4개) 스위트
+tests/sdk_test.py  boto3 호환성 테스트 43개 (주 통합 테스트), tests/js·tests/rust는 JS v3(8개)·Rust SDK(7개) 스위트
 netlify.toml     예전 Netlify 설정(지금은 GitHub Pages `pages.yml`로 배포)
 ```
 
@@ -125,8 +126,7 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
 
 ## 6. 검증 에이전트 요점 (inspector.rs)
 - 실행기·판정기는 결정적 코드, 대상은 127.0.0.1만. LLM은 시나리오 제안만 한다(꺼져 있으면 내장 시나리오만).
-- 내장 시나리오 21개: 보안 8(버킷 정책 Deny·잠김 방지 포함), 장애 6(스로틀·5xx·지연·부분 실패·연결 끊김·부하 중 재생성), 사고 4(DLQ·Lambda 반복 실패·
-  큐 폭주·저장소 한도), 성능 2(동시 처리량·메모리 증가), 퍼징 1. 파괴적 작업은 `rc-insp-` 접두사 리소스에서만.
+- 내장 시나리오 27개: 보안 12(버킷 정책 Deny·잠김 방지·시계 오차·STS 만료·배달 정책·JWT 우회 포함), 장애 6(스로틀·5xx·지연·부분 실패·연결 끊김·부하 중 재생성), 사고 6(DLQ·Lambda 반복 실패·큐 폭주·저장소 한도·Lambda Destinations·EventBridge DLQ), 성능 2(동시 처리량·메모리 증가), 퍼징 1. 파괴적 작업은 `rc-insp-` 접두사 리소스에서만.
 - 요청은 `local_http()` 하나로 나가며 `resign()`이 진짜 SigV4로 서명한다(`sig_header()`의 `Signature=00`은 자리표시).
   `VERIFY_SIGV4=1`이면 서명 없는 요청도 루트로 서명한다. 서명 없이 보내야 하는 검사는 `x-rc-unsigned` 헤더를 단다.
 - 새 시나리오: `sc_x()` 함수 → `run_inner()`의 `plan` 목록과 `match id`에 추가 → `make_result()`로 결과.
@@ -137,7 +137,7 @@ SQS 메시지 속성, Step Functions 동시 실행·실패 중단, ALB 경로·�
 3D 마을 브라우저·휴대폰 점검)은 모두 끝났다. 남은 한계는 각 파일의 `ponytail:` 주석(`grep -rn ponytail core/src`)이 목록이다.
 
 1. **실기기 점검**(사용자 도움 필요): 실제 휴대폰·실제 Safari·GPU가 약한 노트북에서 Pages 마을을 연다. 지금까지는 우분투 Playwright 에뮬레이션만 했다.
-   연대기 섬 숫자(SDK 테스트 34/5/4개, 시나리오 21개, GPU 65°C)는 `town.html` 12절에 손으로 적은 값이니 바뀌면 같이 고친다.
+   연대기 섬 숫자(SDK 테스트 43/8/7개, 시나리오 27개, GPU 65°C)는 `town.html` 12절에 손으로 적은 값이니 바뀌면 같이 고친다.
 2. ~~EventBridge `cron()`(UTC, L·W·#은 거부)·InputTransformer·InputPath `[0]`~~ 완료(2026-11-22).
 3. ~~Kinesis → Lambda 이벤트 소스 매핑~~ 완료(2026-11-22, `lambda.rs` `poll_kinesis`: 샤드별 순서, 실패 배치는 재시도하며 샤드를 막고 `MaximumRetryAttempts` 뒤 건너뜀).
 4. ~~DynamoDB 경로 `a.b[0]`~~ 완료(2026-11-22): 업데이트(SET 끝 너머는 추가, REMOVE는 원래 인덱스 기준)·조건·프로젝션(중첩 경로 유지).

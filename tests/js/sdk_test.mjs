@@ -3,8 +3,8 @@
 //   cd tests/js && npm install && npm test
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import { DynamoDBClient, CreateTableCommand, PutItemCommand, GetItemCommand, QueryCommand, DeleteTableCommand } from "@aws-sdk/client-dynamodb";
-import { S3Client, CreateBucketCommand, PutObjectCommand, GetObjectCommand, ListObjectsV2Command, DeleteObjectCommand, DeleteBucketCommand } from "@aws-sdk/client-s3";
+import { DynamoDBClient, CreateTableCommand, PutItemCommand, GetItemCommand, UpdateItemCommand, QueryCommand, DeleteTableCommand } from "@aws-sdk/client-dynamodb";
+import { S3Client, CreateBucketCommand, PutObjectCommand, GetObjectCommand, ListObjectsV2Command, PutBucketPolicyCommand, DeleteBucketPolicyCommand, DeleteObjectCommand, DeleteBucketCommand } from "@aws-sdk/client-s3";
 import { SQSClient, CreateQueueCommand, SendMessageCommand, ReceiveMessageCommand, DeleteMessageCommand, DeleteQueueCommand, GetQueueUrlCommand } from "@aws-sdk/client-sqs";
 import { IAMClient, CreateUserCommand, CreateAccessKeyCommand, PutUserPolicyCommand, DeleteUserPolicyCommand, DeleteAccessKeyCommand, DeleteUserCommand } from "@aws-sdk/client-iam";
 import { STSClient, GetCallerIdentityCommand } from "@aws-sdk/client-sts";
@@ -151,12 +151,96 @@ async function testSSMSecretsKMS() {
   assert.equal(Buffer.from(dec.Plaintext).toString("utf8"), "hello-kms");
 }
 
+async function testSNSFifo() {
+  const sns = new SNSClient(cfg());
+  const sqs = new SQSClient(cfg());
+  const qName = `js-fq-${run}.fifo`;
+  const tName = `js-ft-${run}.fifo`;
+  const { QueueUrl } = await sqs.send(new CreateQueueCommand({ QueueName: qName, Attributes: { FifoQueue: "true", ContentBasedDeduplication: "true" } }));
+  const { TopicArn } = await sns.send(new CreateTopicCommand({ Name: tName, Attributes: { FifoTopic: "true", ContentBasedDeduplication: "true" } }));
+  await sns.send(new SubscribeCommand({
+    TopicArn, Protocol: "sqs", Endpoint: `arn:aws:sqs:${region}:000000000000:${qName}`,
+    Attributes: { RawMessageDelivery: "true" },
+  }));
+  await sns.send(new PublishCommand({ TopicArn, Message: "same-payload", MessageGroupId: "g1" }));
+  await sns.send(new PublishCommand({ TopicArn, Message: "same-payload", MessageGroupId: "g1" }));
+  const got = await sqs.send(new ReceiveMessageCommand({ QueueUrl, MaxNumberOfMessages: 5 }));
+  assert.equal(got.Messages.length, 1);
+  assert.equal(got.Messages[0].Body, "same-payload");
+  await sns.send(new DeleteTopicCommand({ TopicArn }));
+  await sqs.send(new DeleteQueueCommand({ QueueUrl }));
+}
+
+async function testDynamoDBDecimalAndNested() {
+  const ddb = new DynamoDBClient(cfg());
+  const TableName = `js-num-${run}`;
+  await ddb.send(new CreateTableCommand({
+    TableName, BillingMode: "PAY_PER_REQUEST",
+    KeySchema: [{ AttributeName: "pk", KeyType: "HASH" }, { AttributeName: "sk", KeyType: "RANGE" }],
+    AttributeDefinitions: [{ AttributeName: "pk", AttributeType: "S" }, { AttributeName: "sk", AttributeType: "N" }],
+  }));
+  const k1 = "90071992547409920001";
+  const k2 = "90071992547409920002";
+  await ddb.send(new PutItemCommand({ TableName, Item: { pk: { S: "p" }, sk: { N: k1 }, doc: { M: { items: { L: [{ M: { x: { N: "1" }, y: { N: "2" } } }] } } } } }));
+  await ddb.send(new PutItemCommand({ TableName, Item: { pk: { S: "p" }, sk: { N: k2 } } }));
+  await ddb.send(new UpdateItemCommand({
+    TableName, Key: { pk: { S: "p" }, sk: { N: k1 } },
+    UpdateExpression: "SET doc.items[0].x = :v",
+    ExpressionAttributeValues: { ":v": { N: "99" } },
+  }));
+  const q = await ddb.send(new QueryCommand({
+    TableName, KeyConditionExpression: "pk = :p AND sk BETWEEN :a AND :b",
+    ExpressionAttributeValues: { ":p": { S: "p" }, ":a": { N: k1 }, ":b": { N: k2 } },
+  }));
+  assert.deepEqual(q.Items.map((i) => i.sk.N), [k1, k2]);
+  assert.equal(q.Items[0].doc.M.items.L[0].M.x.N, "99");
+  await ddb.send(new DeleteTableCommand({ TableName }));
+}
+
+async function testIAMConditionsAndBucketPolicy() {
+  const iam = new IAMClient(cfg());
+  const s3Root = new S3Client({ ...cfg(), forcePathStyle: true });
+  const Bucket = `js-pol-${run}`;
+  const UserName = `js-cond-${run}`;
+  await s3Root.send(new CreateBucketCommand({ Bucket }));
+  await s3Root.send(new PutObjectCommand({ Bucket, Key: "a.txt", Body: "ok" }));
+  await iam.send(new CreateUserCommand({ UserName }));
+  const { AccessKey } = await iam.send(new CreateAccessKeyCommand({ UserName }));
+  await iam.send(new PutUserPolicyCommand({
+    UserName, PolicyName: "ip-allow",
+    PolicyDocument: JSON.stringify({
+      Version: "2012-10-17",
+      Statement: [{ Effect: "Allow", Action: "s3:GetObject", Resource: `arn:aws:s3:::${Bucket}/*`, Condition: { IpAddress: { "aws:SourceIp": "127.0.0.0/8" } } }],
+    }),
+  }));
+  const s3User = new S3Client({ ...cfg(AccessKey.AccessKeyId, AccessKey.SecretAccessKey), forcePathStyle: true });
+  const got = await s3User.send(new GetObjectCommand({ Bucket, Key: "a.txt" }));
+  assert.equal(await got.Body.transformToString(), "ok");
+  await s3Root.send(new PutBucketPolicyCommand({
+    Bucket,
+    Policy: JSON.stringify({
+      Version: "2012-10-17",
+      Statement: [{ Effect: "Deny", Principal: { AWS: `arn:aws:iam::000000000000:user/${UserName}` }, Action: "s3:GetObject", Resource: `arn:aws:s3:::${Bucket}/*` }],
+    }),
+  }));
+  await expectError(() => s3User.send(new GetObjectCommand({ Bucket, Key: "a.txt" })), ["AccessDenied"]);
+  await s3Root.send(new DeleteBucketPolicyCommand({ Bucket }));
+  await iam.send(new DeleteUserPolicyCommand({ UserName, PolicyName: "ip-allow" }));
+  await iam.send(new DeleteAccessKeyCommand({ UserName, AccessKeyId: AccessKey.AccessKeyId }));
+  await iam.send(new DeleteUserCommand({ UserName }));
+  await s3Root.send(new DeleteObjectCommand({ Bucket, Key: "a.txt" }));
+  await s3Root.send(new DeleteBucketCommand({ Bucket }));
+}
+
 for (const [name, fn] of [
   ["js_dynamodb", testDynamoDB],
   ["js_s3", testS3],
   ["js_sqs_sns", testSQSAndSNS],
   ["js_iam_sts", testIAMAndSTS],
   ["js_ssm_secrets_kms", testSSMSecretsKMS],
+  ["js_sns_fifo", testSNSFifo],
+  ["js_ddb_decimal_and_nested", testDynamoDBDecimalAndNested],
+  ["js_iam_conditions_and_policy", testIAMConditionsAndBucketPolicy],
 ]) {
   await fn();
   console.log("ok", name);

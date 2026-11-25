@@ -656,7 +656,7 @@ const B = [
   {id: "ecs",      name: "ECS 컨테이너항구",  sub: "Docker Tasks · Svc",   district: "항구·AI 지구", kind: "harbor",   color: 0x0284c7, hex: "#38bdf8", svc: ["ecs"],            x: 11,  z: 29,  roadZ: 20},
   {id: "r53",      name: "Route 53 DNS등대",  sub: "Zones · UDP :10053",   district: "항구·AI 지구", kind: "lighthouse", color: 0xef4444, hex: "#fca5a5", svc: ["route53"],      x: 21,  z: 29,  roadZ: 20},
   {id: "agent",    name: "AI 해설연구소",     sub: "Ollama · Explain/Ask", district: "항구·AI 지구", kind: "ai_lab",   color: 0x6366f1, hex: "#818cf8", svc: ["agent"],          x: 32,  z: 29,  roadZ: 20},
-  {id: "insp",     name: "검사관 본부",       sub: "21 Security/Fuzz Tests", district: "항구·AI 지구", kind: "hq",     color: 0x9333ea, hex: "#c084fc", svc: ["inspector"],      x: 42,  z: 29,  roadZ: 20},
+  {id: "insp",     name: "검사관 본부",       sub: "27 Security/Fuzz Tests", district: "항구·AI 지구", kind: "hq",     color: 0x9333ea, hex: "#c084fc", svc: ["inspector"],      x: 42,  z: 29,  roadZ: 20},
   {id: "chaos",    name: "Chaos 장애발전소",  sub: "Fault · Latency · 5xx", district: "항구·AI 지구", kind: "chaos",   color: 0xeab308, hex: "#fde047", svc: ["chaos"],          x: 51,  z: 0,   roadZ: 0},
 ];
 
@@ -1910,7 +1910,7 @@ const STAGES = [
   ["7", "3D 마을", "SSE·애니메이션·Pages", "/_town 3D 도시, 요청마다 밴·드론·정문 경비, 결과 기호, GitHub Pages에서 로컬 에뮬레이터에 연결"],
   ["8", "LLM 해설", "Ollama·도구 4개", "우분투 Ollama qwen3.5:9b, 스키마 제한 출력, 도구 4개, LLM 없을 때 규칙 기반 설명, 파괴 작업 확인 토큰"],
   ["9", "품질·릴리스", "SDK 3종·v0.1.5", "boto3·JS v3·Rust SDK 스위트, 퍼징·벤치, 보안 강화, 바이너리 3종·Homebrew·Dockerfile, v0.1.0~v0.1.5"],
-  ["10", "검증 에이전트", "시나리오 21·재생", "보안 8·장애 6·사고 4·성능 2·퍼징 1, SDK 응답 대조, 회귀 재생, 127.0.0.1 전용 결정적 실행기"],
+  ["10", "검증 에이전트", "시나리오 27·재생", "보안 12·장애 6·사고 6·성능 2·퍼징 1, SDK 응답 대조, 회귀 재생, 127.0.0.1 전용 결정적 실행기"],
 ];
 {
   const cw = 186, cv = document.createElement("canvas"); cv.width = cw * STAGES.length; cv.height = 256;
@@ -1968,7 +1968,7 @@ const pans = [-3.4, 3.4].map(px => { const p = new THREE.Group(); p.position.x =
 pans[0].add(mkBox(1.2, 1.2, 1.2, mStd({ color: 0x3b82f6, emissive: 0x1d4ed8, emissiveIntensity: 0.3 }), 0, -1.05, 0));
 pans[1].add(mkBox(0.5, 0.5, 0.5, mStd({ color: 0x93c5fd }), 0, -1.4, 0));
 
-landmark("sdk", "SDK 호환성 경기장", "boto3 43 · JS v3 · Rust", "#fbbf24", -16, 156, "공식 SDK 3종(Python boto3 43개, JS @aws-sdk v3, Rust aws-sdk)으로 기본·서명 검증 두 모드를 CI가 매번 돌립니다. 전광판은 이 마을이 받은 실제 요청 수입니다.", 20, 7, 20, 7.8);
+landmark("sdk", "SDK 호환성 경기장", "boto3 43 · JS v3 8 · Rust 7", "#fbbf24", -16, 156, "공식 SDK 3종(Python boto3 43개, JS @aws-sdk v3 8개, Rust aws-sdk 7개)으로 기본·서명 검증 두 모드를 CI가 매번 돌립니다. 전광판은 이 마을이 받은 실제 요청 수입니다.", 20, 7, 20, 7.8);
 {
   const pts = [[6.2, 0], [10, 0], [10, 3.4], [9.5, 3.4], [6.2, 0.6]].map(([x, y]) => new THREE.Vector2(x, y));
   hp("matte", new THREE.LatheGeometry(pts, 48), 0xd1d5db, -16, 0.05, 156);
@@ -2033,7 +2033,7 @@ hp("glow", Bx(0.9, 0.06, 0.06), 0xfacc15, 63.6, 5 * 70 / 80, 152.2);
 const fan = new THREE.Group(); fan.position.set(58, 4.2, 150); scene.add(fan);
 for (let k = 0; k < 4; k++) { const bl = mkBox(2.2, 0.06, 0.45, mStd({ color: 0x94a3b8, metalness: 0.7 })); bl.rotation.y = k * Math.PI / 4; fan.add(bl); }
 
-landmark("range", "검사관 훈련장", "시나리오 21개", "#c084fc", -70, 138, "보안 8(빨강)·장애 6(노랑)·사고 4(주황)·성능 2(파랑)·퍼징 1(보라). 검사관 시나리오 결과가 올 때마다 기둥이 차례로 켜집니다.", 15, 6, 15, 6.8);
+landmark("range", "검사관 훈련장", "시나리오 27개", "#c084fc", -70, 138, "보안 12(빨강)·장애 6(노랑)·사고 6(주황)·성능 2(파랑)·퍼징 1(보라). 검사관 시나리오 결과가 올 때마다 기둥이 차례로 켜집니다.", 15, 6, 15, 6.8);
 const RANGE_CAT = [...Array(8).fill(0xef4444), ...Array(6).fill(0xfacc15), ...Array(4).fill(0xf97316), 0x38bdf8, 0x38bdf8, 0xa855f7];
 const rangeOrbs = new THREE.InstancedMesh(new THREE.SphereGeometry(0.42, 14, 10), new THREE.MeshBasicMaterial({ toneMapped: false }), RANGE_CAT.length);
 const rangeGlow = new Float32Array(RANGE_CAT.length), rangeSpot = [];
@@ -2140,7 +2140,7 @@ function drawHeritageScreens() {
   c = board.getContext("2d");
   c.fillStyle = "#020617"; c.fillRect(0, 0, 1024, 384);
   c.textAlign = "center"; c.fillStyle = "#fbbf24"; c.font = "800 44px system-ui, sans-serif"; c.fillText("SDK 호환성 경기장", 512, 64);
-  [["Python boto3", "38", "#60a5fa"], ["JS @aws-sdk v3", "5", "#fde047"], ["Rust aws-sdk", "4", "#fdba74"]].forEach(([n, k, col], i) => {
+  [["Python boto3", "43", "#60a5fa"], ["JS @aws-sdk v3", "8", "#fde047"], ["Rust aws-sdk", "7", "#fdba74"]].forEach(([n, k, col], i) => {
     const x = 180 + i * 332; c.fillStyle = col; c.font = "700 27px system-ui, sans-serif"; c.fillText(n, x, 130);
     c.font = "800 64px system-ui, sans-serif"; c.fillText(k + " ✓", x, 204);
   });

@@ -75,7 +75,8 @@ fn resign(method: &str, path: &str, host: &str, headers: &[(&str, &str)], body: 
             let svc = match get("x-amz-target") {
                 Some(t) => ["dynamodb", "sqs", "secretsmanager", "ssm", "kms", "logs", "events", "states", "cognito-idp", "kinesis", "ecs"]
                     .into_iter().find(|s| json_target_prefix(s).is_some_and(|p| t.starts_with(p))).unwrap_or("s3"),
-                None if path.starts_with("/2015-03-31/") => "lambda",
+                None if path.starts_with("/2015-03-31/") || path.starts_with("/2019-09-25/") => "lambda",
+                None if path.starts_with("/v2/") => "apigateway",
                 None => "s3",
             };
             root = sig_header("test", svc);
@@ -1098,6 +1099,264 @@ pub async fn run(app: &Arc<App>, req: &Value) -> Result<Value, ApiErr> {
     res
 }
 
+// Poll an SQS queue until a message arrives or max_tries (100ms each) elapses.
+async fn poll_sqs_body(q_url: &str, max_tries: usize) -> Option<String> {
+    if q_url.is_empty() {
+        return None;
+    }
+    for _ in 0..max_tries {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Ok(r) = call_json("sqs", "ReceiveMessage", &json!({"QueueUrl": q_url, "MaxNumberOfMessages": 1}), None).await {
+            let v: Value = serde_json::from_str(&r.body).unwrap_or_default();
+            if let Some(b) = v["Messages"][0]["Body"].as_str() {
+                return Some(b.to_string());
+            }
+        }
+    }
+    None
+}
+
+// Extract the text inside `<tag>...</tag>` from an XML response.
+fn xml_tag(body: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let rest = body.split_once(&open)?.1;
+    Some(rest.split_once(&close)?.0.to_string())
+}
+
+// Security: stale x-amz-date (>15 min clock skew) must be rejected with RequestTimeTooSkewed under VERIFY_SIGV4=1.
+async fn sc_clock_skew() -> Value {
+    let t0 = Instant::now();
+    let hdrs = [
+        ("x-amz-target", "DynamoDB_20120810.ListTables"),
+        ("content-type", "application/x-amz-json-1.0"),
+        ("x-amz-date", "20200101T000000Z"),
+        ("authorization", "AWS4-HMAC-SHA256 Credential=test/20200101/us-east-1/dynamodb/aws4_request, SignedHeaders=host;x-amz-date, Signature=deadbeef"),
+        ("x-rc-unsigned", "1"),
+    ];
+    let repro = vec![repro_step("POST", "/", &hdrs[..4], "{}")];
+    match local_http("POST", "/", &hdrs, b"{}").await {
+        Ok(r) => {
+            let ok = if *crate::VERIFY {
+                (r.status == 400 || r.status == 403) && r.error_code.as_deref() == Some("RequestTimeTooSkewed")
+            } else {
+                r.status < 500
+            };
+            let detail = if *crate::VERIFY {
+                if ok { format!("15분 이상 어긋난 x-amz-date 요청이 HTTP {} RequestTimeTooSkewed로 거부됐습니다.", r.status) }
+                else { format!("기대 400/403 RequestTimeTooSkewed, 실제 HTTP {} ({:?})", r.status, r.error_code) }
+            } else {
+                "VERIFY_SIGV4=0 모드에서는 5xx 없이 통과했습니다 (시계 오차 거부는 VERIFY_SIGV4=1에서 활성).".into()
+            };
+            make_result("sec-clock-skew", "SigV4 시계 오차(>15분) 거부", "security", "high", "iam", ok, *crate::VERIFY && ok,
+                detail, t0.elapsed().as_secs_f64() * 1000.0,
+                json!({"verify_sigv4": *crate::VERIFY, "error_code": "RequestTimeTooSkewed"}),
+                json!({"status": r.status, "error_code": r.error_code}), repro)
+        }
+        Err(e) => make_result("sec-clock-skew", "SigV4 시계 오차(>15분) 거부", "security", "high", "iam", false, false, e,
+            t0.elapsed().as_secs_f64() * 1000.0, json!({}), json!({}), repro),
+    }
+}
+
+// Security: an expired STS AssumeRole session key must be rejected with ExpiredToken in both modes.
+async fn sc_sts_expired(tag: &str) -> Value {
+    let t0 = Instant::now();
+    let role = format!("{PREFIX}exp-{tag}");
+    let trust = json!({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": format!("arn:aws:iam::{ACCOUNT}:root")}, "Action": "sts:AssumeRole"}]}).to_string();
+    let _ = call_query("iam", "2010-05-08", "CreateRole", &[("RoleName", &role), ("AssumeRolePolicyDocument", &trust)], Some("test")).await;
+    let rarn = format!("arn:aws:iam::{ACCOUNT}:role/{role}");
+    let ar = call_query("sts", "2011-06-15", "AssumeRole", &[("RoleArn", &rarn), ("RoleSessionName", "insp"), ("DurationSeconds", "-1")], Some("test")).await;
+    let akid = ar.as_ref().ok().and_then(|r| xml_tag(&r.body, "AccessKeyId")).unwrap_or_default();
+    let probe = if akid.is_empty() {
+        Err("AssumeRole 임시 키 발급 실패".into())
+    } else {
+        call_json("dynamodb", "ListTables", &json!({}), Some(&akid)).await
+    };
+    let _ = call_query("iam", "2010-05-08", "DeleteRole", &[("RoleName", &role)], Some("test")).await;
+    let repro = vec![repro_step("POST", "/", &[("x-amz-target", "DynamoDB_20120810.ListTables")], "{}")];
+    match probe {
+        Ok(r) => {
+            let ok = (r.status == 400 || r.status == 403) && r.error_code.as_deref() == Some("ExpiredToken");
+            make_result("sec-sts-expired", "만료된 STS 세션 키 거부", "security", "high", "iam", ok, ok,
+                if ok { format!("만료된 STS AssumeRole 임시 키 요청이 HTTP {} ExpiredToken으로 거부됐습니다.", r.status) }
+                else { format!("기대 400/403 ExpiredToken, 실제 HTTP {} ({:?})", r.status, r.error_code) },
+                t0.elapsed().as_secs_f64() * 1000.0, json!({"status_in": [400, 403], "error_code": "ExpiredToken"}),
+                json!({"status": r.status, "error_code": r.error_code}), repro)
+        }
+        Err(e) => make_result("sec-sts-expired", "만료된 STS 세션 키 거부", "security", "high", "iam", false, false, e,
+            t0.elapsed().as_secs_f64() * 1000.0, json!({"status_in": [400, 403], "error_code": "ExpiredToken"}), json!({}), repro),
+    }
+}
+
+// Security: SNS -> SQS delivery blocked by target queue policy (or missing policy under STRICT_DELIVERY=1).
+async fn sc_strict_delivery(tag: &str) -> Value {
+    let t0 = Instant::now();
+    let q_name = format!("{PREFIX}sdq-{tag}");
+    let t_name = format!("{PREFIX}sdt-{tag}");
+    let q_r = call_json("sqs", "CreateQueue", &json!({"QueueName": q_name}), None).await;
+    let q_url = q_r.as_ref().ok().and_then(|r| serde_json::from_str::<Value>(&r.body).ok()).and_then(|v| v["QueueUrl"].as_str().map(String::from)).unwrap_or_default();
+    let q_arn = format!("arn:aws:sqs:{}:{ACCOUNT}:{q_name}", *REGION);
+    let t_r = call_query("sns", "2010-03-31", "CreateTopic", &[("Name", &t_name)], Some("test")).await;
+    let t_arn = t_r.as_ref().ok().and_then(|r| xml_tag(&r.body, "TopicArn")).unwrap_or_default();
+    if !*crate::STRICT {
+        // Default permissive mode allows policy-less targets, so attach an explicit Deny queue policy.
+        let pol = json!({"Version": "2012-10-17", "Statement": [{"Effect": "Deny", "Principal": {"Service": "sns.amazonaws.com"}, "Action": "sqs:SendMessage", "Resource": q_arn}]}).to_string();
+        let _ = call_json("sqs", "SetQueueAttributes", &json!({"QueueUrl": q_url, "Attributes": {"Policy": pol}}), None).await;
+    }
+    let _ = call_query("sns", "2010-03-31", "Subscribe", &[("TopicArn", &t_arn), ("Protocol", "sqs"), ("Endpoint", &q_arn)], Some("test")).await;
+    let _ = call_query("sns", "2010-03-31", "Publish", &[("TopicArn", &t_arn), ("Message", "should-be-blocked")], Some("test")).await;
+    let arrived = poll_sqs_body(&q_url, 4).await.is_some();
+    if !t_arn.is_empty() {
+        let _ = call_query("sns", "2010-03-31", "DeleteTopic", &[("TopicArn", &t_arn)], Some("test")).await;
+    }
+    if !q_url.is_empty() {
+        let _ = call_json("sqs", "DeleteQueue", &json!({"QueueUrl": q_url}), None).await;
+    }
+    let ok = !*ENFORCE || !arrived;
+    let mode = if *crate::STRICT { "STRICT_DELIVERY=1 (정책 없음 거부)" } else { "기본 모드 (큐 정책 명시적 Deny 거부)" };
+    let repro = vec![repro_step("POST", "/", &[("content-type", "application/x-www-form-urlencoded")], "Action=Publish&Version=2010-03-31")];
+    make_result("sec-strict-delivery", "SNS → SQS 서비스 주체 배달 정책 차단", "security", "high", "sns", ok, *ENFORCE && ok,
+        if ok { format!("{mode}: 허용되지 않은 SNS 배달이 대상 큐에 도착하지 못했습니다.") }
+        else { format!("{mode}: 차단되어야 할 메시지가 대상 큐에 도착했습니다.") },
+        t0.elapsed().as_secs_f64() * 1000.0, json!({"arrived": false, "strict_delivery": *crate::STRICT}),
+        json!({"arrived": arrived}), repro)
+}
+
+// Security: API Gateway JWT authorizer must reject external issuers, missing tokens (401), and tampered tokens (403).
+async fn sc_jwt_bypass(tag: &str) -> Value {
+    let t0 = Instant::now();
+    let gw_auth = sig_header("test", "apigateway");
+    let lam_auth = sig_header("test", "lambda");
+    let pname = format!("{PREFIX}jwt-{tag}");
+    let fname = format!("{PREFIX}jwtfn-{tag}");
+    let pool_r = call_json("cognito-idp", "CreateUserPool", &json!({"PoolName": pname}), None).await;
+    let pool_id = pool_r.as_ref().ok().and_then(|r| serde_json::from_str::<Value>(&r.body).ok()).and_then(|v| v["UserPool"]["Id"].as_str().map(String::from)).unwrap_or_default();
+    let z = make_py_zip("def handler(e, c):\n    return {'ok': True}\n").unwrap_or_default();
+    let _ = local_http("POST", "/2015-03-31/functions", &[("content-type", "application/json"), ("authorization", &lam_auth)],
+        json!({"FunctionName": fname, "Runtime": "python3.12", "Role": format!("arn:aws:iam::{ACCOUNT}:role/r"),
+               "Handler": "index.handler", "Code": {"ZipFile": z}}).to_string().as_bytes()).await;
+    let api_r = local_http("POST", "/v2/apis", &[("content-type", "application/json"), ("authorization", &gw_auth)],
+        json!({"name": pname, "protocolType": "HTTP"}).to_string().as_bytes()).await;
+    let api_id = api_r.as_ref().ok().and_then(|r| serde_json::from_str::<Value>(&r.body).ok()).and_then(|v| v["apiId"].as_str().map(String::from)).unwrap_or_default();
+
+    let ext_r = local_http("POST", &format!("/v2/apis/{api_id}/authorizers"), &[("content-type", "application/json"), ("authorization", &gw_auth)],
+        json!({"name": "ext", "authorizerType": "JWT", "identitySource": ["$request.header.Authorization"],
+               "jwtConfiguration": {"issuer": "https://evil.example.com", "audience": ["c1"]}}).to_string().as_bytes()).await;
+    let iss = format!("{}/_cognito/{pool_id}", endpoint());
+    let auth_r = local_http("POST", &format!("/v2/apis/{api_id}/authorizers"), &[("content-type", "application/json"), ("authorization", &gw_auth)],
+        json!({"name": "cog", "authorizerType": "JWT", "identitySource": ["$request.header.Authorization"],
+               "jwtConfiguration": {"issuer": iss, "audience": ["c1"]}}).to_string().as_bytes()).await;
+    let aid = auth_r.as_ref().ok().and_then(|r| serde_json::from_str::<Value>(&r.body).ok()).and_then(|v| v["authorizerId"].as_str().map(String::from)).unwrap_or_default();
+    let integ_r = local_http("POST", &format!("/v2/apis/{api_id}/integrations"), &[("content-type", "application/json"), ("authorization", &gw_auth)],
+        json!({"integrationType": "AWS_PROXY", "integrationUri": format!("arn:aws:lambda:{}:{ACCOUNT}:function:{fname}", *REGION), "payloadFormatVersion": "2.0"}).to_string().as_bytes()).await;
+    let iid = integ_r.as_ref().ok().and_then(|r| serde_json::from_str::<Value>(&r.body).ok()).and_then(|v| v["integrationId"].as_str().map(String::from)).unwrap_or_default();
+    let _ = local_http("POST", &format!("/v2/apis/{api_id}/routes"), &[("content-type", "application/json"), ("authorization", &gw_auth)],
+        json!({"routeKey": "GET /secret", "target": format!("integrations/{iid}"), "authorizationType": "JWT", "authorizerId": aid}).to_string().as_bytes()).await;
+
+    let no_tok = local_http("GET", &format!("/_api/{api_id}/secret"), &[("x-rc-unsigned", "1")], b"").await;
+    let bad_tok = local_http("GET", &format!("/_api/{api_id}/secret"), &[("authorization", "Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJldmlsIn0.AAAA"), ("x-rc-unsigned", "1")], b"").await;
+
+    // cleanup
+    if !api_id.is_empty() {
+        let _ = local_http("DELETE", &format!("/v2/apis/{api_id}"), &[("authorization", &gw_auth)], b"").await;
+    }
+    let _ = local_http("DELETE", &format!("/2015-03-31/functions/{fname}"), &[("authorization", &lam_auth)], b"").await;
+    if !pool_id.is_empty() {
+        let _ = call_json("cognito-idp", "DeleteUserPool", &json!({"UserPoolId": pool_id}), None).await;
+    }
+
+    let ext_s = ext_r.as_ref().map(|r| r.status).unwrap_or(0);
+    let no_s = no_tok.as_ref().map(|r| r.status).unwrap_or(0);
+    let bad_s = bad_tok.as_ref().map(|r| r.status).unwrap_or(0);
+    let ok = ext_s == 400 && no_s == 401 && bad_s == 403;
+    let repro = vec![repro_step("GET", &format!("/_api/{api_id}/secret"), &[], "")];
+    make_result("sec-jwt-bypass", "API Gateway JWT 인가자 우회 차단", "security", "high", "apigateway", ok, ok,
+        if ok { "외부 issuer 거부(400), 토큰 누락 거부(401), 변조 토큰 거부(403)가 모두 확인됐습니다.".into() }
+        else { format!("기대 (400, 401, 403), 실제 ({ext_s}, {no_s}, {bad_s})") },
+        t0.elapsed().as_secs_f64() * 1000.0, json!({"ext_issuer": 400, "missing_token": 401, "tampered": 403}),
+        json!({"ext_issuer": ext_s, "missing_token": no_s, "tampered": bad_s}), repro)
+}
+
+// Lambda Destinations: a failing async invoke delivers the failure envelope to the OnFailure SQS queue.
+async fn sc_lambda_dest(tag: &str) -> Value {
+    let t0 = Instant::now();
+    let fname = format!("{PREFIX}dest-{tag}");
+    let q_name = format!("{PREFIX}destq-{tag}");
+    let z = match make_py_zip("def handler(event, ctx):\n    raise RuntimeError('inspector-dest-boom')\n") {
+        Ok(z) => z,
+        Err(e) => return make_result("inc-lambda-dest", "Lambda Destinations OnFailure 배달", "incident", "medium", "lambda", false, false, e, 0.0, json!({}), json!({}), vec![]),
+    };
+    let auth = sig_header("root", "lambda");
+    let q_r = call_json("sqs", "CreateQueue", &json!({"QueueName": q_name}), None).await;
+    let q_url = q_r.as_ref().ok().and_then(|r| serde_json::from_str::<Value>(&r.body).ok()).and_then(|v| v["QueueUrl"].as_str().map(String::from)).unwrap_or_default();
+    let q_arn = format!("arn:aws:sqs:{}:{ACCOUNT}:{q_name}", *REGION);
+    let cr = local_http("POST", "/2015-03-31/functions", &[("content-type", "application/json"), ("authorization", &auth)],
+        json!({"FunctionName": fname, "Runtime": "python3.12", "Role": format!("arn:aws:iam::{ACCOUNT}:role/r"),
+               "Handler": "index.handler", "Code": {"ZipFile": z}}).to_string().as_bytes()).await;
+    let _ = local_http("PUT", &format!("/2019-09-25/functions/{fname}/event-invoke-config"), &[("content-type", "application/json"), ("authorization", &auth)],
+        json!({"DestinationConfig": {"OnFailure": {"Destination": q_arn}}, "MaximumRetryAttempts": 0}).to_string().as_bytes()).await;
+    let _ = local_http("POST", &format!("/2015-03-31/functions/{fname}/invocations"), &[("authorization", &auth), ("x-amz-invocation-type", "Event")], b"{}").await;
+
+    let body = poll_sqs_body(&q_url, 30).await.unwrap_or_default();
+    let arrived = !body.is_empty();
+    let ok = cr.is_ok_and(|r| r.status < 300) && arrived && body.contains("inspector-dest-boom") && body.contains("RetriesExhausted");
+    // cleanup
+    let _ = local_http("DELETE", &format!("/2015-03-31/functions/{fname}"), &[("authorization", &auth)], b"").await;
+    let _ = call_json("logs", "DeleteLogGroup", &json!({"logGroupName": format!("/aws/lambda/{fname}")}), None).await;
+    if !q_url.is_empty() {
+        let _ = call_json("sqs", "DeleteQueue", &json!({"QueueUrl": q_url}), None).await;
+    }
+    let repro = vec![repro_step("POST", &format!("/2015-03-31/functions/{fname}/invocations"), &[("x-amz-invocation-type", "Event")], "{}")];
+    make_result("inc-lambda-dest", "Lambda Destinations OnFailure 배달", "incident", "medium", "lambda", ok, false,
+        if ok { "실패한 비동기 호출이 OnFailure 대상 큐에 AWS 형식 봉투(에러·요청 페이로드 포함)로 도착했습니다.".into() }
+        else { format!("도착={arrived}, 본문: {body}") },
+        t0.elapsed().as_secs_f64() * 1000.0, json!({"arrived": true, "condition": "RetriesExhausted"}),
+        json!({"arrived": arrived, "body": body}), repro)
+}
+
+// EventBridge: retries exhausted on a failing Lambda target land in the rule's SQS DLQ.
+async fn sc_events_dlq(tag: &str) -> Value {
+    let t0 = Instant::now();
+    let fname = format!("{PREFIX}ev-{tag}");
+    let q_name = format!("{PREFIX}evq-{tag}");
+    let rule = format!("{PREFIX}rule-{tag}");
+    let z = match make_py_zip("def handler(event, ctx):\n    raise RuntimeError('inspector-ev-boom')\n") {
+        Ok(z) => z,
+        Err(e) => return make_result("inc-events-dlq", "EventBridge 재시도 소진 → DLQ", "incident", "high", "events", false, false, e, 0.0, json!({}), json!({}), vec![]),
+    };
+    let auth = sig_header("root", "lambda");
+    let q_r = call_json("sqs", "CreateQueue", &json!({"QueueName": q_name}), None).await;
+    let q_url = q_r.as_ref().ok().and_then(|r| serde_json::from_str::<Value>(&r.body).ok()).and_then(|v| v["QueueUrl"].as_str().map(String::from)).unwrap_or_default();
+    let q_arn = format!("arn:aws:sqs:{}:{ACCOUNT}:{q_name}", *REGION);
+    let _ = local_http("POST", "/2015-03-31/functions", &[("content-type", "application/json"), ("authorization", &auth)],
+        json!({"FunctionName": fname, "Runtime": "python3.12", "Role": format!("arn:aws:iam::{ACCOUNT}:role/r"),
+               "Handler": "index.handler", "Code": {"ZipFile": z}}).to_string().as_bytes()).await;
+    let _ = call_json("events", "PutRule", &json!({"Name": rule, "EventPattern": json!({"detail-type": ["inspector-ev"]}).to_string()}), None).await;
+    let _ = call_json("events", "PutTargets", &json!({"Rule": rule, "Targets": [{
+        "Id": "t", "Arn": format!("arn:aws:lambda:{}:{ACCOUNT}:function:{fname}", *REGION),
+        "RetryPolicy": {"MaximumRetryAttempts": 0}, "DeadLetterConfig": {"Arn": q_arn}}]}), None).await;
+    let _ = call_json("events", "PutEvents", &json!({"Entries": [{"Source": "inspector", "DetailType": "inspector-ev", "Detail": "{\"k\":1}"}]}), None).await;
+
+    let body = poll_sqs_body(&q_url, 30).await.unwrap_or_default();
+    let arrived = !body.is_empty();
+    let ok = arrived && body.contains("inspector-ev");
+    // cleanup
+    let _ = call_json("events", "RemoveTargets", &json!({"Rule": rule, "Ids": ["t"]}), None).await;
+    let _ = call_json("events", "DeleteRule", &json!({"Name": rule}), None).await;
+    let _ = local_http("DELETE", &format!("/2015-03-31/functions/{fname}"), &[("authorization", &auth)], b"").await;
+    let _ = call_json("logs", "DeleteLogGroup", &json!({"logGroupName": format!("/aws/lambda/{fname}")}), None).await;
+    if !q_url.is_empty() {
+        let _ = call_json("sqs", "DeleteQueue", &json!({"QueueUrl": q_url}), None).await;
+    }
+    let repro = vec![repro_step("POST", "/", &[("x-amz-target", "AWSEvents.PutEvents")],
+        &json!({"Entries": [{"Source": "inspector", "DetailType": "inspector-ev", "Detail": "{}"}]}).to_string())];
+    make_result("inc-events-dlq", "EventBridge 재시도 소진 → DLQ", "incident", "high", "events", ok, false,
+        if ok { "MaximumRetryAttempts=0로 즉시 실패한 대상 배달이 SQS DLQ에 기록되었습니다.".into() }
+        else { format!("도착={arrived}, 본문: {body}") },
+        t0.elapsed().as_secs_f64() * 1000.0, json!({"arrived": true}),
+        json!({"arrived": arrived, "body": body}), repro)
+}
+
 async fn run_inner(app: &Arc<App>, req: &Value) -> Result<Value, ApiErr> {
     let t0 = Instant::now();
     let run_id = uuid::Uuid::new_v4().simple().to_string()[..10].to_string();
@@ -1125,6 +1384,10 @@ async fn run_inner(app: &Arc<App>, req: &Value) -> Result<Value, ApiErr> {
             ("sec-missing-sigv4", "security"),
             ("sec-oversize-payload", "security"),
             ("sec-injection-input", "security"),
+            ("sec-clock-skew", "security"),
+            ("sec-sts-expired", "security"),
+            ("sec-strict-delivery", "security"),
+            ("sec-jwt-bypass", "security"),
         ]);
     }
     if has("chaos") {
@@ -1133,7 +1396,7 @@ async fn run_inner(app: &Arc<App>, req: &Value) -> Result<Value, ApiErr> {
     }
     if has("incident") {
         plan.extend([("inc-dlq-buildup", "incident"), ("inc-lambda-repeated-fail", "incident"), ("inc-queue-flood", "incident"),
-            ("inc-storage-limits", "incident")]);
+            ("inc-storage-limits", "incident"), ("inc-lambda-dest", "incident"), ("inc-events-dlq", "incident")]);
     }
     if has("perf") {
         plan.extend([("perf-concurrent-burst", "perf"), ("perf-memory-growth", "perf")]);
@@ -1167,6 +1430,10 @@ async fn run_inner(app: &Arc<App>, req: &Value) -> Result<Value, ApiErr> {
             "sec-missing-sigv4" => sc_missing_sigv4().await,
             "sec-oversize-payload" => sc_oversize_payload().await,
             "sec-injection-input" => sc_injection_input(tag).await,
+            "sec-clock-skew" => sc_clock_skew().await,
+            "sec-sts-expired" => sc_sts_expired(tag).await,
+            "sec-strict-delivery" => sc_strict_delivery(tag).await,
+            "sec-jwt-bypass" => sc_jwt_bypass(tag).await,
             "chaos-throttle-recovery" => sc_chaos_throttle(app).await,
             "chaos-5xx-recovery" => sc_chaos_5xx(app).await,
             "inc-dlq-buildup" => sc_dlq_buildup(tag).await,
@@ -1179,6 +1446,8 @@ async fn run_inner(app: &Arc<App>, req: &Value) -> Result<Value, ApiErr> {
             "chaos-recreate-under-load" => sc_recreate_under_load(tag).await,
             "inc-queue-flood" => sc_queue_flood(tag).await,
             "inc-storage-limits" => sc_storage_limits(tag).await,
+            "inc-lambda-dest" => sc_lambda_dest(tag).await,
+            "inc-events-dlq" => sc_events_dlq(tag).await,
             "perf-memory-growth" => sc_memory_growth(tag).await,
             _ => continue,
         };
