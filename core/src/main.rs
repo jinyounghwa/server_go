@@ -587,17 +587,65 @@ async fn handle(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<std:
             json_reply("states", r)
         }
         (Svc::Json("cognito-idp", op), None) => {
-            let r = serde_json::from_slice::<Value>(&body).map_err(|e| err("SerializationException", e.to_string())).and_then(|j| {
+            let mut j = match serde_json::from_slice::<Value>(&body) {
+                Ok(j) => j,
+                Err(e) => return json_reply("cognito-idp", Err(err("SerializationException", e.to_string()))),
+            };
+            // PreSignUp trigger runs before the user is created; a failing function refuses the sign-up.
+            if op == "SignUp" {
+                let presign = app.cognito.lock().unwrap().presignup_event(&j);
+                if let Some(t) = presign {
+                    match crate::lambda::invoke(&app, &crate::lambda::name_of(&t.fn_name), t.event).await {
+                        Ok(inv) if inv.error.is_none() => {
+                            if inv.payload["response"]["autoConfirmUser"] == true {
+                                j["__rcConfirm"] = true.into();
+                            }
+                            if inv.payload["response"]["autoVerifyEmail"] == true {
+                                j["__rcVerifyEmail"] = true.into();
+                            }
+                        }
+                        _ => return json_reply("cognito-idp", Err(err("UserLambdaValidationException", "PreSignUp invocation failed due to function error"))),
+                    }
+                }
+            }
+            let (r, triggers, codes) = {
                 let mut c = app.cognito.lock().unwrap();
                 let r = c.handle(&op, &j);
-                let codes = c.take_codes();
-                drop(c);
-                // Verification codes would be emailed; locally they are published as events.
-                for (user, code) in codes {
-                    emit(&app, json!({"ts": chrono::Utc::now().to_rfc3339(), "service": "cognito-idp", "op": "CodeSent", "target": user, "code": code, "status": 200}));
+                (r, c.take_triggers(), c.take_codes())
+            };
+            // Verification codes would be emailed; locally they are published as events.
+            for (user, code) in codes {
+                emit(&app, json!({"ts": chrono::Utc::now().to_rfc3339(), "service": "cognito-idp", "op": "CodeSent", "target": user, "code": code, "status": 200}));
+            }
+            // PostConfirmation runs after the fact (best effort); PreTokenGeneration overrides claims and re-signs.
+            let r = match r {
+                Err(e) => Err(e),
+                Ok(mut v) => {
+                    for t in triggers {
+                        match t.kind {
+                            "PostConfirmation" => {
+                                let _ = crate::lambda::invoke(&app, &crate::lambda::name_of(&t.fn_name), t.event).await;
+                            }
+                            "PreTokenGeneration" => {
+                                if let Ok(inv) = crate::lambda::invoke(&app, &crate::lambda::name_of(&t.fn_name), t.event.clone()).await {
+                                    if inv.error.is_none() {
+                                        let od = &inv.payload["response"]["claimsOverrideDetails"];
+                                        let add = od["claimsToAddOrOverride"].as_object().cloned();
+                                        let suppress: Vec<String> = od["claimsToSuppress"].as_array().into_iter().flatten()
+                                            .filter_map(|x| x.as_str().map(String::from)).collect();
+                                        if add.is_some() || !suppress.is_empty() {
+                                            let fresh = app.cognito.lock().unwrap().reissue_tokens(&t, add, &suppress);
+                                            v["AuthenticationResult"] = fresh["AuthenticationResult"].clone();
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(v)
                 }
-                r
-            });
+            };
             json_reply("cognito-idp", r)
         }
         (Svc::Json(name, op), None) => {

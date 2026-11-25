@@ -1,12 +1,14 @@
-// Cognito user pools (JSON 1.1): users, app clients, password auth and RS256 JWTs with a JWKS endpoint.
+// Cognito user pools (JSON 1.1): users, app clients, groups, password auth, RS256 JWTs (JWKS endpoint) and
+// Lambda triggers (PreSignUp before creation, PostConfirmation after, PreTokenGeneration at issue).
 // Issuer: {endpoint}/_cognito/{poolId}  (JWKS at /.well-known/jwks.json, discovery at /.well-known/openid-configuration)
-// ponytail: no SRP, MFA, hosted UI/OAuth flows, Lambda triggers or groups. Verification codes are published as events.
+// ponytail: no SRP, MFA, hosted UI/OAuth flows, custom auth challenges (only NEW_PASSWORD_REQUIRED).
+// Verification codes are published as events; trigger failures on PostConfirmation/PreToken are best-effort like AWS retries.
 use crate::{b64, epoch, err, need, ApiErr, ACCOUNT, REGION};
 use base64::Engine;
 use rsa::{pkcs1v15::{SigningKey, VerifyingKey}, signature::{SignatureEncoding, Signer, Verifier}, traits::PublicKeyParts, RsaPrivateKey};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::LazyLock;
 
 const KID: &str = "rocalcloud-1";
@@ -63,6 +65,20 @@ struct User {
     created: f64,
     code: Option<String>,
 }
+struct Group {
+    description: String,
+    precedence: i64,
+    role_arn: String,
+    members: BTreeSet<String>,
+}
+
+impl Group {
+    fn json(&self, name: &str, pool: &str) -> Value {
+        json!({"GroupName": name, "UserPoolId": pool, "Description": self.description, "RoleArn": self.role_arn,
+               "Precedence": self.precedence, "CreationDate": epoch(), "LastModifiedDate": epoch()})
+    }
+}
+
 struct Pool {
     name: String,
     created: f64,
@@ -70,6 +86,19 @@ struct Pool {
     policy: Value,
     username_attrs: Vec<String>,
     auto_verified: Vec<String>,
+    groups: BTreeMap<String, Group>,
+    lambda_config: BTreeMap<String, String>, // trigger name -> Lambda function ARN
+}
+
+// A pending Lambda trigger: main.rs runs the function and applies the result.
+pub struct Trigger {
+    pub kind: &'static str, // "PreSignUp" | "PostConfirmation" | "PreTokenGeneration"
+    pub fn_name: String,
+    pub event: Value,
+    pub pool: String,
+    pub user: String,
+    pub client: String,
+    pub with_refresh: bool,
 }
 struct Client {
     name: String,
@@ -84,6 +113,7 @@ pub struct Cognito {
     refresh: HashMap<String, (String, String, String)>, // token -> (pool, username, client)
     sessions: HashMap<String, (String, String, String)>, // challenge session -> same
     codes: Vec<(String, String)>,                       // (username, code) to publish as events
+    pub triggers: Vec<Trigger>,                         // pending triggers for main.rs
 }
 
 fn e(code: &str, msg: &str) -> ApiErr {
@@ -133,6 +163,56 @@ impl Cognito {
         std::mem::take(&mut self.codes)
     }
 
+    pub fn take_triggers(&mut self) -> Vec<Trigger> {
+        std::mem::take(&mut self.triggers)
+    }
+
+    // PreSignUp event for a SignUp request, if the pool has that trigger configured.
+    pub fn presignup_event(&self, r: &Value) -> Option<Trigger> {
+        let cid = r["ClientId"].as_str()?;
+        let c = self.clients.get(cid)?;
+        let pool = &c.pool;
+        let p = self.pools.get(pool)?;
+        let fn_name = p.lambda_config.get("PreSignUp")?.clone();
+        let uname = r["Username"].as_str()?;
+        let attrs: Map<String, Value> = attrs_of(&r["UserAttributes"]).into_iter().map(|(k, v)| (k, v.into())).collect();
+        Some(Trigger {
+            kind: "PreSignUp",
+            fn_name,
+            event: json!({"version": "1", "triggerSource": "PreSignUp_SignUp", "region": *REGION, "userPoolId": pool,
+                          "userName": uname, "callerContext": {"clientId": cid},
+                          "request": {"userAttributes": attrs, "validationData": {}},
+                          "response": {"autoConfirmUser": false, "autoVerifyEmail": false, "autoVerifyPhone": false}}),
+            pool: pool.clone(), user: uname.into(), client: cid.into(), with_refresh: false,
+        })
+    }
+
+    // Re-issue tokens with PreTokenGeneration claim overrides applied (no new trigger).
+    pub fn reissue_tokens(&mut self, t: &Trigger, add: Option<Map<String, Value>>, suppress: &[String]) -> Value {
+        self.tokens_inner(&t.pool, &t.user, &t.client, t.with_refresh, add.as_ref(), suppress, false)
+    }
+
+    // Queue a PostConfirmation trigger for a newly confirmed user.
+    fn push_post_confirmation(&mut self, pool: &str, uname: &str) {
+        let Some(p) = self.pools.get(pool) else { return };
+        let Some(fn_name) = p.lambda_config.get("PostConfirmation") else { return };
+        let u = &p.users.get(uname).unwrap();
+        let attrs: Map<String, Value> = u.attrs.iter().map(|(k, v)| (k.clone(), v.as_str().into())).collect();
+        let mut user_attrs = json!({"sub": u.sub.clone(), "cognito:username": uname});
+        for (k, v) in attrs {
+            user_attrs[k.as_str()] = v;
+        }
+        let client = "".to_string();
+        self.triggers.push(Trigger {
+            kind: "PostConfirmation",
+            fn_name: fn_name.clone(),
+            event: json!({"version": "1", "triggerSource": "PostConfirmation_ConfirmSignUp", "region": *REGION, "userPoolId": pool,
+                          "userName": uname, "callerContext": {"clientId": client},
+                          "request": {"userAttributes": user_attrs}, "response": {}}),
+            pool: pool.into(), user: uname.into(), client, with_refresh: false,
+        });
+    }
+
     fn client(&self, r: &Value) -> Result<(String, &Client), ApiErr> {
         let id = need(r, "ClientId")?;
         let c = self.clients.get(id).ok_or_else(|| e("ResourceNotFoundException", "User pool client does not exist."))?;
@@ -147,20 +227,61 @@ impl Cognito {
     }
 
     fn tokens(&mut self, pool: &str, username: &str, client: &str, with_refresh: bool) -> Value {
+        self.tokens_inner(pool, username, client, with_refresh, None, &[], true)
+    }
+
+    // Groups a user belongs to (sorted, like the token claim).
+    fn groups_of(&self, pool: &str, user: &str) -> Vec<String> {
+        self.pools.get(pool).map(|p| p.groups.iter().filter(|(_, g)| g.members.contains(user)).map(|(n, _)| n.clone()).collect()).unwrap_or_default()
+    }
+
+    fn tokens_inner(&mut self, pool: &str, username: &str, client: &str, with_refresh: bool,
+                    add: Option<&Map<String, Value>>, suppress: &[String], emit_trigger: bool) -> Value {
         let u = &self.pools[pool].users[username];
         let now = epoch().floor();
+        let groups = self.groups_of(pool, username);
         let mut id = json!({"sub": u.sub, "aud": client, "iss": issuer(pool), "token_use": "id", "cognito:username": username,
-                            "auth_time": now, "iat": now, "exp": now + 3600.0, "event_id": uuid::Uuid::new_v4().to_string()});
+                            "cognito:groups": groups, "auth_time": now, "iat": now, "exp": now + 3600.0, "event_id": uuid::Uuid::new_v4().to_string()});
         for (k, v) in &u.attrs {
             id[k] = if k.ends_with("_verified") { json!(v == "true") } else { json!(v) };
         }
+        // PreTokenGeneration claim overrides touch the ID token.
+        if let Some(add) = add {
+            for (k, v) in add {
+                id[k.as_str()] = v.clone();
+            }
+        }
+        for k in suppress {
+            id.as_object_mut().unwrap().remove(k);
+        }
         let access = json!({"sub": u.sub, "client_id": client, "iss": issuer(pool), "token_use": "access", "scope": "aws.cognito.signin.user.admin",
-                            "username": username, "auth_time": now, "iat": now, "exp": now + 3600.0, "jti": uuid::Uuid::new_v4().to_string()});
+                            "username": username, "cognito:groups": self.groups_of(pool, username),
+                            "auth_time": now, "iat": now, "exp": now + 3600.0, "jti": uuid::Uuid::new_v4().to_string()});
         let mut out = json!({"AccessToken": sign(&access), "IdToken": sign(&id), "ExpiresIn": 3600, "TokenType": "Bearer"});
         if with_refresh {
             let rt = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
             self.refresh.insert(rt.clone(), (pool.into(), username.into(), client.into()));
             out["RefreshToken"] = rt.into();
+        }
+        if emit_trigger && self.pools[pool].lambda_config.contains_key("PreTokenGeneration") {
+            let fn_name = self.pools[pool].lambda_config["PreTokenGeneration"].clone();
+            let sub = u.sub.clone();
+            let attrs: Map<String, Value> = u.attrs.iter().map(|(k, v)| (k.clone(), v.as_str().into())).collect();
+            let groups = self.groups_of(pool, username);
+            let mut user_attrs = json!({"sub": sub, "cognito:username": username});
+            for (k, v) in attrs {
+                user_attrs[k.as_str()] = v;
+            }
+            self.triggers.push(Trigger {
+                kind: "PreTokenGeneration",
+                fn_name,
+                event: json!({"version": "1", "triggerSource": "TokenGeneration_HostedAuth", "region": *REGION, "userPoolId": pool,
+                              "userName": username, "callerContext": {"clientId": client},
+                              "request": {"groupConfiguration": {"groupsToOverride": groups, "iamRolesToOverride": [], "preferredRole": null},
+                                          "userAttributes": user_attrs},
+                              "response": {"claimsOverrideDetails": {}}}),
+                pool: pool.into(), user: username.into(), client: client.into(), with_refresh,
+            });
         }
         json!({ "AuthenticationResult": out })
     }
@@ -232,12 +353,26 @@ impl Cognito {
             "CreateUserPool" => {
                 let id = format!("{}_{}", *REGION, &uuid::Uuid::new_v4().simple().to_string()[..9]);
                 let strs = |k: &str| r[k].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>();
+                let lambda_config = ["PreSignUp", "PostConfirmation", "PreTokenGeneration", "CustomMessage", "PostAuthentication"]
+                    .iter().filter_map(|t| r["LambdaConfig"][t].as_str().map(|v| (t.to_string(), v.to_string()))).collect();
                 let p = Pool { name: need(r, "PoolName")?.into(), created: epoch(), users: BTreeMap::new(),
                     policy: r["Policies"]["PasswordPolicy"].clone().as_object().map_or(json!({"MinimumLength": 8}), |o| json!(o)),
-                    username_attrs: strs("UsernameAttributes"), auto_verified: strs("AutoVerifiedAttributes") };
+                    username_attrs: strs("UsernameAttributes"), auto_verified: strs("AutoVerifiedAttributes"),
+                    groups: BTreeMap::new(), lambda_config };
                 let out = json!({"UserPool": Self::pool_json(&id, &p)});
                 self.pools.insert(id, p);
                 out
+            }
+            "UpdateUserPool" => {
+                let p = self.pools.get_mut(&pool_id).ok_or_else(no_pool)?;
+                for t in ["PreSignUp", "PostConfirmation", "PreTokenGeneration"] {
+                    match r["LambdaConfig"][t].as_str() {
+                        Some(v) => { p.lambda_config.insert(t.into(), v.into()); }
+                        None if r["LambdaConfig"].as_object().is_some_and(|o| o.contains_key(t)) => { p.lambda_config.remove(t); }
+                        None => {}
+                    }
+                }
+                json!({})
             }
             "DescribeUserPool" => json!({"UserPool": Self::pool_json(&pool_id, self.pools.get(&pool_id).ok_or_else(no_pool)?)}),
             "ListUserPools" => json!({"UserPools": self.pools.iter().map(|(i, p)| json!({"Id": i, "Name": p.name, "CreationDate": p.created})).collect::<Vec<_>>()}),
@@ -283,8 +418,24 @@ impl Cognito {
                 let u = self.pools.get_mut(&pool).unwrap().users.get_mut(&uname).unwrap();
                 u.code = Some(code.clone());
                 let dest = u.attrs.get("email").cloned().unwrap_or_default();
+                let sub = u.sub.clone();
                 self.codes.push((name.into(), code));
-                json!({"UserConfirmed": false, "UserSub": u.sub, "CodeDeliveryDetails": {"Destination": dest, "DeliveryMedium": "EMAIL", "AttributeName": "email"}})
+                // PreSignUp response markers (set by main.rs after running the trigger).
+                let mut confirmed = false;
+                if r["__rcConfirm"] == true {
+                    (u.status, u.code) = ("CONFIRMED", None);
+                    if u.attrs.contains_key("email") {
+                        u.attrs.insert("email_verified".into(), "true".into());
+                    }
+                    confirmed = true;
+                }
+                if r["__rcVerifyEmail"] == true && u.attrs.contains_key("email") {
+                    u.attrs.insert("email_verified".into(), "true".into());
+                }
+                if confirmed {
+                    self.push_post_confirmation(&pool, &uname);
+                }
+                json!({"UserConfirmed": confirmed, "UserSub": sub, "CodeDeliveryDetails": {"Destination": dest, "DeliveryMedium": "EMAIL", "AttributeName": "email"}})
             }
             "ConfirmSignUp" | "ConfirmForgotPassword" => {
                 let (_, c) = self.client(r)?;
@@ -306,6 +457,9 @@ impl Cognito {
                     if u.attrs.contains_key("email") {
                         u.attrs.insert("email_verified".into(), "true".into());
                     }
+                    let pool_c = pool.clone();
+                    let uname_c = uname.clone();
+                    self.push_post_confirmation(&pool_c, &uname_c);
                 }
                 json!({})
             }
@@ -373,6 +527,44 @@ impl Cognito {
             "ListUsers" => {
                 let p = self.pools.get(&pool_id).ok_or_else(no_pool)?;
                 json!({"Users": p.users.iter().map(|(n, u)| Self::user_json(n, u)).collect::<Vec<_>>()})
+            }
+            "CreateGroup" => {
+                let p = self.pools.get_mut(&pool_id).ok_or_else(no_pool)?;
+                let name = need(r, "GroupName")?;
+                if p.groups.contains_key(name) {
+                    return Err(e("GroupExistsException", "A group with the same name already exists."));
+                }
+                let g = Group { description: r["Description"].as_str().unwrap_or("").into(), precedence: r["Precedence"].as_i64().unwrap_or(0),
+                                role_arn: r["RoleArn"].as_str().unwrap_or("").into(), members: BTreeSet::new() };
+                let out = json!({"Group": g.json(name, &pool_id)});
+                p.groups.insert(name.into(), g);
+                out
+            }
+            "GetGroup" => {
+                let p = self.pools.get(&pool_id).ok_or_else(no_pool)?;
+                let g = p.groups.get(need(r, "GroupName")?).ok_or_else(|| e("ResourceNotFoundException", "Group does not exist."))?;
+                json!({"Group": g.json(need(r, "GroupName")?, &pool_id)})
+            }
+            "ListGroups" => {
+                let p = self.pools.get(&pool_id).ok_or_else(no_pool)?;
+                json!({"Groups": p.groups.iter().map(|(n, g)| g.json(n, &pool_id)).collect::<Vec<_>>()})
+            }
+            "DeleteGroup" => {
+                let p = self.pools.get_mut(&pool_id).ok_or_else(no_pool)?;
+                p.groups.remove(need(r, "GroupName")?).ok_or_else(|| e("ResourceNotFoundException", "Group does not exist."))?;
+                json!({})
+            }
+            "AdminAddUserToGroup" | "AdminRemoveUserFromGroup" => {
+                let p = self.pools.get_mut(&pool_id).ok_or_else(no_pool)?;
+                let uname = p.find(need(r, "Username")?).ok_or_else(no_user)?;
+                let g = p.groups.get_mut(need(r, "GroupName")?).ok_or_else(|| e("ResourceNotFoundException", "Group does not exist."))?;
+                if op == "AdminAddUserToGroup" { g.members.insert(uname); } else { g.members.remove(&uname); }
+                json!({})
+            }
+            "AdminListGroupsForUser" => {
+                let p = self.pools.get(&pool_id).ok_or_else(no_pool)?;
+                let uname = p.find(need(r, "Username")?).ok_or_else(no_user)?;
+                json!({"Groups": p.groups.iter().filter(|(_, g)| g.members.contains(&uname)).map(|(n, g)| g.json(n, &pool_id)).collect::<Vec<_>>()})
             }
             "InitiateAuth" | "AdminInitiateAuth" => {
                 let (cid, c) = self.client(r)?;
@@ -480,5 +672,52 @@ mod tests {
         // Expired token must fail
         let exp = super::sign(&serde_json::json!({"sub": "u1", "exp": now - 10.0}));
         assert!(super::verify(&exp).is_none());
+    }
+
+    #[test]
+    fn groups_triggers_and_tokens() {
+        use serde_json::json;
+        let mut c = super::Cognito::default();
+        let pool = c.handle("CreateUserPool", &json!({"PoolName": "p", "LambdaConfig": {"PreSignUp": "fn:pre", "PreTokenGeneration": "fn:tok"}}))
+            .unwrap()["UserPool"]["Id"].as_str().unwrap().to_string();
+        let cid = c.handle("CreateUserPoolClient", &json!({"UserPoolId": pool, "ClientName": "web"}))
+            .unwrap()["UserPoolClient"]["ClientId"].as_str().unwrap().to_string();
+
+        // Groups CRUD
+        assert_eq!(c.handle("CreateGroup", &json!({"UserPoolId": pool, "GroupName": "admins", "Precedence": 1})).unwrap()["Group"]["GroupName"], "admins");
+        assert_eq!(c.handle("CreateGroup", &json!({"UserPoolId": pool, "GroupName": "admins"})).unwrap_err().code, "GroupExistsException");
+        assert_eq!(c.handle("GetGroup", &json!({"UserPoolId": pool, "GroupName": "admins"})).unwrap()["Group"]["Precedence"], 1);
+        assert_eq!(c.handle("ListGroups", &json!({"UserPoolId": pool})).unwrap()["Groups"].as_array().unwrap().len(), 1);
+
+        // User → group → token claim
+        c.handle("SignUp", &json!({"ClientId": cid, "Username": "u1", "Password": "Str0ng!pass", "UserAttributes": []})).unwrap();
+        c.handle("AdminConfirmSignUp", &json!({"UserPoolId": pool, "Username": "u1"})).unwrap();
+        assert_eq!(c.triggers.len(), 0, "no PostConfirmation configured → no trigger from confirm");
+        c.handle("AdminAddUserToGroup", &json!({"UserPoolId": pool, "Username": "u1", "GroupName": "admins"})).unwrap();
+        assert_eq!(c.handle("AdminListGroupsForUser", &json!({"UserPoolId": pool, "Username": "u1"})).unwrap()["Groups"][0]["GroupName"], "admins");
+        let auth = c.handle("InitiateAuth", &json!({"ClientId": cid, "AuthFlow": "USER_PASSWORD_AUTH",
+            "AuthParameters": {"USERNAME": "u1", "PASSWORD": "Str0ng!pass"}})).unwrap();
+        let claims = super::verify(auth["AuthenticationResult"]["IdToken"].as_str().unwrap()).unwrap();
+        assert_eq!(claims["cognito:groups"], json!(["admins"]));
+        let tok_trigger = c.take_triggers();
+        assert_eq!(tok_trigger[0].kind, "PreTokenGeneration");
+        assert_eq!(tok_trigger[0].event["request"]["groupConfiguration"]["groupsToOverride"], json!(["admins"]));
+
+        // Claim overrides via reissue: add + suppress
+        let fresh = c.reissue_tokens(&tok_trigger[0], Some(json!({"department": "eng"}).as_object().unwrap().clone()), &["cognito:username".to_string()]);
+        let fresh_claims = super::verify(fresh["AuthenticationResult"]["IdToken"].as_str().unwrap()).unwrap();
+        assert_eq!(fresh_claims["department"], "eng");
+        assert!(fresh_claims.get("cognito:username").is_none());
+
+        // Leaving the group drops the claim; PreSignUp event shape
+        c.handle("AdminRemoveUserFromGroup", &json!({"UserPoolId": pool, "Username": "u1", "GroupName": "admins"})).unwrap();
+        let auth2 = c.handle("InitiateAuth", &json!({"ClientId": cid, "AuthFlow": "USER_PASSWORD_AUTH",
+            "AuthParameters": {"USERNAME": "u1", "PASSWORD": "Str0ng!pass"}})).unwrap();
+        assert_eq!(super::verify(auth2["AuthenticationResult"]["IdToken"].as_str().unwrap()).unwrap()["cognito:groups"], json!([]));
+        c.handle("DeleteGroup", &json!({"UserPoolId": pool, "GroupName": "admins"})).unwrap();
+        assert_eq!(c.handle("ListGroups", &json!({"UserPoolId": pool})).unwrap()["Groups"].as_array().unwrap().len(), 0);
+
+        let pre = c.presignup_event(&json!({"ClientId": cid, "Username": "new", "UserAttributes": []})).unwrap();
+        assert_eq!((pre.kind, pre.fn_name.as_str(), pre.event["triggerSource"].as_str().unwrap()), ("PreSignUp", "fn:pre", "PreSignUp_SignUp"));
     }
 }

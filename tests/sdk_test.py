@@ -2321,6 +2321,73 @@ def test_apigw_cors_proxy():
     srv.shutdown()
 
 
+def test_cognito_groups_and_triggers():
+    import urllib.request
+    import jwt  # pyjwt[crypto]
+    idp, lam = boto3.client("cognito-idp", **kw), boto3.client("lambda", **kw)
+    p = f"cgt{run}"
+    role = "arn:aws:iam::000000000000:role/x"
+
+    # PreSignUp auto-confirms everyone except users whose name ends with "bad"
+    pre_code = (
+        'def handler(e, c):\n'
+        '    if e["userName"].endswith("bad"):\n'
+        '        raise RuntimeError("denied")\n'
+        '    return {"response": {"autoConfirmUser": True, "autoVerifyEmail": True}}\n'
+    )
+    post_code = 'def handler(e, c):\n    return {"trigger": e["triggerSource"]}\n'
+    tok_code = (
+        'def handler(e, c):\n'
+        '    return {"response": {"claimsOverrideDetails": '
+        '{"claimsToAddOrOverride": {"department": "eng"}, "claimsToSuppress": ["email"]}}}\n'
+    )
+    mk = lambda n, code: lam.create_function(FunctionName=f"{p}-{n}", Runtime="python3.12", Role=role,
+                                              Handler="app.handler", Code={"ZipFile": zipped({"app.py": code})})["FunctionArn"]
+    pre_arn, post_arn, tok_arn = mk("pre", pre_code), mk("post", post_code), mk("tok", tok_code)
+
+    pool = idp.create_user_pool(PoolName=f"{p}-pool",
+                                LambdaConfig={"PreSignUp": pre_arn, "PostConfirmation": post_arn, "PreTokenGeneration": tok_arn})["UserPool"]["Id"]
+    cid = idp.create_user_pool_client(UserPoolId=pool, ClientName="web", ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"])["UserPoolClient"]["ClientId"]
+
+    # PreSignUp auto-confirm: user is usable without a confirmation code
+    u1 = idp.sign_up(ClientId=cid, Username=f"{p}-alice", Password="Str0ng!pass",
+                     UserAttributes=[{"Name": "email", "Value": f"{p}@example.com"}])
+    assert u1["UserConfirmed"] is True
+    # PreSignUp failure → UserLambdaValidationException, no user created
+    assert code(idp.sign_up, ClientId=cid, Username=f"{p}-bad", Password="Str0ng!pass") == "UserLambdaValidationException"
+
+    # Groups: CRUD + membership
+    g = idp.create_group(GroupName="admins", UserPoolId=pool, Description="Administrators", Precedence=1)["Group"]
+    assert g["GroupName"] == "admins" and g["Precedence"] == 1
+    assert idp.get_group(GroupName="admins", UserPoolId=pool)["Group"]["Description"] == "Administrators"
+    assert [x["GroupName"] for x in idp.list_groups(UserPoolId=pool)["Groups"]] == ["admins"]
+    assert code(idp.create_group, GroupName="admins", UserPoolId=pool) == "GroupExistsException"
+    idp.admin_add_user_to_group(UserPoolId=pool, Username=f"{p}-alice", GroupName="admins")
+    assert [x["GroupName"] for x in idp.admin_list_groups_for_user(UserPoolId=pool, Username=f"{p}-alice")["Groups"]] == ["admins"]
+
+    # Login → ID token carries cognito:groups and PreTokenGeneration claim overrides
+    tok = idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+                            AuthParameters={"USERNAME": f"{p}-alice", "PASSWORD": "Str0ng!pass"})["AuthenticationResult"]
+    key = json.load(urllib.request.urlopen(f"{EP}/_cognito/{pool}/.well-known/jwks.json"))["keys"][0]
+    key = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(key))
+    claims = jwt.decode(tok["IdToken"], key, algorithms=["RS256"], audience=cid)
+    assert claims["cognito:groups"] == ["admins"], claims
+    assert claims["department"] == "eng" and "email" not in claims, claims
+
+    # Leave the group → the claim disappears on the next token
+    idp.admin_remove_user_from_group(UserPoolId=pool, Username=f"{p}-alice", GroupName="admins")
+    tok2 = idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+                             AuthParameters={"USERNAME": f"{p}-alice", "PASSWORD": "Str0ng!pass"})["AuthenticationResult"]
+    claims2 = jwt.decode(tok2["IdToken"], key, algorithms=["RS256"], audience=cid)
+    assert claims2["cognito:groups"] == [] and claims2["department"] == "eng"
+    idp.delete_group(GroupName="admins", UserPoolId=pool)
+    assert idp.list_groups(UserPoolId=pool)["Groups"] == []
+
+    for n in ("pre", "post", "tok"):
+        lam.delete_function(FunctionName=f"{p}-{n}")
+    idp.delete_user_pool(UserPoolId=pool)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
