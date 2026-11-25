@@ -243,7 +243,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
 - 7일차 JWT 인가자와 연결해 그룹 클레임이 `requestContext`에 보이는지 확인한다.
 - 테스트: 그룹에 넣은 사용자 토큰에 클레임이 있어야 하고, PreSignUp이 거부하면 가입이 실패해야 한다.
 
-## 10일차 (2026-12-04): Kinesis 보존·샤드 수 변경 + S3 목록 정확도
+## 10일차 (2026-12-04): Kinesis 보존·샤드 수 변경 + S3 목록 정확도 — ✅ 완료 (`6e4e622`): RetentionPeriodHours(만료 숨김·주입 시계 단위 테스트)·UpdateShardCount(1→2→1 무손실), S3 1000키 MaxKeys=7 delimiter 경계(코드 수정 불필요·테스트 추가), 단위/boto3 테스트(47/42)·우분투 두 모드 통과
 - **`kinesis.rs` 3행:**
   - `RetentionPeriodHours`: 기본 24시간이다. `IncreaseStreamRetentionPeriod`와 `Decrease...`를 지원하고, 읽을 때 만료된 레코드를 숨긴다.
   - `UpdateShardCount`(UNIFORM_SCALING): 기존 Split·Merge 로직을 다시 쓴다.
