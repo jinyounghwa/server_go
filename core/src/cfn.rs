@@ -26,6 +26,7 @@ struct Stack {
     template: String,
     params: Vec<(String, String)>,
     outputs: Vec<(String, String, String)>,
+    exports: Vec<(String, String, String)>, // (output key, export name, value) for Fn::ImportValue
     resources: Vec<Res>,
     events: Vec<Value>,
 }
@@ -141,6 +142,7 @@ struct Ctx<'a> {
     params: HashMap<String, Value>,
     res: HashMap<String, (String, Map<String, Value>)>,
     conds: HashMap<String, bool>,
+    imports: HashMap<String, String>, // exported name -> value, from already deployed stacks
 }
 
 fn text(v: &Value) -> String {
@@ -230,6 +232,10 @@ impl Ctx<'_> {
                         let items = self.resolve(&a[1])?;
                         items.as_array().into_iter().flatten().filter(|x| x.as_str() != Some(NOVALUE)).map(text).collect::<Vec<_>>().join(a[0].as_str().unwrap_or("")).into()
                     }
+                    "Fn::ImportValue" => {
+                        let name = text(a);
+                        self.imports.get(&name).cloned().map(Value::String).ok_or_else(|| format!("Fn::ImportValue: {name} not found"))?
+                    }
                     "Fn::Select" => {
                         let a = arr();
                         let i = text(&self.resolve(&a[0])?).parse::<usize>().map_err(|_| "Fn::Select index must be a number")?;
@@ -315,6 +321,39 @@ fn zip_inline(file: &str, src: &str) -> String {
     let _ = z.write_all(src.as_bytes());
     let _ = z.finish();
     crate::b64(buf.get_ref())
+}
+
+// Apply an in-place property update to a live resource (same physical id).
+async fn update_res(app: &Arc<App>, prev: &Res, p: &Value) -> Result<(), String> {
+    match prev.ty.as_str() {
+        "AWS::SQS::Queue" => {
+            let a: Map<String, Value> = p.as_object().into_iter().flatten()
+                .filter(|(k, _)| in_place_keys("AWS::SQS::Queue").contains(&k.as_str()))
+                .map(|(k, v)| (k.clone(), Value::String(s(v)))).collect();
+            api(crate::sqs::handle(app, "SetQueueAttributes", json!({"QueueUrl": prev.phys, "Attributes": a}).to_string().as_bytes(), "local").await).map(drop)
+        }
+        "AWS::Lambda::Function" => {
+            let mut req = json!({"FunctionName": prev.phys});
+            for k in ["Environment", "MemorySize", "Timeout", "Description"] {
+                if !p[k].is_null() {
+                    req[k] = p[k].clone();
+                }
+            }
+            lambda_call(app, "UpdateFunctionConfiguration", &format!("/functions/{}/configuration", prev.phys), req).await.map(drop)
+        }
+        "AWS::SNS::Topic" => {
+            let val = p["DisplayName"].as_str().or_else(|| prev.props["DisplayName"].as_str()).unwrap_or("");
+            api(app.sns.lock().unwrap().handle(&q(&[("Action", "SetTopicAttributes".into()), ("TopicArn", prev.phys.clone()), ("AttributeName", "DisplayName".into()), ("AttributeValue", val.into())]))).map(drop)
+        }
+        "AWS::DynamoDB::Table" => {
+            let mut req = json!({"TableName": prev.phys});
+            if !p["ProvisionedThroughput"].is_null() {
+                req["ProvisionedThroughput"] = p["ProvisionedThroughput"].clone();
+            }
+            api(crate::ddb::handle(app, "UpdateTable", req.to_string().as_bytes())).map(drop)
+        }
+        _ => Err(format!("no in-place update for {}", prev.ty)),
+    }
 }
 
 // Create one resource; returns its physical id (Ref value) and attributes (Fn::GetAtt).
@@ -570,20 +609,78 @@ fn set_status(app: &App, stack: &str, status: &str, reason: &str) {
     event(app, stack, stack, ty, stack, status, reason);
 }
 
+// Properties each resource type can update in place (same physical id); anything else replaces.
+// ponytail: DynamoDB billing-mode/GSI changes and S3 property changes still replace.
+fn in_place_keys(ty: &str) -> &'static [&'static str] {
+    match ty {
+        "AWS::SQS::Queue" => &["VisibilityTimeout", "DelaySeconds", "MaximumMessageSize", "MessageRetentionPeriod", "ReceiveMessageWaitTimeSeconds"],
+        "AWS::Lambda::Function" => &["Environment", "MemorySize", "Timeout", "Description"],
+        "AWS::SNS::Topic" => &["DisplayName"],
+        "AWS::DynamoDB::Table" => &["ProvisionedThroughput"],
+        _ => &[],
+    }
+}
+
+// Whether every property change between two templates is in the in-place set (and at least one changed).
+fn in_place_change(ty: &str, old: &Value, new: &Value) -> bool {
+    let ok = in_place_keys(ty);
+    let mut any = false;
+    for k in old.as_object().into_iter().flatten().map(|(k, _)| k.as_str())
+        .chain(new.as_object().into_iter().flatten().map(|(k, _)| k.as_str())) {
+        if old.get(k) != new.get(k) {
+            if !ok.contains(&k) {
+                return false;
+            }
+            any = true;
+        }
+    }
+    any
+}
+
+// Collect every Fn::ImportValue name in a template.
+fn collect_imports(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::Object(m) => {
+            if m.len() == 1 {
+                if let Some(iv) = m.get("Fn::ImportValue") {
+                    out.push(text(iv));
+                }
+            }
+            for v in m.values() {
+                collect_imports(v, out);
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|v| collect_imports(v, out)),
+        _ => {}
+    }
+}
+
+// Stack names whose template imports `export`.
+fn stacks_importing(c: &Cfn, export: &str, skip: &str) -> Vec<String> {
+    c.stacks.iter().filter_map(|(n, st)| {
+        (n != skip && parse(&st.template).ok().map(|t| {
+            let mut names = vec![];
+            collect_imports(&t, &mut names);
+            names.iter().any(|x| x == export)
+        }).unwrap_or(false)).then(|| n.clone())
+    }).collect()
+}
+
 // Create or update: walk resources in dependency order, reusing unchanged ones; roll back on failure.
 async fn deploy(app: &Arc<App>, name: &str, update: bool) {
-    let (template, params, id, old) = {
+    let (template, params, id, old, imports, old_exports) = {
         let c = app.cfn.lock().unwrap();
         let st = &c.stacks[name];
-        (st.template.clone(), st.params.clone(), st.id.clone(), st.resources.clone())
+        (st.template.clone(), st.params.clone(), st.id.clone(), st.resources.clone(),
+         c.stacks.values().flat_map(|s| s.exports.iter().map(|(_, n, v)| (n.clone(), v.clone()))).collect::<HashMap<String, String>>(), st.exports.clone())
     };
     let (prefix, done, rollback) = if update { ("UPDATE", "UPDATE_COMPLETE", "UPDATE_ROLLBACK_COMPLETE") } else { ("CREATE", "CREATE_COMPLETE", "ROLLBACK_COMPLETE") };
     let t = match parse(&template) {
         Ok(t) => t,
         Err(e) => return set_status(app, name, rollback, &e.msg),
     };
-    let mut ctx = Ctx { t: &t, stack: name.into(), stack_id: id, params: HashMap::new(), res: HashMap::new(), conds: HashMap::new() };
-    let result: Result<(Vec<Res>, Vec<(String, String, String)>), (String, Vec<Res>)> = async {
+    let mut ctx = Ctx { t: &t, stack: name.into(), stack_id: id, params: HashMap::new(), res: HashMap::new(), conds: HashMap::new(), imports };
+    let result: Result<(Vec<Res>, Vec<(String, String, String)>, Vec<(String, String, String)>), (String, Vec<Res>)> = async {
         for (k, def) in t["Parameters"].as_object().into_iter().flatten() {
             let v = params.iter().find(|(p, _)| p == k).map(|(_, v)| v.clone()).or_else(|| def["Default"].as_str().map(String::from).or(def["Default"].as_i64().map(|n| n.to_string())))
                 .ok_or_else(|| (format!("Parameters: [{k}] must have values"), vec![]))?;
@@ -617,8 +714,23 @@ async fn deploy(app: &Arc<App>, name: &str, update: bool) {
                 made.push(prev.clone());
                 continue;
             }
+            if let Some(prev) = old.iter().find(|r| r.logical == logical && r.ty == ty && in_place_change(&ty, &r.props, &props)) {
+                // In-place update: properties the service can change keep the same physical id.
+                event(app, name, &logical, &ty, &prev.phys, "UPDATE_IN_PROGRESS", "");
+                match update_res(app, prev, &props).await {
+                    Ok(()) => {
+                        event(app, name, &logical, &ty, &prev.phys, "UPDATE_COMPLETE", "");
+                        ctx.res.insert(logical.clone(), (prev.phys.clone(), prev.attrs.clone()));
+                        made.push(Res { logical, ty, phys: prev.phys.clone(), attrs: prev.attrs.clone(), props, status: "UPDATE_COMPLETE".into() });
+                        continue;
+                    }
+                    Err(e) => {
+                        event(app, name, &logical, &ty, &prev.phys, "UPDATE_FAILED", &e);
+                        return Err((format!("Resource {logical} failed: {e}"), made));
+                    }
+                }
+            }
             if let Some(prev) = old.iter().find(|r| r.logical == logical) {
-                // ponytail: every property change replaces the resource (no in-place updates).
                 event(app, name, &logical, &prev.ty, &prev.phys, "DELETE_IN_PROGRESS", "Requested update requires the replacement of the existing resource");
                 let _ = delete(app, prev).await;
             }
@@ -636,17 +748,33 @@ async fn deploy(app: &Arc<App>, name: &str, update: bool) {
             }
         }
         let mut outs = vec![];
+        let mut exports = vec![];
         for (k, o) in t["Outputs"].as_object().into_iter().flatten() {
             if o["Condition"].as_str().is_some_and(|c| !ctx.conds.get(c).copied().unwrap_or(true)) {
                 continue;
             }
             let v = ctx.resolve(&o["Value"]).map_err(|e| (e, made.clone()))?;
             outs.push((k.clone(), text(&v), o["Description"].as_str().unwrap_or("").to_string()));
+            if let Some(en) = o["Export"]["Name"].as_str() {
+                exports.push((k.clone(), en.to_string(), text(&v)));
+            }
         }
-        Ok((made, outs))
+        // An exported value that another stack imports must not change.
+        for (_, en, ev) in &exports {
+            if old_exports.iter().any(|(_, n, v)| n == en && v != ev) {
+                let importers = {
+                    let c = app.cfn.lock().unwrap();
+                    stacks_importing(&c, en, name)
+                };
+                if !importers.is_empty() {
+                    return Err((format!("Export {en} cannot be changed because it is in use by {}", importers.join(", ")), made));
+                }
+            }
+        }
+        Ok((made, outs, exports))
     }.await;
     match result {
-        Ok((made, outs)) => {
+        Ok((made, outs, exports)) => {
             // Old resources that are no longer in the template.
             for r in old.iter().rev().filter(|r| !made.iter().any(|m| m.logical == r.logical && m.phys == r.phys)) {
                 if made.iter().any(|m| m.logical == r.logical) {
@@ -657,7 +785,7 @@ async fn deploy(app: &Arc<App>, name: &str, update: bool) {
                 event(app, name, &r.logical, &r.ty, &r.phys, "DELETE_COMPLETE", "");
             }
             if let Some(st) = app.cfn.lock().unwrap().stacks.get_mut(name) {
-                (st.resources, st.outputs) = (made, outs);
+                (st.resources, st.outputs, st.exports) = (made, outs, exports);
             }
             set_status(app, name, done, "");
         }
@@ -705,7 +833,13 @@ impl Cfn {
     fn stack_json(&self, name: &str, s: &Stack) -> Value {
         json!({"StackId": s.id, "StackName": name, "StackStatus": s.status, "StackStatusReason": s.reason, "CreationTime": s.created,
             "Parameters": s.params.iter().map(|(k, v)| json!({"ParameterKey": k, "ParameterValue": v})).collect::<Vec<_>>(),
-            "Outputs": s.outputs.iter().map(|(k, v, d)| json!({"OutputKey": k, "OutputValue": v, "Description": d})).collect::<Vec<_>>()})
+            "Outputs": s.outputs.iter().map(|(k, v, d)| {
+                let mut o = json!({"OutputKey": k, "OutputValue": v, "Description": d});
+                if let Some((_, en, _)) = s.exports.iter().find(|(ok, _, _)| ok == k) {
+                    o["ExportName"] = en.as_str().into();
+                }
+                o
+            }).collect::<Vec<_>>()})
     }
     fn find(&self, id: &str) -> Result<(String, &Stack), ApiErr> {
         self.stacks.iter().find(|(n, s)| *n == id || s.id == id).map(|(n, s)| (n.clone(), s))
@@ -728,7 +862,7 @@ impl Cfn {
                 order(&t).map_err(|e| err("ValidationError", e))?;
                 let id = format!("arn:aws:cloudformation:{}:{ACCOUNT}:stack/{n}/{}", *REGION, uuid::Uuid::new_v4());
                 self.stacks.insert(n.clone(), Stack { id: id.clone(), status: "CREATE_IN_PROGRESS".into(), reason: String::new(), created: chrono::Utc::now().to_rfc3339(),
-                    template: body, params: params(), outputs: vec![], resources: vec![], events: vec![] });
+                    template: body, params: params(), outputs: vec![], exports: vec![], resources: vec![], events: vec![] });
                 (json!({ "StackId": id }), Some(Job::Deploy(n, false)))
             }
             "UpdateStack" => {
@@ -755,8 +889,26 @@ impl Cfn {
             "DeleteStack" => {
                 let n = p("StackName")?;
                 let Ok((n, _)) = self.find(&n) else { return Ok((json!({}), None)) };
+                // A stack whose exports are imported by other stacks cannot be deleted.
+                for (_, en, _) in self.stacks[&n].exports.clone() {
+                    let importers = stacks_importing(self, &en, &n);
+                    if !importers.is_empty() {
+                        return Err(err("ValidationError", format!("Export {en} is in use by {}", importers.join(", "))));
+                    }
+                }
                 self.stacks.get_mut(&n).unwrap().status = "DELETE_IN_PROGRESS".into();
                 (json!({}), Some(Job::Delete(n)))
+            }
+            "ListExports" => {
+                let mut items: Vec<Value> = self.stacks.iter()
+                    .flat_map(|(n, st)| st.exports.iter().map(move |(_, en, ev)| json!({"ExportingStackName": n, "ExportingStackId": st.id, "Name": en, "Value": ev})))
+                    .collect();
+                items.sort_by(|a, b| a["Name"].as_str().unwrap_or("").cmp(b["Name"].as_str().unwrap_or("")));
+                (json!({"Exports": items}), None)
+            }
+            "ListImports" => {
+                let en = p("ExportName")?;
+                (json!({"Imports": stacks_importing(self, &en, "")}), None)
             }
             "DescribeStacks" => {
                 let list: Vec<Value> = match qs.get("StackName") {
@@ -821,7 +973,7 @@ mod tests {
     #[test]
     fn intrinsics() {
         let t = json!({"Mappings": {"M": {"dev": {"size": "1"}}}});
-        let mut c = Ctx { t: &t, stack: "s".into(), stack_id: "id".into(), params: HashMap::from([("Env".into(), json!("dev"))]), res: HashMap::new(), conds: HashMap::new() };
+        let mut c = Ctx { t: &t, stack: "s".into(), stack_id: "id".into(), params: HashMap::from([("Env".into(), json!("dev"))]), res: HashMap::new(), conds: HashMap::new(), imports: HashMap::from([("shared".into(), "value-of-shared".into())]) };
         c.res.insert("Q".into(), ("url".into(), Map::from_iter([("Arn".to_string(), json!("arn:q"))])));
         c.conds.insert("IsDev".into(), true);
         let v = json!({"a": {"Fn::Sub": "${AWS::Region}/${Env}/${Q.Arn}/${!x}"}, "b": {"Fn::Join": ["-", ["x", {"Ref": "Q"}]]},
@@ -830,5 +982,27 @@ mod tests {
         assert_eq!(c.resolve(&v).unwrap(), json!({"a": format!("{}/dev/arn:q/${{x}}", *REGION), "b": "x-url", "c": "yes", "d": "1", "e": "b"}));
         c.conds.insert("IsDev".into(), false);
         assert!(c.resolve(&v).unwrap().get("c").is_none());
+        // Fn::ImportValue resolves from already deployed exports.
+        assert_eq!(c.resolve(&json!({"Fn::ImportValue": "shared"})).unwrap(), "value-of-shared");
+        assert!(c.resolve(&json!({"Fn::ImportValue": "missing"})).is_err());
+    }
+
+    #[test]
+    fn in_place_rules() {
+        let old = json!({"QueueName": "q", "VisibilityTimeout": 30, "DelaySeconds": 0});
+        let same_id = json!({"QueueName": "q", "VisibilityTimeout": 60, "DelaySeconds": 0});
+        let renamed = json!({"QueueName": "q2", "VisibilityTimeout": 30, "DelaySeconds": 0});
+        let fn_new = json!({"FunctionName": "f", "Timeout": 5});
+        let fn_code = json!({"FunctionName": "f", "Timeout": 5, "Code": {"ZipFile": "x"}});
+        assert!(in_place_change("AWS::SQS::Queue", &old, &same_id));
+        assert!(!in_place_change("AWS::SQS::Queue", &old, &renamed));
+        assert!(in_place_change("AWS::Lambda::Function", &fn_new, &json!({"FunctionName": "f", "Timeout": 30, "MemorySize": 512})));
+        assert!(!in_place_change("AWS::Lambda::Function", &fn_new, &fn_code));
+        assert!(!in_place_change("AWS::SQS::Queue", &old, &old), "no change → not an in-place update");
+        let mut names = vec![];
+        collect_imports(&json!({"Fn::ImportValue": "e1"}), &mut names);
+        collect_imports(&json!({"Fn::Join": ["-", [{"Fn::ImportValue": "e2"}, {"Fn::ImportValue": "e1"}]]}), &mut names);
+        collect_imports(&json!({"Outputs": {"o": {"Value": {"Fn::ImportValue": "e3"}}}}), &mut names);
+        assert_eq!(names, vec!["e1", "e2", "e1", "e3"]);
     }
 }

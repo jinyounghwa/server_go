@@ -884,6 +884,15 @@ pub fn handle(app: &App, op: &str, body: &[u8]) -> Result<Value, ApiErr> {
             Ok(out)
         }
         "DescribeTable" => Ok(json!({"Table": describe(tbl(db, &r)?)})),
+        "UpdateTable" => {
+            // ponytail: only ProvisionedThroughput is applied; billing mode / GSI changes replace-style are not emulated.
+            let n = s(&r, "TableName")?;
+            let t = db.tables.get_mut(n).ok_or_else(not_found)?;
+            if let Some(pt) = r.get("ProvisionedThroughput") {
+                t.desc["ProvisionedThroughput"] = pt.clone();
+            }
+            Ok(json!({"TableDescription": describe(t)}))
+        }
         "DeleteTable" => {
             let t = db.tables.remove(s(&r, "TableName")?).ok_or_else(not_found)?;
             let mut d = describe(&t);

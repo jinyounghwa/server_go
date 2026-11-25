@@ -2465,6 +2465,80 @@ def test_s3_list_pagination_boundaries():
     s3c.delete_bucket(Bucket=b)
 
 
+def test_cloudformation_exports_and_inplace():
+    cf, sqs, ddb = boto3.client("cloudformation", **kw), boto3.client("sqs", **kw), boto3.client("dynamodb", **kw)
+    base = f"exp{run}"
+
+    def wait(target, stack):
+        for _ in range(200):
+            st = cf.describe_stacks(StackName=stack)["Stacks"][0]
+            if not st["StackStatus"].endswith("_IN_PROGRESS"):
+                assert st["StackStatus"] == target, (st["StackStatus"], st.get("StackStatusReason"))
+                return st
+            time.sleep(0.1)
+        raise AssertionError("stack never settled")
+
+    # Exporting stack: a queue whose URL is exported.
+    exporter = f"{base}-exp"
+    cf.create_stack(StackName=exporter, TemplateBody=json.dumps({
+        "Resources": {"Q": {"Type": "AWS::SQS::Queue", "Properties": {"VisibilityTimeout": 30}}},
+        "Outputs": {"QueueUrl": {"Value": {"Ref": "Q"}, "Export": {"Name": f"{base}-url"}}}}))
+    wait("CREATE_COMPLETE", exporter)
+    exports = cf.list_exports()["Exports"]
+    assert exports[0]["Name"] == f"{base}-url" and exporter in exports[0]["ExportingStackId"]
+
+    # Importing stack: Fn::ImportValue resolves to the exported queue URL.
+    importer = f"{base}-imp"
+    cf.create_stack(StackName=importer, TemplateBody=json.dumps({
+        "Resources": {"P": {"Type": "AWS::SSM::Parameter", "Properties": {
+            "Name": f"/{base}-url", "Type": "String", "Value": {"Fn::ImportValue": f"{base}-url"}}}}}))
+    st = wait("CREATE_COMPLETE", importer)
+    assert cf.list_imports(ExportName=f"{base}-url")["Imports"] == [importer]
+
+    # While imported, the exporting stack cannot be deleted.
+    assert code(cf.delete_stack, StackName=exporter) == "ValidationError"
+
+    # In-place update: VisibilityTimeout only -> same queue URL (identity preserved).
+    qurl = exports[0]["Value"]
+    attrs = sqs.get_queue_attributes(QueueUrl=qurl, AttributeNames=["VisibilityTimeout"])["Attributes"]
+    assert attrs["VisibilityTimeout"] == "30"
+    cf.update_stack(StackName=exporter, TemplateBody=json.dumps({
+        "Resources": {"Q": {"Type": "AWS::SQS::Queue", "Properties": {"VisibilityTimeout": 77}}},
+        "Outputs": {"QueueUrl": {"Value": {"Ref": "Q"}, "Export": {"Name": f"{base}-url"}}}}))
+    wait("UPDATE_COMPLETE", exporter)
+    assert sqs.get_queue_attributes(QueueUrl=qurl, AttributeNames=["VisibilityTimeout"])["Attributes"]["VisibilityTimeout"] == "77", "in-place attribute applied"
+    st = cf.describe_stacks(StackName=exporter)["Stacks"][0]
+    assert st["Outputs"][0]["OutputValue"] == qurl, "physical id must not change"
+    events = [e for e in cf.describe_stack_events(StackName=exporter)["StackEvents"] if e["LogicalResourceId"] == "Q"]
+    assert any(e["ResourceStatus"] == "UPDATE_COMPLETE" for e in events) and not any(e["ResourceStatus"] == "DELETE_IN_PROGRESS" for e in events)
+
+    # QueueName change replaces the resource: the import stays valid (export is re-resolved).
+    cf.delete_stack(StackName=importer)
+    for _ in range(100):
+        try:
+            if not cf.describe_stacks(StackName=importer)["Stacks"][0]["StackStatus"].endswith("_IN_PROGRESS"):
+                break
+        except ClientError:
+            break
+        time.sleep(0.1)
+    cf.update_stack(StackName=exporter, TemplateBody=json.dumps({
+        "Resources": {"Q": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": f"{base}-renamed", "VisibilityTimeout": 77}}},
+        "Outputs": {"QueueUrl": {"Value": {"Ref": "Q"}, "Export": {"Name": f"{base}-url"}}}}))
+    wait("UPDATE_COMPLETE", exporter)
+    st = cf.describe_stacks(StackName=exporter)["Stacks"][0]
+    assert st["Outputs"][0]["OutputValue"] != qurl, "rename replaces the queue"
+
+    cf.delete_stack(StackName=exporter)
+    for _ in range(100):
+        try:
+            if cf.describe_stacks(StackName=exporter)["Stacks"][0]["StackStatus"] in ("DELETE_COMPLETE",):
+                break
+        except ClientError:
+            break
+        time.sleep(0.1)
+    assert all(e["Name"] != f"{base}-url" for e in cf.list_exports()["Exports"]), "export disappears with its stack"
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
