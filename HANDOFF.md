@@ -256,7 +256,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - 샤드 수를 1→2→1로 바꿔도 레코드가 유실되지 않아야 한다.
   - 키 1,000개를 `MaxKeys=7`과 delimiter로 끝까지 페이지 넘겼을 때 전체 집합이 정확해야 한다.
 
-## 11일차 (2026-12-05): CloudFormation 제자리 업데이트·Export/ImportValue
+## 11일차 (2026-12-05): CloudFormation 제자리 업데이트·Export/ImportValue — ✅ 완료 (`3076f73`): 타입별 in-place 속성 업데이트(물리 ID 유지), Export/ImportValue·ListExports/ListImports·import 중 삭제/변경 거부, 단위/boto3 테스트(48/43)·우분투 두 모드 통과
 - **`cfn.rs` 621행:** 교체가 필요 없는 속성 변경은 그 자리에서 고친다. 대상은 SQS 속성, Lambda 환경 변수·메모리·타임아웃, SNS 표시 이름, DynamoDB 처리량·TTL 정도다. 나머지는 지금처럼 교체한다.
   - 교체 여부 표는 리소스 타입별 짧은 목록으로 둔다.
 - **`cfn.rs` 4행:**
