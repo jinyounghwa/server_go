@@ -267,7 +267,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - 큐의 `VisibilityTimeout`만 바꾼 업데이트에서 큐 URL(정체성)이 그대로여야 한다.
   - import하는 스택이 있으면 export하는 스택 삭제가 실패해야 한다.
 
-## 12일차 (2026-12-06): 검증 에이전트·SDK 스위트·마을 따라잡기
+## 12일차 (2026-12-06): 검증 에이전트·SDK 스위트·마을 따라잡기 — ✅ 완료 (`ef084a9`): 검사관 시나리오 27개(보안 4종·사고 2종 추가 및 `poll_sqs_body`/`xml_tag` 리팩토링), JS v3(8개)·Rust SDK(7개) 스위트 확장, `town.html`/`AGENTS.md` 동기화, 우분투 전체 검증(단위 48·boto3 43 두 모드·JS 8·Rust 7) 통과 (Playwright 화면 점검은 미실행)
 - **`inspector.rs`에 새 시나리오** (현재 21개). 결정적으로 쓰고 `rc-insp-` 리소스만 쓴다.
   - 보안: 시계 오차 요청 거부, 만료된 STS 키 거부, `STRICT_DELIVERY`일 때 정책 없는 대상 배달 거부, JWT 인가자 우회 시도
   - 사고: Lambda Destinations OnFailure 도착, EventBridge DLQ 도착
