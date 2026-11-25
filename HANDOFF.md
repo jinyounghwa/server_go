@@ -218,7 +218,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - Cognito 로그인 토큰이 있으면 200, 토큰이 없으면 401, 변조된 토큰이면 401 또는 403
   - Lambda 인가자가 false를 돌려주면 403
 
-## 8일차 (2026-12-02): API Gateway CORS·HTTP_PROXY·스테이지 변수
+## 8일차 (2026-12-02): API Gateway CORS·HTTP_PROXY·스테이지 변수 — ✅ 완료 (`1e5ae19`): CORS(사전 요청 204·실제 응답 헤더, `*`+Credentials 거부)·HTTP_PROXY(루프백만, 스테이지 변수 치환)·스테이지 변수 CRUD, 단위/boto3 테스트(44/39)·우분투 두 모드 통과
 - **CORS 설정:** `CorsConfiguration`(AllowOrigins, Methods, Headers, MaxAge, Credentials)을 지원한다.
   - `/_api/...`에 대한 OPTIONS 사전 요청에 응답하고, 실제 응답에도 헤더를 단다.
   - **이것은 사용자 API의 CORS다.** `/_events` 관리 스트림의 CORS 규칙은 절대 건드리지 않는다.
