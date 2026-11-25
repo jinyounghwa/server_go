@@ -232,7 +232,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - 루프백의 작은 HTTP 서버로 프록시가 되어야 한다. 테스트 안에서 파이썬 `http.server`를 띄운다.
   - 외부 URL 통합은 생성할 때 거부되어야 한다.
 
-## 9일차 (2026-12-03): Cognito 그룹·Lambda 트리거
+## 9일차 (2026-12-03): Cognito 그룹·Lambda 트리거 — ✅ 완료 (`c3a0642`): 그룹 CRUD·`cognito:groups` 클레임, PreSignUp(실패 시 가입 거부·autoConfirm)·PostConfirmation·PreTokenGeneration(클레임 추가/삭제), 단위/boto3 테스트(45/40)·우분투 두 모드 통과
 - **`cognito.rs` 3행:** 그룹을 지원한다.
   - 연산: `CreateGroup`, `GetGroup`, `ListGroups`, `DeleteGroup`, `AdminAddUserToGroup`, `AdminRemoveUserFromGroup`, `AdminListGroupsForUser`
   - 토큰에 `cognito:groups` 클레임을 넣는다.
