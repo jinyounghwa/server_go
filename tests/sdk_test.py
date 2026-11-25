@@ -2388,6 +2388,83 @@ def test_cognito_groups_and_triggers():
     idp.delete_user_pool(UserPoolId=pool)
 
 
+def test_kinesis_retention_and_update_shard_count():
+    k = boto3.client("kinesis", **kw)
+    n = f"rsc{run}"
+    k.create_stream(StreamName=n, ShardCount=1)
+    k.get_waiter("stream_exists").wait(StreamName=n)
+    for i in range(5):
+        k.put_record(StreamName=n, Data=f"m{i}".encode(), PartitionKey="p")
+
+    # Retention period bounds: increase must grow, decrease must shrink, 24..8760.
+    assert k.describe_stream(StreamName=n)["StreamDescription"]["RetentionPeriodHours"] == 24
+    assert code(k.increase_stream_retention_period, StreamName=n, RetentionPeriodHours=24) == "InvalidArgumentException"
+    k.increase_stream_retention_period(StreamName=n, RetentionPeriodHours=48)
+    assert k.describe_stream_summary(StreamName=n)["StreamDescriptionSummary"]["RetentionPeriodHours"] == 48
+    assert code(k.decrease_stream_retention_period, StreamName=n, RetentionPeriodHours=48) == "InvalidArgumentException"
+    k.decrease_stream_retention_period(StreamName=n, RetentionPeriodHours=24)
+
+    # UpdateShardCount 1 -> 2 -> 1: records must survive every reshard.
+    def read_all(sid):
+        it = k.get_shard_iterator(StreamName=n, ShardId=sid, ShardIteratorType="TRIM_HORIZON")["ShardIterator"]
+        return [x["Data"] for x in k.get_records(ShardIterator=it, Limit=1000)["Records"]]
+    r = k.update_shard_count(StreamName=n, TargetShardCount=2, ScalingType="UNIFORM_SCALING")
+    assert (r["CurrentShardCount"], r["TargetShardCount"]) == (1, 2)
+    shards = k.list_shards(StreamName=n)["Shards"]
+    assert len(shards) == 3 and sum(1 for s in shards if "EndingSequenceNumber" in s["SequenceNumberRange"]) == 1
+    assert sorted(x for sid in [s["ShardId"] for s in shards] for x in read_all(sid)) == sorted(f"m{i}".encode() for i in range(5)), "records lost across UpdateShardCount"
+    k.update_shard_count(StreamName=n, TargetShardCount=1, ScalingType="UNIFORM_SCALING")
+    k.put_record(StreamName=n, Data=b"after", PartitionKey="p")
+    total = [x for s in k.list_shards(StreamName=n)["Shards"] for x in read_all(s["ShardId"])]
+    assert sorted(total) == sorted([f"m{i}".encode() for i in range(5)] + [b"after"])
+    assert code(k.update_shard_count, StreamName=n, TargetShardCount=1, ScalingType="UNIFORM_SCALING") == "InvalidArgumentException"
+    assert code(k.update_shard_count, StreamName=n, TargetShardCount=3, ScalingType="other") == "ValidationException"
+    k.delete_stream(StreamName=n)
+
+
+def test_s3_list_pagination_boundaries():
+    s3c = boto3.client("s3", config=Config(s3={"addressing_style": "path"}), **kw)
+    b = f"pgb{run}"
+    s3c.create_bucket(Bucket=b)
+    # 1000 keys: top-level (returned as objects), grouped under prefixes, and a max-codepoint edge key.
+    keys = [f"top{i:04d}" for i in range(500)] + [f"dir/{i % 50}/f{i:04d}" for i in range(499)] + ["edge/\U0010FFFF"]
+    for key in keys:
+        s3c.put_object(Bucket=b, Key=key, Body=b"x")
+    # Walk every page at MaxKeys=7 with a delimiter: the union must be exact, no duplicates.
+    got, prefixes, token = [], set(), None
+    for _ in range(400):
+        kw2 = {"Bucket": b, "MaxKeys": 7, "Delimiter": "/"}
+        if token:
+            kw2["ContinuationToken"] = token
+        page = s3c.list_objects_v2(**kw2)
+        assert page["KeyCount"] == len(page.get("Contents", [])) + len(page.get("CommonPrefixes", []))
+        got += [x["Key"] for x in page.get("Contents", [])]
+        prefixes |= {x["Prefix"] for x in page.get("CommonPrefixes", [])}
+        if not page["IsTruncated"]:
+            break
+        token = page["NextContinuationToken"]
+    assert sorted(got) == sorted(f"top{i:04d}" for i in range(500)), "every top-level key exactly once, no duplicates"
+    assert prefixes == {"dir/", "edge/"}, prefixes
+    # Start-after the last key: nothing remains.
+    page = s3c.list_objects_v2(Bucket=b, MaxKeys=7, Delimiter="/", StartAfter="top0499")
+    assert not page["IsTruncated"] and page["KeyCount"] == 0
+    # No delimiter: all 1000 keys in order, MaxKeys boundary exact.
+    allk, token = [], None
+    for _ in range(200):
+        kw2 = {"Bucket": b, "MaxKeys": 333}
+        if token:
+            kw2["ContinuationToken"] = token
+        page = s3c.list_objects_v2(**kw2)
+        allk += [x["Key"] for x in page.get("Contents", [])]
+        if not page["IsTruncated"]:
+            break
+        token = page["NextContinuationToken"]
+    assert allk == sorted(keys), "no delimiter: exact ordered enumeration"
+    s3c.delete_objects(Bucket=b, Delete={"Objects": [{"Key": k} for k in keys]})
+    assert s3c.list_objects_v2(Bucket=b)["KeyCount"] == 0
+    s3c.delete_bucket(Bucket=b)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

@@ -1,7 +1,7 @@
 // Kinesis Data Streams (JSON 1.1): shards by MD5 hash range, sequence numbers, shard iterators.
 // Lambda event source mappings read shards through positions()/read() (lambda.rs poll_kinesis).
-// ponytail: no enhanced fan-out, retention expiry or UpdateShardCount yet; resharding keeps closed
-// shards readable at the end of their sequence range, as AWS does until retention expires.
+// ponytail: no enhanced fan-out; resharding keeps closed shards readable at the end of their
+// sequence range, as AWS does until retention expires (records past RetentionPeriodHours are hidden).
 use crate::{b64, epoch, err, need, unb64, ApiErr, ACCOUNT, REGION};
 use md5::{Digest, Md5};
 use serde_json::{json, Value};
@@ -30,12 +30,14 @@ struct Stream {
     shards: Vec<Shard>, // append-only ordering keeps poll_kinesis indices stable
     on_demand: bool,
     next: usize, // next shard counter for resharding children
+    retention: u64, // RetentionPeriodHours; older records are hidden from reads
 }
 
 #[derive(Default)]
 pub struct Kinesis {
     streams: BTreeMap<String, Stream>,
     seq: u128,
+    clock: f64, // "now" for retention expiry; monotonic so tests can push it into the future
 }
 
 fn shard_id(i: usize) -> String {
@@ -77,13 +79,21 @@ impl Kinesis {
     }
     // Up to `limit` records of a shard from `pos`, in the Lambda event "kinesis" shape.
     pub fn read(&self, name: &str, shard: usize, pos: usize, limit: usize) -> Vec<Value> {
-        let Some(recs) = self.streams.get(name).and_then(|s| s.shards.get(shard)).map(|sh| &sh.recs) else { return vec![] };
-        recs.iter().skip(pos).take(limit).map(|x| json!({"kinesisSchemaVersion": "1.0", "partitionKey": x.key, "sequenceNumber": x.seq,
+        let Some(s) = self.streams.get(name) else { return vec![] };
+        let Some(recs) = s.shards.get(shard).map(|sh| &sh.recs) else { return vec![] };
+        let start = self.fresh_start(s, shard).max(pos);
+        recs.iter().skip(start).take(limit).map(|x| json!({"kinesisSchemaVersion": "1.0", "partitionKey": x.key, "sequenceNumber": x.seq,
             "data": x.data, "approximateArrivalTimestamp": x.at})).collect()
     }
 
+    // First record index of a shard that is still inside the retention window.
+    fn fresh_start(&self, s: &Stream, i: usize) -> usize {
+        let cutoff = self.clock - s.retention as f64 * 3600.0;
+        s.shards.get(i).map_or(0, |sh| sh.recs.iter().position(|x| x.at >= cutoff).unwrap_or(sh.recs.len()))
+    }
+
     fn describe(n: &str, s: &Stream, summary: bool) -> Value {
-        let mut d = json!({"StreamName": n, "StreamARN": arn(n), "StreamStatus": "ACTIVE", "RetentionPeriodHours": 24,
+        let mut d = json!({"StreamName": n, "StreamARN": arn(n), "StreamStatus": "ACTIVE", "RetentionPeriodHours": s.retention,
             "StreamCreationTimestamp": s.created, "EncryptionType": "NONE", "OpenShardCount": s.shards.iter().filter(|sh| !sh.closed).count(),
             "StreamModeDetails": {"StreamMode": if s.on_demand { "ON_DEMAND" } else { "PROVISIONED" }}, "EnhancedMonitoring": [{"ShardLevelMetrics": []}]});
         if !summary {
@@ -123,6 +133,7 @@ impl Kinesis {
     }
 
     pub fn handle(&mut self, op: &str, r: &Value) -> Result<Value, ApiErr> {
+        self.clock = self.clock.max(epoch());
         Ok(match op {
             "CreateStream" => {
                 let n = need(r, "StreamName")?;
@@ -132,7 +143,7 @@ impl Kinesis {
                 let on_demand = r["StreamModeDetails"]["StreamMode"] == "ON_DEMAND";
                 let count = r["ShardCount"].as_u64().unwrap_or(if on_demand { 4 } else { 1 }).clamp(1, 64) as usize;
                 let shards = (0..count).map(|i| { let (a, b) = range(i, count); Shard::open(shard_id(i), a, b) }).collect();
-                self.streams.insert(n.into(), Stream { created: epoch(), shards, on_demand, next: count });
+                self.streams.insert(n.into(), Stream { created: epoch(), shards, on_demand, next: count, retention: 24 });
                 json!({})
             }
             "DescribeStream" | "DescribeStreamSummary" => {
@@ -210,6 +221,46 @@ impl Kinesis {
                 s.shards.push(Shard::open(id, lo, hi));
                 json!({})
             }
+            "IncreaseStreamRetentionPeriod" | "DecreaseStreamRetentionPeriod" => {
+                let n = stream_name(r)?;
+                let want = r["NewRetentionPeriodHours"].as_u64().or_else(|| r["RetentionPeriodHours"].as_u64()).unwrap_or(0);
+                let s = self.streams.get_mut(&n).ok_or_else(|| not_found(&n))?;
+                if !(24..=8760).contains(&want) {
+                    return Err(err("InvalidArgumentException", "NewRetentionPeriodHours must be between 24 and 8760"));
+                }
+                let increasing = op.starts_with("Increase");
+                if want == s.retention || (increasing && want < s.retention) || (!increasing && want > s.retention) {
+                    return Err(err("InvalidArgumentException", format!("NewRetentionPeriodHours {want} must be {} than the current {}", if increasing { "greater" } else { "less" }, s.retention)));
+                }
+                s.retention = want;
+                json!({})
+            }
+            "UpdateShardCount" => {
+                let n = stream_name(r)?;
+                if need(r, "ScalingType")? != "UNIFORM_SCALING" {
+                    return Err(err("ValidationException", "Only UNIFORM_SCALING is supported locally"));
+                }
+                let target = r["TargetShardCount"].as_u64().unwrap_or(0);
+                if !(1..=64).contains(&target) {
+                    return Err(err("InvalidArgumentException", "TargetShardCount must be between 1 and 64"));
+                }
+                let s = self.streams.get_mut(&n).ok_or_else(|| not_found(&n))?;
+                let open = s.shards.iter().filter(|sh| !sh.closed).count() as u64;
+                if target == open {
+                    return Err(err("InvalidArgumentException", "TargetShardCount must differ from the current open shard count"));
+                }
+                // UNIFORM_SCALING: close every open shard, then open `target` even ones. Old records stay readable.
+                for sh in s.shards.iter_mut() {
+                    sh.closed = true;
+                }
+                let next = s.next;
+                for i in 0..target as usize {
+                    let (a, b) = range(i, target as usize);
+                    s.shards.push(Shard::open(shard_id(next + i), a, b));
+                }
+                s.next = next + target as usize;
+                json!({"StreamARN": arn(&n), "StreamStatus": "ACTIVE", "CurrentShardCount": open, "TargetShardCount": target})
+            }
             "GetShardIterator" => {
                 let n = stream_name(r)?;
                 let s = self.streams.get(&n).ok_or_else(|| not_found(&n))?;
@@ -223,7 +274,7 @@ impl Kinesis {
                     Ok(if after && recs.get(p).is_some_and(|x| x.seq == q) { p + 1 } else { p })
                 };
                 let pos = match need(r, "ShardIteratorType")? {
-                    "TRIM_HORIZON" => 0,
+                    "TRIM_HORIZON" => self.fresh_start(s, i),
                     "LATEST" => recs.len(),
                     "AT_SEQUENCE_NUMBER" => at_seq(false)?,
                     "AFTER_SEQUENCE_NUMBER" => at_seq(true)?,
@@ -242,10 +293,11 @@ impl Kinesis {
                 let (n, i, pos) = (it.next().unwrap_or(""), it.next().and_then(|x| x.parse::<usize>().ok()).ok_or_else(bad)?, it.next().and_then(|x| x.parse::<usize>().ok()).ok_or_else(bad)?);
                 let s = self.streams.get(n).ok_or_else(|| not_found(n))?;
                 let recs = s.shards.get(i).map(|sh| &sh.recs).ok_or_else(bad)?;
+                let start = self.fresh_start(s, i).max(pos);
                 let limit = r["Limit"].as_u64().unwrap_or(10000) as usize;
-                let page: Vec<Value> = recs.iter().skip(pos).take(limit)
+                let page: Vec<Value> = recs.iter().skip(start).take(limit)
                     .map(|x| json!({"SequenceNumber": x.seq, "ApproximateArrivalTimestamp": x.at, "Data": x.data, "PartitionKey": x.key})).collect();
-                let next = pos.min(recs.len()) + page.len();
+                let next = start.min(recs.len()) + page.len();
                 json!({"Records": page, "NextShardIterator": iterator(n, i, next), "MillisBehindLatest": 0})
             }
             _ => return Err(err("UnknownOperationException", format!("{op} is not supported yet"))),
@@ -266,5 +318,64 @@ impl Kinesis {
                        "cols": ["샤드", "파티션 키", "데이터", "시퀀스"], "rows": recs.into_iter().take(100).map(|(_, v)| v).collect::<Vec<_>>()})
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn rec(k: &Kinesis, n: &str) -> usize {
+        k.streams[n].shards.iter().flat_map(|sh| sh.recs.iter()).count()
+    }
+
+    #[test]
+    fn retention_hides_expired_records() {
+        let mut k = Kinesis::default();
+        k.handle("CreateStream", &json!({"StreamName": "s", "ShardCount": 1})).unwrap();
+        for i in 0..3 {
+            k.handle("PutRecord", &json!({"StreamName": "s", "Data": b64(format!("{i}").as_bytes()), "PartitionKey": "p"})).unwrap();
+        }
+        assert_eq!(rec(&k, "s"), 3);
+        // Retention bounds and direction are validated.
+        assert!(k.handle("IncreaseStreamRetentionPeriod", &json!({"StreamName": "s", "NewRetentionPeriodHours": 24})).is_err());
+        k.handle("IncreaseStreamRetentionPeriod", &json!({"StreamName": "s", "NewRetentionPeriodHours": 48})).unwrap();
+        assert_eq!(k.handle("DescribeStreamSummary", &json!({"StreamName": "s"})).unwrap()["StreamDescriptionSummary"]["RetentionPeriodHours"], 48);
+        assert!(k.handle("DecreaseStreamRetentionPeriod", &json!({"StreamName": "s", "NewRetentionPeriodHours": 48})).is_err());
+        k.handle("DecreaseStreamRetentionPeriod", &json!({"StreamName": "s", "NewRetentionPeriodHours": 24})).unwrap();
+        // 25 hours later with the 24h window: records are gone from reads (but not from storage).
+        k.clock += 25.0 * 3600.0;
+        let it = k.handle("GetShardIterator", &json!({"StreamName": "s", "ShardId": "shardId-000000000000", "ShardIteratorType": "TRIM_HORIZON"})).unwrap();
+        let out = k.handle("GetRecords", &json!({"ShardIterator": it["ShardIterator"]})).unwrap();
+        assert_eq!(out["Records"].as_array().unwrap().len(), 0, "expired records must be hidden");
+        assert_eq!(rec(&k, "s"), 3, "records stay in storage until the stream is deleted");
+        // The lambda poll path hides them too.
+        assert!(k.read("s", 0, 0, 10).is_empty());
+    }
+
+    #[test]
+    fn update_shard_count_keeps_records() {
+        let mut k = Kinesis::default();
+        k.handle("CreateStream", &json!({"StreamName": "s", "ShardCount": 1})).unwrap();
+        for i in 0..3 {
+            k.handle("PutRecord", &json!({"StreamName": "s", "Data": b64(format!("{i}").as_bytes()), "PartitionKey": "p"})).unwrap();
+        }
+        // 1 -> 2: old shard closes, two new even ones open, records survive in the closed shard.
+        let r = k.handle("UpdateShardCount", &json!({"StreamName": "s", "TargetShardCount": 2, "ScalingType": "UNIFORM_SCALING"})).unwrap();
+        assert_eq!(r["CurrentShardCount"], 1);
+        assert_eq!(r["TargetShardCount"], 2);
+        let d = k.handle("DescribeStreamSummary", &json!({"StreamName": "s"})).unwrap();
+        assert_eq!(d["StreamDescriptionSummary"]["OpenShardCount"], 2);
+        let it = k.handle("GetShardIterator", &json!({"StreamName": "s", "ShardId": "shardId-000000000000", "ShardIteratorType": "TRIM_HORIZON"})).unwrap();
+        let out = k.handle("GetRecords", &json!({"ShardIterator": it["ShardIterator"]})).unwrap();
+        assert_eq!(out["Records"].as_array().unwrap().len(), 3, "records must not be lost in a reshard");
+        // 2 -> 1 again; new puts land in the open shard.
+        k.handle("UpdateShardCount", &json!({"StreamName": "s", "TargetShardCount": 1, "ScalingType": "UNIFORM_SCALING"})).unwrap();
+        k.handle("PutRecord", &json!({"StreamName": "s", "Data": b64(b"new"), "PartitionKey": "p"})).unwrap();
+        assert_eq!(rec(&k, "s"), 4);
+        assert_eq!(k.handle("ListShards", &json!({"StreamName": "s"})).unwrap()["Shards"].as_array().unwrap().len(), 4, "1 closed + 2 closed + 1 open");
+        assert_eq!(k.handle("UpdateShardCount", &json!({"StreamName": "s", "TargetShardCount": 1, "ScalingType": "UNIFORM_SCALING"})).unwrap_err().code, "InvalidArgumentException");
+        assert_eq!(k.handle("UpdateShardCount", &json!({"StreamName": "s", "TargetShardCount": 2, "ScalingType": "something"})).unwrap_err().code, "ValidationException");
     }
 }
