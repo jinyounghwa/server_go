@@ -1,6 +1,8 @@
-// API Gateway HTTP APIs (apigatewayv2, REST-JSON) with Lambda proxy integrations and JWT/Lambda authorizers.
+// API Gateway HTTP APIs (apigatewayv2, REST-JSON) with Lambda proxy integrations, JWT/Lambda authorizers,
+// CORS configuration and HTTP_PROXY integrations (loopback targets only).
 // Invoke URL: {endpoint}/_api/{apiId}/[{stage}/]path
-// ponytail: REST APIs (v1), HTTP_PROXY integrations and CORS config are not emulated yet.
+// ponytail: REST APIs (v1) are not emulated; HTTP_PROXY forwards method/path/query/headers and reads the reply
+// to connection close (no chunked decoding, 5s timeout); stage variables are substituted in integration URIs only.
 use crate::{err, ApiErr, App};
 use serde_json::{json, Map, Value};
 use std::{collections::BTreeMap, sync::Arc};
@@ -32,6 +34,66 @@ struct Route {
     authorizer_id: Option<String>,
 }
 
+struct Stage {
+    auto: bool,
+    vars: BTreeMap<String, String>, // ${stageVariables.x} substitutions for integration URIs
+}
+
+#[derive(Clone)]
+struct Cors {
+    allow_origins: Vec<String>,
+    allow_methods: Vec<String>,
+    allow_headers: Vec<String>,
+    expose_headers: Vec<String>,
+    max_age: u64,
+    credentials: bool,
+}
+
+fn parse_cors(b: &Value) -> Cors {
+    // The v2 control plane speaks lowerCamelCase on the wire (botocore sends/accepts lowerCamel keys).
+    let l = |k: &str| str_list(&b[k]);
+    Cors {
+        allow_origins: l("allowOrigins"),
+        allow_methods: l("allowMethods"),
+        allow_headers: l("allowHeaders"),
+        expose_headers: l("exposeHeaders"),
+        max_age: b["maxAge"].as_u64().unwrap_or(0),
+        credentials: b["allowCredentials"].as_bool().unwrap_or(false),
+    }
+}
+
+fn cors_json(c: &Cors) -> Value {
+    json!({"allowOrigins": c.allow_origins, "allowMethods": c.allow_methods, "allowHeaders": c.allow_headers,
+           "exposeHeaders": c.expose_headers, "maxAge": c.max_age, "allowCredentials": c.credentials})
+}
+
+// Whether an Origin is allowed. `*` matches any origin (never with credentials, as in AWS).
+fn cors_allows(c: &Cors, origin: &str) -> bool {
+    !origin.is_empty() && c.allow_origins.iter().any(|o| o == "*" || o == origin)
+}
+
+// Headers for an actual response with an allowed origin (preflight adds more below).
+fn cors_response_headers(c: &Cors, origin: &str) -> Vec<(String, String)> {
+    let mut h = vec![("Access-Control-Allow-Origin".to_string(), if c.allow_origins.iter().any(|o| o == "*") { "*".to_string() } else { origin.to_string() })];
+    if c.credentials {
+        h.push(("Access-Control-Allow-Credentials".into(), "true".into()));
+    }
+    if !c.expose_headers.is_empty() {
+        h.push(("Access-Control-Expose-Headers".into(), c.expose_headers.join(", ")));
+    }
+    h
+}
+
+fn stage_json(n: &str, s: &Stage) -> Value {
+    json!({"stageName": n, "autoDeploy": s.auto, "stageVariables": s.vars})
+}
+
+fn stage_of(b: &Value, auto: bool) -> Stage {
+    let vars = b["stageVariables"].as_object().into_iter().flatten()
+        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect();
+    Stage { auto, vars }
+}
+
 struct Api {
     name: String,
     protocol: String,
@@ -39,7 +101,8 @@ struct Api {
     routes: BTreeMap<String, Route>,
     integrations: BTreeMap<String, Integ>,
     authorizers: BTreeMap<String, Authorizer>,
-    stages: BTreeMap<String, bool>, // name -> auto deploy
+    stages: BTreeMap<String, Stage>,
+    cors: Option<Cors>,
 }
 
 #[derive(Default)]
@@ -54,8 +117,12 @@ fn nf(what: &str) -> ApiErr {
     ApiErr { status: 404, ..err("NotFoundException", format!("Invalid {what} identifier specified")) }
 }
 fn api_json(id: &str, a: &Api) -> Value {
-    json!({"apiId": id, "name": a.name, "protocolType": a.protocol, "createdDate": a.created,
-           "apiEndpoint": format!("{}/_api/{id}", crate::endpoint()), "routeSelectionExpression": "$request.method $request.path"})
+    let mut out = json!({"apiId": id, "name": a.name, "protocolType": a.protocol, "createdDate": a.created,
+           "apiEndpoint": format!("{}/_api/{id}", crate::endpoint()), "routeSelectionExpression": "$request.method $request.path"});
+    if let Some(c) = &a.cors {
+        out["corsConfiguration"] = cors_json(c);
+    }
+    out
 }
 fn integ_json(id: &str, i: &Integ) -> Value {
     json!({"integrationId": id, "integrationType": i.ty, "integrationUri": i.uri, "payloadFormatVersion": i.fmt, "integrationMethod": "POST"})
@@ -105,6 +172,72 @@ fn lambda_fn_of(uri: &str) -> String {
 
 fn str_list(v: &Value) -> Vec<String> {
     v.as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect()
+}
+
+// HTTP_PROXY target check at save time: only loopback http URIs (or URIs that still contain a
+// ${stageVariables.x} placeholder, re-checked after substitution at invoke time) are stored.
+fn loopback_uri(uri: &str) -> bool {
+    if uri.contains("${") {
+        return true;
+    }
+    let Some(rest) = uri.strip_prefix("http://") else { return false };
+    let authority = rest.split('/').next().unwrap_or("");
+    let Some((host, port)) = authority.rsplit_once(':') else { return false };
+    (host == "127.0.0.1" || host == "localhost") && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())
+}
+
+// Substitute ${stageVariables.x} in an integration URI.
+fn sub_stage_vars(uri: &str, vars: &BTreeMap<String, String>) -> String {
+    let mut out = uri.to_string();
+    for (k, v) in vars {
+        out = out.replace(&format!("${{stageVariables.{k}}}"), v);
+    }
+    out
+}
+
+// Minimal HTTP/1.1 client for loopback HTTP_PROXY integrations. Sends method, path+query and
+// headers, reads the reply to connection close. ponytail: no TLS, no chunked decoding, 5s timeout.
+async fn http_proxy(
+    uri: &str, method: &str, path: &str, query: &str, hdrs: &[(String, String)], body: &[u8],
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
+    let rest = uri.strip_prefix("http://").ok_or("HTTP_PROXY integration URI must use http://")?;
+    let authority = rest.split('/').next().unwrap_or("");
+    let (host, port) = authority.rsplit_once(':').ok_or("HTTP_PROXY URI needs a port")?;
+    if host != "127.0.0.1" && host != "localhost" {
+        return Err("HTTP_PROXY integration targets must be 127.0.0.1 or localhost".into());
+    }
+    let port: u16 = port.parse().map_err(|_| "bad HTTP_PROXY port")?;
+    let mut req = format!("{method} {path}");
+    if !query.is_empty() {
+        req.push('?');
+        req.push_str(query);
+    }
+    req.push_str(&format!(" HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nContent-Length: {}\r\n", body.len()));
+    for (k, v) in hdrs {
+        let skip = ["host", "connection", "content-length", "transfer-encoding", "keep-alive"];
+        if !skip.iter().any(|s| k.eq_ignore_ascii_case(s)) {
+            req.push_str(&format!("{k}: {v}\r\n"));
+        }
+    }
+    req.push_str("\r\n");
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect((host, port)).await.map_err(|e| e.to_string())?;
+    let io = async {
+        stream.write_all(req.as_bytes()).await.map_err(|e| e.to_string())?;
+        stream.write_all(body).await.map_err(|e| e.to_string())?;
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.map_err(|e| e.to_string())?;
+        Ok::<Vec<u8>, String>(buf)
+    };
+    let buf = tokio::time::timeout(std::time::Duration::from_secs(5), io).await.map_err(|_| "HTTP_PROXY timeout".to_string())??;
+
+    let text_end = buf.windows(4).position(|w| w == b"\r\n\r\n").ok_or("malformed HTTP_PROXY response")?;
+    let head = String::from_utf8_lossy(&buf[..text_end]).to_string();
+    let mut lines = head.split("\r\n");
+    let status = lines.next().unwrap_or("").split_whitespace().nth(1).and_then(|s| s.parse::<u16>().ok()).ok_or("malformed HTTP_PROXY status")?;
+    let out_hdrs: Vec<(String, String)> = lines.filter_map(|l| l.split_once(':').map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))).collect();
+    Ok((status, out_hdrs, buf[text_end + 4..].to_vec()))
 }
 
 fn validate_authorizer(a: &Authorizer) -> Result<(), ApiErr> {
@@ -200,7 +333,8 @@ pub struct Target {
     pub route_key: String,
     pub stage: String,
     pub path: String,
-    pub function: Option<String>,
+    pub function: Option<String>,    // AWS_PROXY: Lambda function name
+    pub proxy_uri: Option<String>,   // HTTP_PROXY: loopback URI after stage-variable substitution
     pub params: Map<String, Value>,
     pub authorizer: Option<Authorizer>,
 }
@@ -235,13 +369,27 @@ impl ApiGw {
             }
         }
         let (_, route, params) = best?;
-        let function = route.target.strip_prefix("integrations/").and_then(|i| a.integrations.get(i)).filter(|i| i.ty == "AWS_PROXY").map(|i| lambda_fn_of(&i.uri));
+        let stage_vars = a.stages.get(&stage).map(|s| s.vars.clone()).unwrap_or_default();
+        let (function, proxy_uri) = route.target.strip_prefix("integrations/").and_then(|i| a.integrations.get(i)).map(|i| {
+            if i.ty == "AWS_PROXY" {
+                (Some(lambda_fn_of(&i.uri)), None)
+            } else if i.ty == "HTTP_PROXY" {
+                (None, Some(sub_stage_vars(&i.uri, &stage_vars)))
+            } else {
+                (None, None)
+            }
+        }).unwrap_or((None, None));
         let authorizer = if matches!(route.auth_type.as_str(), "JWT" | "CUSTOM") {
             route.authorizer_id.as_deref().and_then(|aid| a.authorizers.get(aid)).cloned()
         } else {
             None
         };
-        Some(Target { route_key: route.key.clone(), stage, path, function, params, authorizer })
+        Some(Target { route_key: route.key.clone(), stage, path, function, proxy_uri, params, authorizer })
+    }
+
+    // CORS configuration of an API, for preflight handling and response headers.
+    fn cors(&self, api: &str) -> Option<Cors> {
+        self.apis.get(api).and_then(|a| a.cors.clone())
     }
 
     // Control plane. `path` is what follows /v2/.
@@ -252,39 +400,74 @@ impl ApiGw {
             ("POST", ["apis"]) => {
                 let id = short_id();
                 let mut a = Api { name: s("name").unwrap_or_default(), protocol: s("protocolType").unwrap_or("HTTP".into()), created: chrono::Utc::now().to_rfc3339(),
-                    routes: BTreeMap::new(), integrations: BTreeMap::new(), authorizers: BTreeMap::new(), stages: BTreeMap::new() };
+                    routes: BTreeMap::new(), integrations: BTreeMap::new(), authorizers: BTreeMap::new(), stages: BTreeMap::new(), cors: None };
                 if a.protocol != "HTTP" {
                     return Err(err("BadRequestException", "Only HTTP APIs are supported locally"));
+                }
+                if let Some(cc) = b.get("corsConfiguration") {
+                    a.cors = Some(parse_cors(cc));
                 }
                 // Quick create: target → integration + $default route + auto-deployed $default stage.
                 if let Some(t) = s("target") {
                     let iid = short_id();
                     a.integrations.insert(iid.clone(), Integ { ty: "AWS_PROXY".into(), uri: t, fmt: "2.0".into() });
                     a.routes.insert(short_id(), Route { key: s("routeKey").unwrap_or("$default".into()), target: format!("integrations/{iid}"), auth_type: "NONE".into(), authorizer_id: None });
-                    a.stages.insert("$default".into(), true);
+                    a.stages.insert("$default".into(), Stage { auto: true, vars: BTreeMap::new() });
                 }
                 let out = api_json(&id, &a);
                 self.apis.insert(id, a);
                 (201, out)
-            }
-            ("GET", ["apis"]) => (200, json!({"items": self.apis.iter().map(|(i, a)| api_json(i, a)).collect::<Vec<_>>()})),
+            }            ("GET", ["apis"]) => (200, json!({"items": self.apis.iter().map(|(i, a)| api_json(i, a)).collect::<Vec<_>>()})),
             ("GET", ["apis", id]) => (200, api_json(id, self.apis.get(*id).ok_or_else(|| nf("API"))?)),
             ("DELETE", ["apis", id]) => {
                 self.apis.remove(*id).ok_or_else(|| nf("API"))?;
                 (204, Value::Null)
+            }
+            ("PATCH" | "PUT", ["apis", id]) => {
+                let a = self.apis.get_mut(*id).ok_or_else(|| nf("API"))?;
+                if let Some(n) = s("name") {
+                    a.name = n;
+                }
+                if let Some(cc) = b.get("corsConfiguration") {
+                    a.cors = cc.as_object().map(|_| parse_cors(cc)); // explicit null removes the config
+                }
+                (200, api_json(id, a))
             }
             (_, ["apis", id, rest @ ..]) => {
                 let a = self.apis.get_mut(*id).ok_or_else(|| nf("API"))?;
                 match (method, rest) {
                     ("POST", ["integrations"]) => {
                         let i = Integ { ty: s("integrationType").unwrap_or_default(), uri: s("integrationUri").unwrap_or_default(), fmt: s("payloadFormatVersion").unwrap_or("2.0".into()) };
-                        if i.ty != "AWS_PROXY" {
-                            return Err(err("BadRequestException", "Only AWS_PROXY (Lambda) integrations are supported locally"));
+                        match i.ty.as_str() {
+                            "AWS_PROXY" => {}
+                            "HTTP_PROXY" => {
+                                if !loopback_uri(&i.uri) {
+                                    return Err(err("BadRequestException", "HTTP_PROXY integration URIs must target http://127.0.0.1 or http://localhost (SSRF protection); use ${stageVariables.x} placeholders for the host/port"));
+                                }
+                            }
+                            other => return Err(err("BadRequestException", format!("Unsupported integrationType: {other} (only AWS_PROXY and HTTP_PROXY)"))),
                         }
                         let iid = short_id();
                         let out = integ_json(&iid, &i);
                         a.integrations.insert(iid, i);
                         (201, out)
+                    }
+                    ("PUT", ["cors"]) => {
+                        let c = parse_cors(b);
+                        if c.credentials && c.allow_origins.iter().any(|o| o == "*") {
+                            return Err(err("BadRequestException", "AllowCredentials cannot be used with the wildcard origin"));
+                        }
+                        let out = cors_json(&c);
+                        a.cors = Some(c);
+                        (200, out)
+                    }
+                    ("GET", ["cors"]) => {
+                        let c = a.cors.as_ref().ok_or_else(|| nf("CorsConfiguration"))?;
+                        (200, cors_json(c))
+                    }
+                    ("DELETE", ["cors"]) => {
+                        a.cors = None;
+                        (204, Value::Null)
                     }
                     ("GET", ["integrations"]) => (200, json!({"items": a.integrations.iter().map(|(k, i)| integ_json(k, i)).collect::<Vec<_>>()})),
                     ("GET", ["integrations", iid]) => (200, integ_json(iid, a.integrations.get(*iid).ok_or_else(|| nf("Integration"))?)),
@@ -379,10 +562,23 @@ impl ApiGw {
                     ("POST", ["stages"]) => {
                         let n = s("stageName").ok_or_else(|| err("BadRequestException", "stageName is required"))?;
                         let auto = b["autoDeploy"].as_bool().unwrap_or(false);
-                        a.stages.insert(n.clone(), auto);
-                        (201, json!({"stageName": n, "autoDeploy": auto}))
+                        let st = stage_of(b, auto);
+                        let out = stage_json(&n, &st);
+                        a.stages.insert(n, st);
+                        (201, out)
                     }
-                    ("GET", ["stages"]) => (200, json!({"items": a.stages.iter().map(|(n, d)| json!({"stageName": n, "autoDeploy": d})).collect::<Vec<_>>()})),
+                    ("GET", ["stages"]) => (200, json!({"items": a.stages.iter().map(|(n, s)| stage_json(n, s)).collect::<Vec<_>>()})),
+                    ("GET", ["stages", n]) => (200, stage_json(n, a.stages.get(*n).ok_or_else(|| nf("Stage"))?)),
+                    ("PATCH", ["stages", n]) => {
+                        let cur = a.stages.get(*n).ok_or_else(|| nf("Stage"))?;
+                        let updated = Stage {
+                            auto: b["autoDeploy"].as_bool().unwrap_or(cur.auto),
+                            vars: if b.get("stageVariables").is_some() { stage_of(b, cur.auto).vars } else { cur.vars.clone() },
+                        };
+                        let out = stage_json(n, &updated);
+                        a.stages.insert((*n).to_string(), updated);
+                        (200, out)
+                    }
                     ("DELETE", ["stages", n]) => {
                         a.stages.remove(*n).ok_or_else(|| nf("Stage"))?;
                         (204, Value::Null)
@@ -401,8 +597,10 @@ impl ApiGw {
             .iter()
             .map(|(id, a)| {
                 let rows: Vec<Value> = a.routes.values().map(|r| {
-                    let fname = r.target.strip_prefix("integrations/").and_then(|i| a.integrations.get(i)).map(|i| lambda_fn_of(&i.uri)).unwrap_or_default();
-                    json!([r.key, fname])
+                    let target = r.target.strip_prefix("integrations/").and_then(|i| a.integrations.get(i)).map(|i| {
+                        if i.ty == "HTTP_PROXY" { format!("{} (HTTP_PROXY)", i.uri) } else { lambda_fn_of(&i.uri) }
+                    }).unwrap_or_default();
+                    json!([r.key, target])
                 }).collect();
                 json!({"name": a.name, "count": rows.len(), "sub": format!("{}/_api/{id} · 스테이지 {} · 인가자 {}", crate::endpoint(), a.stages.keys().cloned().collect::<Vec<_>>().join(", "), a.authorizers.len()),
                        "cols": ["라우트", "Lambda"], "rows": rows})
@@ -411,11 +609,46 @@ impl ApiGw {
     }
 }
 
-// Data plane: turn an HTTP request into a payload-v2 Lambda event and the result into a response.
+// Preflight headers: everything the browser needs for an OPTIONS call with an allowed origin.
+fn preflight_headers(c: &Cors, origin: &str) -> Vec<(String, String)> {
+    let mut h = cors_response_headers(c, origin);
+    if !c.allow_methods.is_empty() {
+        h.push(("Access-Control-Allow-Methods".into(), c.allow_methods.join(", ")));
+    }
+    if !c.allow_headers.is_empty() {
+        h.push(("Access-Control-Allow-Headers".into(), c.allow_headers.join(", ")));
+    }
+    h.push(("Access-Control-Max-Age".into(), c.max_age.to_string()));
+    h
+}
+
+// Append CORS headers to a real response (never duplicating one the handler already set).
+fn apply_cors(h: &mut Vec<(String, String)>, cors: Option<&Cors>, origin: &str) {
+    if let Some(c) = cors.filter(|c| cors_allows(c, origin)) {
+        for (k, v) in cors_response_headers(c, origin) {
+            if !h.iter().any(|(hk, _)| hk.eq_ignore_ascii_case(&k)) {
+                h.push((k, v));
+            }
+        }
+    }
+}
+
+// Data plane: turn an HTTP request into a payload-v2 Lambda event and the result into a response,
+// or forward it to a loopback HTTP_PROXY target. CORS headers ride on both kinds.
 pub async fn invoke(app: &Arc<App>, method: &str, api: &str, rest: &str, query: &str, headers: &axum::http::HeaderMap, body: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>, String) {
     let json_err = |st: u16, m: &str, rk: String| (st, vec![("content-type".into(), "application/json".into())], json!({"message": m}).to_string().into_bytes(), rk);
-    let Some(t) = app.apigw.lock().unwrap().resolve(api, method, rest) else { return json_err(404, "Not Found", String::new()) };
-    let Some(func) = t.function.clone() else { return json_err(404, "Not Found", String::new()) };
+    let (t, cors) = {
+        let gw = app.apigw.lock().unwrap();
+        (gw.resolve(api, method, rest), gw.cors(api))
+    };
+    let origin = headers.get("origin").and_then(|v| v.to_str().ok()).unwrap_or("");
+    // Preflight: an allowed Origin answers OPTIONS directly, without needing a matching route.
+    if method == "OPTIONS" {
+        if let Some(c) = cors.as_ref().filter(|c| cors_allows(c, origin)) {
+            return (204, preflight_headers(c, origin), Vec::new(), String::new());
+        }
+    }
+    let Some(t) = t else { return json_err(404, "Not Found", String::new()) };
     let hdrs: Map<String, Value> = headers.iter().filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.into()))).collect();
     let qs: Map<String, Value> = query.split('&').filter(|p| !p.is_empty())
         .map(|p| { let (k, v) = p.split_once('=').unwrap_or((p, "")); (crate::s3::pct_decode(k), crate::s3::pct_decode(v).into()) }).collect();
@@ -491,22 +724,36 @@ pub async fn invoke(app: &Arc<App>, method: &str, api: &str, rest: &str, query: 
         }
     }
 
+    // HTTP_PROXY: forward method, path, query and headers to the loopback target.
+    let hdr_pairs: Vec<(String, String)> = headers.iter().map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())).collect();
+    if let Some(uri) = t.proxy_uri.clone() {
+        let (status, mut h, b, rk) = match http_proxy(&uri, method, &t.path, query, &hdr_pairs, body).await {
+            // Hop-by-hop headers belong to the emulator's own connection, not to the caller.
+            Ok((s, h, b)) => (s, h.into_iter().filter(|(k, _)| !matches!(k.to_ascii_lowercase().as_str(), "connection" | "keep-alive" | "transfer-encoding" | "content-length")).collect(), b, t.route_key),
+            Err(_) => json_err(502, "Bad Gateway", t.route_key),
+        };
+        apply_cors(&mut h, cors.as_ref(), origin);
+        return (status, h, b, rk);
+    }
+    let Some(func) = t.function.clone() else { return json_err(404, "Not Found", String::new()) };
     match crate::lambda::invoke(app, &func, event).await {
         Ok(inv) if inv.error.is_none() => {
             let p = inv.payload;
             // A result with statusCode is a full response; anything else becomes a 200 JSON body.
-            if p.get("statusCode").is_some() {
-                let mut h: Vec<(String, String)> = p["headers"].as_object().into_iter().flatten()
+            let (mut h, b) = if p.get("statusCode").is_some() {
+                let h: Vec<(String, String)> = p["headers"].as_object().into_iter().flatten()
                     .map(|(k, v)| (k.clone(), v.as_str().map_or(v.to_string(), String::from))).collect();
-                if !h.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
-                    h.push(("content-type".into(), "application/json".into()));
-                }
                 let raw = p["body"].as_str().unwrap_or("");
                 let b = if p["isBase64Encoded"] == true { crate::unb64(raw).unwrap_or_default() } else { raw.as_bytes().to_vec() };
-                (p["statusCode"].as_u64().unwrap_or(200) as u16, h, b, t.route_key)
+                (h, b)
             } else {
-                (200, vec![("content-type".into(), "application/json".into())], p.to_string().into_bytes(), t.route_key)
+                (vec![], p.to_string().into_bytes())
+            };
+            if !h.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
+                h.push(("content-type".into(), "application/json".into()));
             }
+            apply_cors(&mut h, cors.as_ref(), origin);
+            (p["statusCode"].as_u64().unwrap_or(200) as u16, h, b, t.route_key)
         }
         _ => json_err(500, "Internal Server Error", t.route_key),
     }
@@ -574,5 +821,82 @@ mod tests {
         assert!(extract_identity(&["$request.header.X-Missing".into()], &h, &q).is_none());
 
         assert_eq!(gw.handle("DELETE", &format!("apis/{id}/authorizers/{aid}"), &json!({})).unwrap().0, 204);
+    }
+
+    #[test]
+    fn cors_and_loopback_rules() {
+        let mut gw = ApiGw::default();
+        let (_, api) = gw.handle("POST", "apis", &json!({"name": "a", "corsConfiguration": {"allowOrigins": ["https://good.example"], "allowMethods": ["GET"]}})).unwrap();
+        let id = api["apiId"].as_str().unwrap().to_string();
+        assert_eq!(api["corsConfiguration"]["allowOrigins"], json!(["https://good.example"]));
+
+        // PUT/GET/DELETE cors round trip
+        let (_, c) = gw.handle("PUT", &format!("apis/{id}/cors"), &json!({"allowOrigins": ["https://a.example", "https://b.example"], "allowHeaders": ["content-type"], "maxAge": 600, "allowCredentials": true})).unwrap();
+        assert_eq!(c["maxAge"], 600);
+        assert_eq!(gw.handle("GET", &format!("apis/{id}/cors"), &json!({})).unwrap().1["allowHeaders"], json!(["content-type"]));
+
+        let cors = gw.cors(&id).unwrap();
+        assert!(cors_allows(&cors, "https://a.example") && !cors_allows(&cors, "https://evil.example"));
+        assert!(!cors_allows(&cors, ""));
+        let h = preflight_headers(&cors, "https://a.example");
+        assert!(h.contains(&("Access-Control-Allow-Origin".into(), "https://a.example".into())));
+        assert!(h.iter().any(|(k, v)| k == "Access-Control-Max-Age" && v == "600"));
+
+        // AllowCredentials + wildcard origin is refused
+        let e = gw.handle("PUT", &format!("apis/{id}/cors"), &json!({"allowOrigins": ["*"], "allowCredentials": true})).unwrap_err();
+        assert_eq!(e.code, "BadRequestException");
+        assert_eq!(gw.handle("DELETE", &format!("apis/{id}/cors"), &json!({})).unwrap().0, 204);
+        assert!(gw.cors(&id).is_none());
+
+        // HTTP_PROXY integrations: loopback only at save time
+        assert_eq!(gw.handle("POST", &format!("apis/{id}/integrations"), &json!({"integrationType": "HTTP_PROXY", "integrationUri": "http://example.com/x"})).unwrap_err().code, "BadRequestException");
+        assert_eq!(gw.handle("POST", &format!("apis/{id}/integrations"), &json!({"integrationType": "HTTP_PROXY", "integrationUri": "https://127.0.0.1:80/x"})).unwrap_err().code, "BadRequestException");
+        let (_, i) = gw.handle("POST", &format!("apis/{id}/integrations"), &json!({"integrationType": "HTTP_PROXY", "integrationUri": "http://${stageVariables.h}:${stageVariables.p}"})).unwrap();
+        let iid = i["integrationId"].as_str().unwrap();
+        let (_, rt) = gw.handle("POST", &format!("apis/{id}/routes"), &json!({"routeKey": "GET /{p+}", "target": format!("integrations/{iid}")})).unwrap();
+        assert_eq!(rt["target"], format!("integrations/{iid}"));
+        let (_, st) = gw.handle("POST", &format!("apis/{id}/stages"), &json!({"stageName": "s1", "autoDeploy": true, "stageVariables": {"h": "127.0.0.1", "p": "8123"}})).unwrap();
+        assert_eq!(st["stageVariables"]["p"], "8123");
+        let t = gw.resolve(&id, "GET", "/s1/anything").unwrap();
+        assert_eq!(t.stage, "s1");
+        assert_eq!(t.proxy_uri.as_deref(), Some("http://127.0.0.1:8123"));
+        assert!(t.function.is_none());
+        // $default stage has no variables: the placeholder survives and fails the loopback check at invoke time
+        let d = gw.resolve(&id, "GET", "/anything").unwrap();
+        assert_eq!(d.proxy_uri.as_deref(), Some("http://${stageVariables.h}:${stageVariables.p}"));
+    }
+
+    #[tokio::test]
+    async fn http_proxy_roundtrip() {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut all = Vec::new();
+            let mut buf = [0u8; 4096];
+            // Read the whole request (headers + Content-Length body) so closing never resets the client.
+            loop {
+                let n = s.read(&mut buf).unwrap();
+                if n == 0 { break }
+                all.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&all).to_string();
+                if let Some((h, b)) = text.split_once("\r\n\r\n") {
+                    let want: usize = h.lines().find(|l| l.to_ascii_lowercase().starts_with("content-length:")).and_then(|l| l.split(':').nth(1)).and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+                    if b.len() >= want { break }
+                }
+            }
+            let req = String::from_utf8_lossy(&all).to_string();
+            let body = if req.starts_with("POST /echo?a=1") {
+                format!("saw {} {}", req.lines().find(|l| l.to_ascii_lowercase().starts_with("x-fwd:")).map(String::from).unwrap_or_default().trim(), req.split("\r\n\r\n").nth(1).unwrap_or(""))
+            } else { String::new() };
+            let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Backend: yes\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+            s.write_all(resp.as_bytes()).unwrap();
+        });
+        let (status, h, b) = http_proxy(&format!("http://127.0.0.1:{port}"), "POST", "/echo", "a=1", &[("x-fwd".to_string(), "hi".to_string())], b"pay").await.unwrap();
+        assert_eq!(status, 200);
+        assert!(h.contains(&("X-Backend".to_string(), "yes".to_string())));
+        assert_eq!(String::from_utf8(b).unwrap(), "saw x-fwd: hi pay");
+        assert!(http_proxy("http://example.com", "GET", "/", "", &[], b"").await.is_err());
     }
 }

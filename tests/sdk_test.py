@@ -2249,6 +2249,78 @@ def test_apigw_authorizers():
     idp.delete_user_pool(UserPoolId=pool)
 
 
+def test_apigw_cors_proxy():
+    import threading, http.server, urllib.request, urllib.error
+    gw = boto3.client("apigatewayv2", **kw)
+    p = f"corsp{run}"
+
+    # Local backend for HTTP_PROXY: echoes path+query and a forwarded header.
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("X-Backend", "yes")
+            self.end_headers()
+            self.wfile.write(f"{self.path} fwd={self.headers.get('X-Fwd', '')}".encode())
+        def log_message(self, *a):
+            pass
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    api = gw.create_api(Name=p, ProtocolType="HTTP")["ApiId"]
+    # External and https targets are refused at save time (SSRF protection)
+    assert code(gw.create_integration, ApiId=api, IntegrationType="HTTP_PROXY", IntegrationUri="http://example.com/x") == "BadRequestException"
+    assert code(gw.create_integration, ApiId=api, IntegrationType="HTTP_PROXY", IntegrationUri="https://127.0.0.1:9/x") == "BadRequestException"
+
+    # Loopback target behind stage variables: ${stageVariables.port} substituted per stage
+    integ = gw.create_integration(ApiId=api, IntegrationType="HTTP_PROXY", IntegrationUri="http://127.0.0.1:${stageVariables.port}")["IntegrationId"]
+    gw.create_route(ApiId=api, RouteKey="GET /{proxy+}", Target=f"integrations/{integ}")
+    gw.create_stage(ApiId=api, StageName="s1", AutoDeploy=True, StageVariables={"port": str(port)})
+    base = gw.get_api(ApiId=api)["ApiEndpoint"]
+
+    # GET /s1/hello?a=1 → backend sees /hello?a=1, headers ride along
+    with urllib.request.urlopen(urllib.request.Request(f"{base}/s1/hello?a=1", headers={"X-Fwd": "hi"}), timeout=10) as r:
+        assert r.status == 200 and r.headers["X-Backend"] == "yes"
+        assert r.read().decode() == "/hello?a=1 fwd=hi", "proxy must forward path, query and headers"
+    # A stage without the variable leaves the placeholder → loopback check fails at invoke time
+    try:
+        urllib.request.urlopen(f"{base}/other/hello", timeout=10)
+        raise AssertionError("unresolved stage variable should not proxy")
+    except urllib.error.HTTPError as e:
+        assert e.code == 502
+
+    # CORS: preflight answered only for allowed origins (boto3 sets CORS via update_api)
+    gw.update_api(ApiId=api, CorsConfiguration={
+        "AllowOrigins": ["https://good.example"], "AllowMethods": ["GET", "POST"],
+        "AllowHeaders": ["content-type", "x-fwd"], "MaxAge": 600})
+    assert gw.get_api(ApiId=api)["ApiEndpoint"] == base
+    good = urllib.request.Request(f"{base}/s1/anything", method="OPTIONS",
+                                  headers={"Origin": "https://good.example", "Access-Control-Request-Method": "GET"})
+    with urllib.request.urlopen(good, timeout=10) as r:
+        assert r.status == 204
+        assert r.headers["Access-Control-Allow-Origin"] == "https://good.example"
+        assert "GET" in r.headers["Access-Control-Allow-Methods"]
+        assert r.headers["Access-Control-Max-Age"] == "600"
+    bad = urllib.request.Request(f"{base}/s1/anything", method="OPTIONS",
+                                 headers={"Origin": "https://evil.example", "Access-Control-Request-Method": "GET"})
+    try:
+        urllib.request.urlopen(bad, timeout=10)
+        raise AssertionError("foreign-origin preflight must not be answered with CORS headers")
+    except urllib.error.HTTPError as e:
+        assert e.code == 404 and "Access-Control-Allow-Origin" not in e.headers
+    # Real responses carry the CORS header for allowed origins only
+    with_origin = urllib.request.Request(f"{base}/s1/hello", headers={"Origin": "https://good.example"})
+    with urllib.request.urlopen(with_origin, timeout=10) as r:
+        assert r.headers["Access-Control-Allow-Origin"] == "https://good.example"
+    with_origin_evil = urllib.request.Request(f"{base}/s1/hello", headers={"Origin": "https://evil.example"})
+    with urllib.request.urlopen(with_origin_evil, timeout=10) as r:
+        assert "Access-Control-Allow-Origin" not in r.headers
+
+    gw.delete_api(ApiId=api)
+    srv.shutdown()
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
