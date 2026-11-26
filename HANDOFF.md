@@ -1,4 +1,4 @@
-# rocalcloud 작업 계획서 (2026-11-25 ~ 2026-12-07, 13일)
+# rocalcloud 작업 계획서 (2026-11-25 ~ 2026-12-17, 23일)
 
 이 문서는 일을 넘겨받는 작업자(모델)를 위한 날짜별 계획서다. **먼저 `AGENTS.md` 전체를 읽는다.** 구조, 요청 흐름, 서비스 추가 패턴은 거기 있다.
 이 문서와 AGENTS.md가 충돌하면 AGENTS.md가 맞다.
@@ -6,7 +6,7 @@
 **이 문서는 지우지 않는다. 계속 이어 쓰는 계획서다.**
 - 하루가 끝나면 그날 제목 옆에 `✅ 완료`, `⚠️ 일부`, `❌ 못 함` 중 하나와 커밋 해시를 적는다.
 - 못 끝낸 일은 다음 날 맨 앞으로 옮긴다. 다른 날 항목을 건너뛰어 먼저 하지 않는다.
-- 마지막 날(13일차)에는 그다음 10일 계획을 이 문서 끝에 이어 쓴다.
+- 마지막 날(지금은 23일차)에는 그다음 10일 계획을 이 문서 끝에 이어 쓴다.
 
 **지난 1차(11-24~26) 결과:** 커밋 9개(`5982113`~`4e4191f`)가 들어갔고 CI는 전부 초록이다.
 - 계획했던 일: IAM 조건 연산자, `STRICT_DELIVERY=1`, 테스트하지 않은 경로 테스트(`test_handoff_edge_paths`).
@@ -289,10 +289,119 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - 7절: 할 일 목록을 고친다.
   - 8절: 한계를 고친다.
   - `grep -rn ponytail core/src`에서 해결한 주석이 지워졌는지 본다.
-- **이 문서 끝에 14~23일차(10일) 계획을 이어 쓴다.**
-  - 남은 `ponytail:` 주석과 7절 후보에서 고른다. 예: ECS 롤링 배포, RDS 스냅샷, Lambda 레이어, SigV4a, DynamoDB 트랜잭션·스트림 점검, Route53 헬스체크.
-  - 하루 분량은 이 문서의 하루 수준(기능 1~2개 + 테스트)으로 맞춘다.
-  - 큰 기능(API Gateway REST v1, Cognito SRP·호스팅 UI, CFN 중첩 스택·SAM)은 이틀로 나눈다.
+- 14~23일차 계획은 이미 아래에 있다(2026-11-26 추가). 1~12일차 결과를 보고 순서나 범위를 고칠 곳이 있으면 고치고, 고친 이유를 그 날 항목에 한 줄로 적는다.
+- 12일차에 하지 않은 Playwright 화면 점검(Pages 마을·`/_town`·`/_ui`)을 여기서 한다.
+
+---
+
+## 14일차 (2026-12-08): Step Functions 작업 토큰·타임아웃
+- **`sfn.rs` 4행:** `.waitForTaskToken` 통합을 넣는다.
+  - `$.Task.Token`을 Parameters로 넘기고, 실행은 토큰이 돌아올 때까지 멈춘다. 대상은 SQS `sendMessage`, SNS `publish`, Lambda `invoke`다.
+  - 토큰을 돌려주는 연산은 `SendTaskSuccess`, `SendTaskFailure`, `SendTaskHeartbeat`다.
+  - 모르는 토큰이나 이미 끝난 토큰에는 `TaskDoesNotExist` 또는 `TaskTimedOut`으로 답한다.
+- **Task 상태의 `TimeoutSeconds`와 `HeartbeatSeconds`:** 시간을 넘기면 `States.Timeout` 오류를 낸다. 기존 Retry·Catch를 그대로 탄다.
+- 멈춘 실행을 어떻게 보관할지 `ponytail:` 주석에 적는다. 메모리에만 두고 재시작하면 잃는다면 그렇게 쓴다.
+- 테스트:
+  - SQS로 토큰을 받아 SendTaskSuccess를 보내면 실행이 SUCCEEDED가 되어야 한다.
+  - 하트비트가 없으면 1초 뒤 Catch로 가야 한다.
+  - 엉터리 토큰은 오류가 나야 한다.
+
+## 15일차 (2026-12-09): Lambda 가중치 별칭·한정자별 호출 설정
+- **`lambda.rs` 3행:** 별칭 `RoutingConfig.AdditionalVersionWeights`를 지원한다. 한 버전만, 가중치는 0~1이다.
+  - 호출할 때 `rand`로 버전을 고르고, 응답 `ExecutedVersion`에 실제 버전을 적는다.
+  - 지금은 이 설정을 거부하니, 거부 코드를 지운다.
+- **`lambda.rs` 536행:** EventInvokeConfig를 한정자(버전·별칭)별로 저장한다. 한정자가 없으면 `$LATEST` 설정을 쓴다.
+- 테스트:
+  - 가중치 0.5로 200번 호출하면 두 버전이 각각 30% 이상이어야 한다. 확률 테스트라 기준을 느슨하게 잡았다는 사실을 보고에 적는다.
+  - 가중치 1.0을 넘으면 거부되어야 한다.
+  - 별칭별 OnFailure 대상이 서로 섞이지 않아야 한다.
+
+## 16일차 (2026-12-10): ECS 롤링 배포·헬스 체크 (Docker 필요, 우분투에서만)
+- **`ecs.rs` 246행:** 서비스 업데이트를 `deploymentConfiguration`(`minimumHealthyPercent`, `maximumPercent`)에 따라 단계적으로 바꾼다.
+  - `deployments` 배열(PRIMARY·ACTIVE)과 `rolloutState`를 보여 준다.
+- **헬스 체크:** 컨테이너 `healthCheck.command`를 Docker `--health-cmd`로 넘긴다. unhealthy 태스크는 교체한다.
+- 컨테이너 수는 우분투 한도(RAM 8 GiB)를 고려해 테스트에서 최대 3개로 둔다. 끝나면 `docker ps -a`가 0개여야 한다.
+- 테스트:
+  - 2개 태스크 서비스의 태스크 정의를 바꾸는 동안 실행 중인 태스크가 1개 아래로 떨어지지 않아야 한다(min 50%).
+  - 실패하는 헬스 체크를 가진 태스크는 교체되어야 한다.
+
+## 17일차 (2026-12-11): RDS 스냅샷·파라미터 그룹 (Docker 필요)
+- **`managed.rs` 3행:**
+  - 스냅샷: `CreateDBSnapshot`, `DescribeDBSnapshots`, `DeleteDBSnapshot`, `RestoreDBInstanceFromDBSnapshot`
+  - 구현은 `docker commit`이 가장 짧다. 이미지 크기를 보고에 적는다. 스냅샷 이미지는 `rocalcloud-snap-` 접두사로 만들고, 리셋·삭제할 때 지운다.
+- **파라미터 그룹:** `CreateDBParameterGroup`, `ModifyDBParameterGroup`, `DescribeDBParameters`
+  - 적용은 컨테이너 재시작할 때 `-c key=value`(Postgres) 또는 `--key=value`(MySQL)로 한다. 모르는 파라미터는 거부한다.
+- 테스트:
+  - 테이블에 행을 넣고 스냅샷을 찍은 뒤 복원한 인스턴스에서 그 행이 보여야 한다.
+  - `max_connections` 파라미터가 `SHOW`로 확인되어야 한다.
+  - 끝나면 남은 컨테이너와 스냅샷 이미지가 0개여야 한다.
+
+## 18일차 (2026-12-12): Route53 헬스 체크·DNS TCP
+- **`route53.rs` 4행:** `CreateHealthCheck`, `GetHealthCheck`, `ListHealthChecks`, `DeleteHealthCheck`, `GetHealthCheckStatus`
+  - 종류는 TCP와 HTTP이고, **대상은 루프백만 허용한다**(SSRF 방지). 주기는 10초 이상이다.
+- 페일오버와 가중치 레코드의 `HealthCheckId`를 반영한다. PRIMARY가 unhealthy면 SECONDARY로 답한다.
+- **DNS over TCP:** 기존 UDP 응답 코드를 다시 써서 같은 포트 TCP로도 받는다(2바이트 길이 접두사). 512바이트를 넘는 응답은 UDP에서 TC 비트를 세운다.
+- 테스트:
+  - 테스트 안에서 루프백 서버를 띄웠다 내리면 페일오버 응답이 바뀌어야 한다.
+  - `dnspython` TCP 질의가 되어야 한다.
+  - 외부 주소 헬스 체크는 생성할 때 거부되어야 한다.
+
+## 19일차 (2026-12-13): DynamoDB 트랜잭션·스트림·숫자 점검
+- **점검 위주로 한다.** 아래를 테스트로 확인하고, 틀린 것만 고친다.
+  - `TransactWriteItems`: 실패할 때 `CancellationReasons` 순서와 코드, `ClientRequestToken` 10분 멱등성, 같은 항목 두 번 지정 거부
+  - `TransactGetItems`
+  - Streams: `StreamViewType` 4종의 레코드 모양. Lambda 매핑의 `FilterCriteria`가 있으면 그것도 본다.
+- **`ddb.rs` 11행:** 키가 아닌 N 값과 `ADD`/`SET a = a + :n` 산술도 십진 문자열로 계산해 정밀도를 지킨다. 3일차의 비교 코드를 다시 쓴다. 38자리를 넘으면 `ValidationException`으로 답한다.
+- 테스트:
+  - `9007199254740993` + 1이 정확해야 한다.
+  - 트랜잭션 조건이 실패하면 `CancellationReasons`에 `ConditionalCheckFailed`가 제 위치에 있어야 한다.
+  - 같은 토큰으로 다시 보내면 한 번만 적용되어야 한다.
+
+## 20일차 (2026-12-14): API Gateway REST v1 (1/2) — 리소스·메서드·배포
+- **`apigw.rs` 4행:** REST API(`apigateway` 서비스, REST-JSON 프로토콜)를 시작한다.
+  - 연산: `CreateRestApi`, `GetResources`, `CreateResource`, `PutMethod`, `PutIntegration`(AWS_PROXY Lambda, MOCK), `PutMethodResponse`, `PutIntegrationResponse`, `CreateDeployment`, `CreateStage`, `Get*`, `Delete*`
+- 호출 경로는 `/_restapi/{id}/{stage}/...`이다. HTTP API의 `/_api/`와 같은 처리 방식을 다시 쓴다.
+- **REST v1에서는 배포가 실제로 스냅샷을 만든다.** 배포 전 변경은 호출에 보이지 않아야 한다. HTTP API의 "배포는 no-op"과 다른 점을 주석에 적는다.
+- 매핑 템플릿(VTL)은 하지 않는다. AWS 통합과 `requestTemplates`는 거부한다.
+- 테스트:
+  - Lambda 프록시 호출이 200이어야 하고, 이벤트 모양이 REST v1 형식(`resource`, `httpMethod`, `requestContext.stage`)이어야 한다.
+  - MOCK은 고정 응답을 돌려주어야 한다.
+  - 배포 전 변경은 반영되지 않아야 한다.
+
+## 21일차 (2026-12-15): API Gateway REST v1 (2/2) — 인가자·API 키·CFN
+- REST 인가자를 넣는다.
+  - `COGNITO_USER_POOLS`: 7일차 JWT 검증 코드를 다시 쓴다.
+  - Lambda `TOKEN`, `REQUEST`: IAM 정책 문서 응답을 해석해 Allow·Deny를 판정한다.
+- **API 키와 사용 계획:** `CreateApiKey`, `CreateUsagePlan`, `CreateUsagePlanKey`, 메서드 `apiKeyRequired`
+  - `x-api-key`가 없으면 403이다.
+  - 스로틀은 초당 토큰 버킷 하나만 한다. 쿼터는 `ponytail:` 주석에 한계로 적는다.
+- **CFN:** `AWS::ApiGateway::RestApi`, `Resource`, `Method`, `Deployment`, `Stage` 타입을 추가한다.
+- 테스트:
+  - 키가 없으면 403, 있으면 200이어야 한다.
+  - TOKEN 인가자가 Deny를 돌려주면 403이어야 한다.
+  - CFN 템플릿 하나로 REST API를 만들어 호출이 되어야 한다.
+
+## 22일차 (2026-12-16): S3 체크섬·트레일러 체크섬 재계산
+- **`sigv4.rs` 5행:** aws-chunked 트레일러의 `x-amz-checksum-*` 값을 실제로 다시 계산해 비교한다. 다르면 `BadDigest`로 답한다.
+  - CRC32와 CRC32C는 표 기반으로 짧게 직접 짠다(새 크레이트 없이). SHA-1은 크레이트가 없으니 거부하거나 직접 짠다. 고른 쪽을 주석에 적는다.
+  - SHA-256은 이미 있는 sha2를 쓴다.
+- **S3 객체 체크섬:**
+  - PutObject의 `x-amz-checksum-*` 헤더와 `ChecksumAlgorithm`을 검증하고 저장한다.
+  - `GetObject(ChecksumMode=ENABLED)`와 `HeadObject`에서 돌려준다. `GetObjectAttributes`도 지원한다.
+- **SigV4a는 하지 않는다.** ECDSA P-256 크레이트가 새로 필요하다. 필요하면 사용자에게 묻도록 AGENTS.md 7절 후보로만 적는다.
+- 테스트:
+  - boto3 기본 체크섬(CRC32) 업로드가 통과해야 하고, 변조한 체크섬은 400이어야 한다.
+  - `GetObjectAttributes`의 Checksum이 맞아야 한다.
+  - 두 모드에서 모두 통과해야 한다. VERIFY_SIGV4 모드에서는 트레일러 경로를 탄다.
+
+## 23일차 (2026-12-17): v0.1.7 릴리스 + 다음 10일 계획
+- 우분투 전체 검증을 돌린다(두 모드, JS·Rust 스위트, `ubuntu_verify.sh`, 컨테이너 0개, 스냅샷 이미지 0개).
+- v0.1.7을 준비한다. 절차는 1일차 1-2와 같다.
+  - **태그 푸시는 사용자 승인을 받은 뒤에만 한다.**
+  - 아직 승인을 기다리는 태그(v0.1.5, v0.1.6)가 남아 있으면, 순서대로 낼지 하나로 묶을지 사용자에게 묻는다.
+- AGENTS.md 1·7·8절을 갱신하고, `town.html` 12절 숫자를 고친다. Playwright 화면 점검도 한다.
+- **이 문서 끝에 24~33일차(10일) 계획을 이어 쓴다.** 남은 `ponytail:` 주석과 7절 후보에서 고른다.
+  - 후보: Lambda 레이어·웜 컨테이너, Cognito SRP·MFA(이틀), CFN 중첩 스택·SAM 변환(이틀), Kinesis enhanced fan-out, EC2 NACL·피어링, ALB TLS·스티키 세션, SNS http 엔드포인트(루프백만), Step Functions Express 동기 실행
 
 ---
 
@@ -301,4 +410,4 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
 - 한 일과 CI 결과
 - 테스트한 것과 **테스트하지 않은 것**을 구분해 적는다.
 - 우분투 상태: 프로세스 0개, 컨테이너 0개, 전원 끔
-- 다음 날 할 일과 막힌 점(사용자 결정이 필요한 것). 릴리스 태그 승인은 1일차와 13일차에 꼭 묻는다.
+- 다음 날 할 일과 막힌 점(사용자 결정이 필요한 것). 릴리스 태그 승인은 1일차·13일차·23일차에 꼭 묻는다.
