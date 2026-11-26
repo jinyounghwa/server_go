@@ -2624,6 +2624,77 @@ def test_sfn_task_tokens():
 
 
 
+def test_lambda_weighted_alias():
+    lam, sqs = boto3.client("lambda", **kw), boto3.client("sqs", **kw)
+    base = f"wgt{run}"
+    role = "arn:aws:iam::000000000000:role/none"
+    qa = sqs.create_queue(QueueName=f"{base}-a")["QueueUrl"]
+    qb = sqs.create_queue(QueueName=f"{base}-b")["QueueUrl"]
+    arn_a = f"arn:aws:sqs:us-east-1:000000000000:{base}-a"
+    arn_b = f"arn:aws:sqs:us-east-1:000000000000:{base}-b"
+    # A function whose code reports its own executed version.
+    z = zipped({"index.py": "import os\ndef handler(e, c):\n    return {'version': os.environ.get('AWS_LAMBDA_FUNCTION_VERSION', '?')}\n"})
+    fn = f"{base}-fn"
+    lam.create_function(FunctionName=fn, Runtime="python3.12", Role=role, Handler="index.handler", Code={"ZipFile": z})
+    lam.update_function_configuration(FunctionName=fn, Environment={"Variables": {"TAG": "v2"}})
+    v2 = lam.publish_version(FunctionName=fn)["Version"]
+    lam.create_alias(FunctionName=fn, Name="split", FunctionVersion="$LATEST",
+                     RoutingConfig={"AdditionalVersionWeights": {v2: 0.5}})
+    al = lam.get_alias(FunctionName=fn, Name="split")
+    assert float(al["RoutingConfig"]["AdditionalVersionWeights"][v2]) == 0.5
+
+    # 200 invokes through the alias split roughly between $LATEST and v2 (loose bounds: it is a coin flip).
+    seen = {"$LATEST": 0, v2: 0}
+    for _ in range(200):
+        r = lam.invoke(FunctionName=fn, Qualifier="split", Payload="{}")
+        body = json.loads(r["Payload"].read())
+        seen[body["version"]] += 1
+        assert r["ExecutedVersion"] == body["version"]
+    assert seen["$LATEST"] >= 60 and seen[v2] >= 60, seen  # 30% floor each
+
+    # Weight bounds and mismatched versions are rejected.
+    assert code(lam.update_alias, FunctionName=fn, Name="split", FunctionVersion="$LATEST",
+                RoutingConfig={"AdditionalVersionWeights": {v2: 1.5}}) == "InvalidParameterValueException"
+    assert code(lam.update_alias, FunctionName=fn, Name="split", FunctionVersion="$LATEST",
+                RoutingConfig={"AdditionalVersionWeights": {v2: 0.5, "3": 0.2}}) == "InvalidParameterValueException"
+    assert code(lam.update_alias, FunctionName=fn, Name="split", FunctionVersion=v2,
+                RoutingConfig={"AdditionalVersionWeights": {v2: 0.5}}) == "InvalidParameterValueException"
+
+    # Per-alias async invoke configs stay separate: each failure lands on its own queue.
+    lam2 = boto3.client("lambda", **kw)
+    zf = zipped({"index.py": "def handler(e, c):\n    raise RuntimeError('wgt-boom')\n"})
+    fnf = f"{base}-fail"
+    lam2.create_function(FunctionName=fnf, Runtime="python3.12", Role=role, Handler="index.handler", Code={"ZipFile": zf})
+    vf = lam2.publish_version(FunctionName=fnf)["Version"]
+    lam2.create_alias(FunctionName=fnf, Name="aa", FunctionVersion="$LATEST")
+    lam2.create_alias(FunctionName=fnf, Name="bb", FunctionVersion="$LATEST")
+    for alias, dest in [("aa", arn_a), ("bb", arn_b)]:
+        lam2.put_function_event_invoke_config(
+            FunctionName=fnf, Qualifier=alias, MaximumRetryAttempts=0,
+            DestinationConfig={"OnFailure": {"Destination": dest}})
+    cfg_a = lam2.get_function_event_invoke_config(FunctionName=fnf, Qualifier="aa")
+    cfg_b = lam2.get_function_event_invoke_config(FunctionName=fnf, Qualifier="bb")
+    assert cfg_a["DestinationConfig"]["OnFailure"]["Destination"] == arn_a
+    assert cfg_b["DestinationConfig"]["OnFailure"]["Destination"] == arn_b
+    for alias in ("aa", "bb"):
+        lam2.invoke(FunctionName=fnf, Qualifier=alias, InvocationType="Event", Payload="{}")
+    def drain(url):
+        for _ in range(50):
+            m = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=1).get("Messages", [])
+            if m:
+                return m[0]["Body"]
+            time.sleep(0.1)
+        return None
+    body_a, body_b = drain(qa), drain(qb)
+    assert body_a and "wgt-boom" in body_a, body_a
+    assert body_b and "wgt-boom" in body_b, body_b
+    sqs.delete_queue(QueueUrl=qa)
+    sqs.delete_queue(QueueUrl=qb)
+    lam.delete_function(FunctionName=fn)
+    lam2.delete_function(FunctionName=fnf)
+
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

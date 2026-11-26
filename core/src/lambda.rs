@@ -42,7 +42,7 @@ pub struct Func {
     perms: Vec<Value>, // resource-based policy statements from AddPermission
     version: String,   // "$LATEST" or the published number
     versions: Vec<Func>, // published snapshots; version n is versions[n - 1]
-    aliases: BTreeMap<String, (String, String)>, // alias -> (version, description)
+    aliases: BTreeMap<String, Alias>, // alias -> (version, description)
     icfg: InvokeConfig, // per-function (not per-qualifier) async invoke config: retries, age, destinations
 }
 pub struct Mapping {
@@ -71,8 +71,25 @@ pub fn name_of(id: &str) -> String {
     let id = id.split_once("function:").map_or(id, |(_, rest)| rest);
     id.split(':').next().unwrap_or(id).to_string()
 }
-fn alias_json(n: &str, a: &str, (ver, desc): &(String, String)) -> Value {
-    json!({"AliasArn": format!("{}:{a}", arn(n)), "Name": a, "FunctionVersion": ver, "Description": desc, "RevisionId": format!("{n}-{a}-{ver}")})
+// One alias: its primary version, optional weighted routing to one additional version, and an
+// optional qualifier-specific async invoke config (None inherits the $LATEST config).
+#[derive(Clone, Default)]
+struct Alias {
+    ver: String,
+    desc: String,
+    weights: Option<(String, f64)>, // AdditionalVersionWeights: (version, weight in 0..=1)
+    icfg: Option<InvokeConfig>,
+}
+
+fn alias_json(n: &str, a: &str, al: &Alias) -> Value {
+    let mut v = json!({"AliasArn": format!("{}:{a}", arn(n)), "Name": a, "FunctionVersion": al.ver, "Description": al.desc,
+        "RevisionId": format!("{n}-{a}-{}", al.ver)});
+    if let Some((v2, w)) = &al.weights {
+        let mut m = serde_json::Map::new();
+        m.insert(v2.clone(), json!(w));
+        v["RoutingConfig"] = json!({"AdditionalVersionWeights": Value::Object(m)});
+    }
+    v
 }
 // "name", "name:qualifier", ARN, or ARN:qualifier → (name, qualifier).
 pub fn split_qualifier(id: &str) -> (String, Option<String>) {
@@ -198,7 +215,7 @@ const done = out => fs.writeFileSync(process.env._RC_RESULT, JSON.stringify(out)
 pub async fn invoke(app: &Arc<App>, id: &str, event: Value) -> Result<Invocation, ApiErr> {
     let (name, qual) = split_qualifier(id);
     let name = name.as_str();
-    let f = app.lambda.lock().unwrap().resolve(name, qual.as_deref())?;
+    let f = app.lambda.lock().unwrap().resolve_weighted(name, qual.as_deref(), true)?;
     let (exe, boot) = if f.runtime.starts_with("python") {
         (std::env::var("RC_PYTHON").unwrap_or("python3".into()), PY_BOOT)
     } else if f.runtime.starts_with("nodejs") {
@@ -308,17 +325,68 @@ pub fn op_of(method: &str, path: &str) -> &'static str {
 impl Lambda {
     // The function a qualifier selects: $LATEST (none), a version number, or an alias.
     fn resolve(&self, name: &str, qual: Option<&str>) -> Result<Func, ApiErr> {
+        self.resolve_weighted(name, qual, false)
+    }
+
+    // invoke() resolves aliases with their AdditionalVersionWeights; other reads stay deterministic.
+    fn resolve_weighted(&self, name: &str, qual: Option<&str>, route: bool) -> Result<Func, ApiErr> {
         let f = self.f.get(name).ok_or_else(|| not_found(name))?;
         let missing = |q: &str| ApiErr { status: 404, ..err("ResourceNotFoundException", format!("Function not found: {}:{q}", arn(name))) };
         let q = match qual {
             None | Some("$LATEST") => return Ok(f.clone()),
             Some(q) => q,
         };
-        let ver = if q.bytes().all(|b| b.is_ascii_digit()) { q.to_string() } else { f.aliases.get(q).ok_or_else(|| missing(q))?.0.clone() };
+        let mut ver = if q.bytes().all(|b| b.is_ascii_digit()) {
+            q.to_string()
+        } else {
+            f.aliases.get(q).ok_or_else(|| missing(q))?.ver.clone()
+        };
+        if let Some((v2, w)) = f.aliases.get(q).and_then(|a| a.weights.as_ref()) {
+            if route && rand::random::<f64>() < *w {
+                ver = v2.clone();
+            }
+        }
         if ver == "$LATEST" {
             return Ok(f.clone());
         }
         ver.parse::<usize>().ok().and_then(|n| f.versions.get(n.wrapping_sub(1))).cloned().ok_or_else(|| missing(q))
+    }
+
+    fn icfg_read(f: &Func, qk: &str) -> InvokeConfig {
+        if qk == "$LATEST" {
+            f.icfg.clone()
+        } else if qk.bytes().all(|b| b.is_ascii_digit()) {
+            qk.parse::<usize>().ok().and_then(|n| f.versions.get(n.wrapping_sub(1))).map(|v| v.icfg.clone()).unwrap_or_default()
+        } else {
+            f.aliases.get(qk).and_then(|a| a.icfg.clone()).unwrap_or_else(|| f.icfg.clone())
+        }
+    }
+
+    fn icfg_write(f: &mut Func, qk: &str, c: InvokeConfig) {
+        if qk == "$LATEST" {
+            f.icfg = c;
+        } else if qk.bytes().all(|b| b.is_ascii_digit()) {
+            if let Ok(n) = qk.parse::<usize>() {
+                if let Some(v) = f.versions.get_mut(n.wrapping_sub(1)) {
+                    v.icfg = c;
+                }
+            }
+        } else if let Some(a) = f.aliases.get_mut(qk) {
+            a.icfg = Some(c);
+        }
+    }
+
+    // The async invoke config for a qualifier: an alias keeps its own (or inherits $LATEST),
+    // a version snapshot keeps the config frozen into it, no qualifier = $LATEST.
+    fn icfg_of(&self, name: &str, qual: Option<&str>) -> InvokeConfig {
+        let Some(f) = self.f.get(name) else { return InvokeConfig::default() };
+        match qual {
+            None | Some("$LATEST") => f.icfg.clone(),
+            Some(q) if !q.bytes().all(|b| b.is_ascii_digit()) => {
+                f.aliases.get(q).and_then(|a| a.icfg.clone()).unwrap_or_else(|| f.icfg.clone())
+            }
+            Some(q) => q.parse::<usize>().ok().and_then(|n| f.versions.get(n.wrapping_sub(1))).map(|v| v.icfg.clone()).unwrap_or_default(),
+        }
     }
     pub fn policy(&self, name: &str) -> Option<Value> {
         let f = self.f.get(name)?;
@@ -350,7 +418,7 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
         match kind {
             "DryRun" => return Response::builder().status(204).body(Body::empty()).unwrap(),
             "Event" => {
-                let icfg = app.lambda.lock().unwrap().resolve(&name, qual.as_deref()).ok().map(|f| f.icfg).unwrap_or_default();
+                let icfg = app.lambda.lock().unwrap().icfg_of(&name, qual.as_deref());
                 let (app, name) = (app.clone(), qual.as_ref().map_or(name.clone(), |q| format!("{name}:{q}")));
                 tokio::spawn(async move { invoke_async(app, &name, event, icfg).await });
                 return Response::builder().status(202).body(Body::empty()).unwrap();
@@ -431,15 +499,35 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
                     ("UpdateAlias", None) => return Err(ApiErr { status: 404, ..err("ResourceNotFoundException", format!("Alias not found: {}:{a}", arn(&name))) }),
                     _ => {}
                 }
-                let ver = j["FunctionVersion"].as_str().map(String::from).or(cur.as_ref().map(|c| c.0.clone())).ok_or_else(|| err("ValidationException", "FunctionVersion is required"))?;
+                let ver = j["FunctionVersion"].as_str().map(String::from).or(cur.as_ref().map(|c| c.ver.clone())).ok_or_else(|| err("ValidationException", "FunctionVersion is required"))?;
                 if ver != "$LATEST" && !ver.parse::<usize>().is_ok_and(|n| n >= 1 && n <= f.versions.len()) {
                     return Err(ApiErr { status: 404, ..err("ResourceNotFoundException", format!("Function not found: {}:{ver}", arn(&name))) });
                 }
-                if !j["RoutingConfig"].is_null() {
-                    return Err(err("InvalidParameterValueException", "Weighted alias routing (RoutingConfig) is not supported locally"));
+                // AdditionalVersionWeights: one extra version with a weight in 0..=1.
+                let mut weights = cur.as_ref().and_then(|c| c.weights.clone());
+                if let Some(rc) = j["RoutingConfig"].as_object() {
+                    if let Some(w) = rc["AdditionalVersionWeights"].as_object() {
+                        let kv: Vec<(String, f64)> = w.iter().filter_map(|(k, v)| v.as_f64().map(|f| (k.clone(), f))).collect();
+                        let (v2, weight) = match kv.as_slice() {
+                            [(v2, w)] if *w > 0.0 => (v2.clone(), *w),
+                            [_] => return Err(err("InvalidParameterValueException", "The routing config weight must be greater than 0.0")),
+                            _ => return Err(err("InvalidParameterValueException", "AdditionalVersionWeights must reference exactly one additional version")),
+                        };
+                        if !(0.0..=1.0).contains(&weight) {
+                            return Err(err("InvalidParameterValueException", format!("The routing config weight {weight} is invalid: 0.0 to 1.0 only")));
+                        }
+                        if v2 == ver {
+                            return Err(err("InvalidParameterValueException", "The routing config additional version must differ from the alias version"));
+                        }
+                        if v2 != "$LATEST" && !v2.parse::<usize>().is_ok_and(|n| n >= 1 && n <= f.versions.len()) {
+                            return Err(ApiErr { status: 404, ..err("ResourceNotFoundException", format!("Function not found: {}:{v2}", arn(&name))) });
+                        }
+                        weights = Some((v2, weight));
+                    }
                 }
-                let desc = j["Description"].as_str().map(String::from).or(cur.map(|c| c.1)).unwrap_or_default();
-                f.aliases.insert(a.clone(), (ver, desc));
+                let desc = j["Description"].as_str().map(String::from).or_else(|| cur.as_ref().map(|c| c.desc.clone())).unwrap_or_default();
+                let icfg = cur.as_ref().and_then(|c| c.icfg.clone());
+                f.aliases.insert(a.clone(), Alias { ver, desc, weights, icfg });
                 (if op == "CreateAlias" { 201 } else { 200 }, alias_json(&name, &a, &f.aliases[&a]))
             }
             "ListAliases" => {
@@ -533,9 +621,13 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
                 (204, json!({}))
             }
             "PutFunctionEventInvokeConfig" | "UpdateFunctionEventInvokeConfig" => {
-                // Stored per function, not per qualifier (ponytail: no version/alias-specific invoke configs).
+                // Stored per qualifier: $LATEST on the function, an alias on the alias, a version on its snapshot.
                 let f = st.f.get_mut(&name).ok_or_else(|| not_found(&name))?;
-                let mut c = if op == "PutFunctionEventInvokeConfig" { InvokeConfig::default() } else { f.icfg.clone() };
+                let qk = q.get("Qualifier").cloned().or_else(|| j["Qualifier"].as_str().map(String::from)).unwrap_or_else(|| "$LATEST".into());
+                if qk != "$LATEST" && !qk.bytes().all(|b| b.is_ascii_digit()) && !f.aliases.contains_key(&qk) {
+                    return Err(ApiErr { status: 404, ..err("ResourceNotFoundException", format!("Function not found: {}:{qk}", arn(&name))) });
+                }
+                let mut c = if op == "PutFunctionEventInvokeConfig" { InvokeConfig::default() } else { Lambda::icfg_read(f, &qk) };
                 if let Some(v) = j["MaximumRetryAttempts"].as_i64() {
                     if !(0..=2).contains(&v) {
                         return Err(err("InvalidParameterValueException", "MaximumRetryAttempts must be between 0 and 2"));
@@ -556,16 +648,18 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
                         c.on_failure = d["OnFailure"]["Destination"].as_str().map(String::from);
                     }
                 }
-                f.icfg = c.clone();
+                Lambda::icfg_write(f, &qk, c.clone());
                 (200, icfg_json(&name, &c))
             }
             "GetFunctionEventInvokeConfig" => {
                 let f = st.f.get(&name).ok_or_else(|| not_found(&name))?;
-                (200, icfg_json(&name, &f.icfg))
+                let qk = q.get("Qualifier").cloned().or_else(|| j["Qualifier"].as_str().map(String::from)).unwrap_or_else(|| "$LATEST".into());
+                (200, icfg_json(&name, &Lambda::icfg_read(f, &qk)))
             }
             "DeleteFunctionEventInvokeConfig" => {
                 let f = st.f.get_mut(&name).ok_or_else(|| not_found(&name))?;
-                f.icfg = InvokeConfig::default();
+                let qk = q.get("Qualifier").cloned().or_else(|| j["Qualifier"].as_str().map(String::from)).unwrap_or_else(|| "$LATEST".into());
+                Lambda::icfg_write(f, &qk, InvokeConfig::default());
                 (204, json!({}))
             }
             "CreateEventSourceMapping" => {
