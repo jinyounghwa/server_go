@@ -279,7 +279,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - 연대기 섬 숫자를 고친다(SDK 테스트 수, 시나리오 수).
   - 우분투 Playwright로 Pages 마을과 `/_town` 화면을 확인한다.
 
-## 13일차 (2026-12-07): v0.1.6 릴리스 + 다음 10일 계획 — ✅ 준비 완료: 우분투 전체 검증 통과, Playwright 화면 점검(Pages 마을·`/_town`·`/_ui` 콘솔 에러 0·자동 연결 확인; 스크린샷 판독은 이미지 미지원 세션이라 DOM/콘솔 기준), Cargo 0.1.6·`town.html`·AGENTS 갱신. **태그 푸시·Homebrew는 사용자 승인 대기**
+## 13일차 (2026-12-07): v0.1.6 릴리스 + 다음 10일 계획 — ✅ 완료·태그 대기 (`1bd323d`) (준비 내용:  우분투 전체 검증 통과, Playwright 화면 점검(Pages 마을·`/_town`·`/_ui` 콘솔 에러 0·자동 연결 확인; 스크린샷 판독은 이미지 미지원 세션이라 DOM/콘솔 기준), Cargo 0.1.6·`town.html`·AGENTS 갱신. **태그 푸시·Homebrew는 사용자 승인 대기**
 - 우분투 전체 검증을 돌린다(두 모드와 `ubuntu_verify.sh`). 실패가 있으면 릴리스하지 않는다.
 - v0.1.6을 준비한다. 절차는 1일차 1-2와 같다. 버전, `Cargo.lock`, `town.html`, 문서를 고친다.
   - **태그 푸시는 사용자 승인을 받은 뒤에만 한다.**
