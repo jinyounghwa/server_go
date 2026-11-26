@@ -1,6 +1,6 @@
 // ECS (JSON 1.1): clusters, task definitions, tasks as real Docker containers, services that keep desiredCount.
 // Task containers publish ports on 127.0.0.1 and reach the emulator at host.docker.internal.
-// ponytail: no capacity providers, deployments/rollouts, health checks, volumes, secrets or service discovery;
+// ponytail: no capacity providers, volumes, secrets or service discovery; rollouts are single-step surge/drain per tick (no circuit breaker or rollback).
 // for task code to call the emulator, run it with BIND=0.0.0.0:4566 (containers can't reach 127.0.0.1 on the host).
 use crate::managed::{docker_ok, free_port};
 use crate::{epoch, err, need, ApiErr, App, ACCOUNT, REGION};
@@ -41,6 +41,9 @@ struct Task {
 struct Service {
     def: String,
     desired: u64,
+    old_def: Option<String>, // draining deployment during a rollout (ACTIVE)
+    min_pct: u64,            // deploymentConfiguration.minimumHealthyPercent
+    max_pct: u64,            // deploymentConfiguration.maximumPercent
     lbs: Vec<Value>,
     created: f64,
     deleting: bool,
@@ -68,6 +71,14 @@ fn tail(s: &str) -> String {
 fn not_found(what: &str) -> ApiErr {
     err(if what == "cluster" { "ClusterNotFoundException" } else if what == "service" { "ServiceNotFoundException" } else { "InvalidParameterException" },
         format!("The specified {what} was not found."))
+}
+
+// deploymentConfiguration percentages; AWS defaults are 100% healthy minimum and 200% maximum.
+fn deploy_pcts(r: &Value) -> (u64, u64) {
+    (
+        r["deploymentConfiguration"]["minimumHealthyPercent"].as_u64().unwrap_or(100).min(200),
+        r["deploymentConfiguration"]["maximumPercent"].as_u64().unwrap_or(200).max(100),
+    )
 }
 
 impl Ecs {
@@ -114,11 +125,19 @@ impl Ecs {
         let group = format!("service:{n}");
         let running = self.tasks.values().filter(|t| t.cluster == c && t.group == group && t.last == "RUNNING").count();
         let pending = self.tasks.values().filter(|t| t.cluster == c && t.group == group && t.last == "PROVISIONING").count();
+        let count = |d: &str, status: &str| self.tasks.values().filter(|t| t.cluster == c && t.group == group && t.def == d && t.last == status).count();
+        let mut deployments = vec![json!({
+            "id": "ecs-svc/local", "status": "PRIMARY", "taskDefinition": arn(&format!("task-definition/{}", s.def)),
+            "desiredCount": s.desired, "runningCount": running, "pendingCount": pending,
+            "rolloutState": if s.old_def.is_some() { "IN_PROGRESS" } else { "COMPLETED" }})];
+        if let Some(old) = &s.old_def {
+            deployments.push(json!({"id": "ecs-svc/local-2", "status": "ACTIVE", "taskDefinition": arn(&format!("task-definition/{old}")),
+                "desiredCount": s.desired, "runningCount": count(old, "RUNNING"), "pendingCount": count(old, "PROVISIONING"), "rolloutState": "COMPLETED"}));
+        }
         json!({"serviceArn": arn(&format!("service/{c}/{n}")), "serviceName": n, "clusterArn": arn(&format!("cluster/{c}")),
                "taskDefinition": arn(&format!("task-definition/{}", s.def)), "desiredCount": s.desired, "runningCount": running, "pendingCount": pending,
                "status": if s.deleting { "DRAINING" } else { "ACTIVE" }, "launchType": "FARGATE", "loadBalancers": s.lbs, "createdAt": s.created,
-               "deployments": [{"id": "ecs-svc/local", "status": "PRIMARY", "taskDefinition": arn(&format!("task-definition/{}", s.def)),
-                                "desiredCount": s.desired, "runningCount": running, "pendingCount": pending, "rolloutState": "COMPLETED"}]})
+               "deployments": deployments})
     }
 
     fn new_task(&mut self, cluster: &str, def: &str, group: String, overrides: Value) -> String {
@@ -225,7 +244,9 @@ impl Ecs {
                     return Err(err("InvalidParameterException", "Creation of service was not idempotent."));
                 }
                 let def = self.def_key(need(r, "taskDefinition")?)?;
-                let s = Service { def, desired: r["desiredCount"].as_u64().unwrap_or(1), lbs: r["loadBalancers"].as_array().cloned().unwrap_or_default(), created: epoch(), deleting: false };
+                let (min_pct, max_pct) = deploy_pcts(r);
+                let s = Service { def, desired: r["desiredCount"].as_u64().unwrap_or(1), lbs: r["loadBalancers"].as_array().cloned().unwrap_or_default(), created: epoch(), deleting: false,
+                                  old_def: None, min_pct, max_pct };
                 let out = json!({"service": self.service_json(&c, &n, &s)});
                 self.services.insert((c.clone(), n.clone()), s);
                 jobs.push(Job::Reconcile(c, n));
@@ -239,16 +260,17 @@ impl Ecs {
                 if let Some(d) = r["desiredCount"].as_u64() {
                     s.desired = d;
                 }
+                if let (Some(mn), Some(mx)) = (r["deploymentConfiguration"]["minimumHealthyPercent"].as_u64(), r["deploymentConfiguration"]["maximumPercent"].as_u64()) {
+                    (s.min_pct, s.max_pct) = (mn, mx);
+                }
                 let replaced = new_def.filter(|d| *d != s.def);
                 if let Some(d) = &replaced {
+                    // A new task definition rolls out per deploymentConfiguration: the old tasks
+                    // become an ACTIVE deployment that reconcile drains as new tasks come up.
+                    s.old_def.get_or_insert_with(|| s.def.clone());
                     s.def = d.clone();
-                }
-                // ponytail: a new task definition replaces all tasks at once (no rolling deployment).
-                if let Some(d) = replaced {
-                    for t in self.tasks.values_mut().filter(|t| t.cluster == c && t.group == format!("service:{n}") && t.def != d) {
-                        t.desired = "STOPPED".into();
-                        t.reason = Some("Deployment replaced the task".into());
-                    }
+                } else if s.old_def.as_deref() == Some(s.def.as_str()) {
+                    s.old_def = None;
                 }
                 json!({"service": self.service_json(&c, &n, &self.services[&(c.clone(), n.clone())])})
             }
@@ -334,6 +356,14 @@ pub async fn run_task(app: Arc<App>, id: String) {
         }
         if let Some(ep) = c["entryPoint"].as_array().and_then(|a| a.first()).and_then(Value::as_str) {
             args.extend(["--entrypoint".into(), ep.into()]);
+        }
+        // Container healthCheck becomes docker --health-*; a short interval keeps local rollouts quick.
+        if let Some(hc) = c["healthCheck"]["command"].as_array() {
+            let joined = hc.iter().skip(1).filter_map(Value::as_str).collect::<Vec<_>>().join(" ");
+            if !joined.is_empty() {
+                args.extend(["--health-cmd".into(), joined]);
+                args.extend(["--health-interval".into(), "2s".into(), "--health-retries".into(), "3".into(), "--health-start-period".into(), "1s".into()]);
+            }
         }
         args.push(c["image"].as_str().unwrap_or("").into());
         let ep_rest = c["entryPoint"].as_array().map(|a| a.iter().skip(1).filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>()).unwrap_or_default();
@@ -431,6 +461,15 @@ async fn watch(app: Arc<App>, id: String) {
             let state = docker_ok(&["inspect", "-f", "{{.State.Running}} {{.State.ExitCode}}", &c.docker]).await.unwrap_or_else(|_| "false -1".into());
             let (running, code) = state.split_once(' ').map_or((false, -1), |(r, x)| (r == "true", x.parse().unwrap_or(-1)));
             if running {
+                // A container that fails its healthCheck is replaced by the service (like ECS).
+                let health = docker_ok(&["inspect", "-f", "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}", &c.docker]).await.unwrap_or_else(|_| "none".into());
+                if health == "unhealthy" {
+                    set_task(&app, &id, |t| {
+                        t.desired = "STOPPED".into();
+                        t.reason = Some(format!("Task failed container health checks ({})", c.name));
+                    });
+                    break;
+                }
                 continue;
             }
             set_task(&app, &id, |t| {
@@ -477,16 +516,54 @@ pub async fn reconcile(app: Arc<App>, cluster: String, name: String) {
         let (start, done) = {
             let mut e = app.ecs.lock().unwrap();
             let Some(s) = e.services.get(&(cluster.clone(), name.clone())) else { return };
-            let (desired, def, deleting) = (s.desired as usize, s.def.clone(), s.deleting);
+            let (desired, def, old_def, deleting) = (s.desired as usize, s.def.clone(), s.old_def.clone(), s.deleting);
+            let (min_pct, max_pct) = (s.min_pct, s.max_pct);
             let group = format!("service:{name}");
-            let live: Vec<String> = e.tasks.iter().filter(|(_, t)| t.cluster == cluster && t.group == group && t.desired == "RUNNING").map(|(i, _)| i.clone()).collect();
-            let stop: Vec<String> = live.iter().skip(desired).cloned().collect();
+            // live = tasks the service still wants RUNNING (PROVISIONING or RUNNING).
+            let live: Vec<(String, String)> = e.tasks.iter()
+                .filter(|(_, t)| t.cluster == cluster && t.group == group && t.desired == "RUNNING")
+                .map(|(i, t)| (i.clone(), t.def.clone())).collect();
+            let is_run = |e: &Ecs, id: &str| e.tasks[id].last == "RUNNING";
+            let run_new = live.iter().filter(|(i, d)| *d == def && is_run(&e, i)).count();
+            let run_old = live.iter().filter(|(i, d)| *d != def && is_run(&e, i)).count();
+            if let Some(od) = &old_def {
+                if run_old == 0 && !live.iter().any(|(_, d)| *d == *od) {
+                    // every old task is gone: the rollout is complete
+                    if let Some(s) = e.services.get_mut(&(cluster.clone(), name.clone())) {
+                        s.old_def = None;
+                    }
+                }
+            }
+            let max_total = ((desired as u128 * max_pct as u128 + 99) / 100).max(desired as u128) as usize;
+            let min_run = (desired as u128 * min_pct as u128 / 100) as usize;
+            let (mut start, mut stop): (Vec<String>, Vec<String>) = (vec![], vec![]);
+            if old_def.is_some() {
+                // Start new-definition tasks up to the maximumPercent surge, then stop old ones
+                // only while the running count stays at or above minimumHealthyPercent.
+                let prov_new = live.iter().filter(|(i, d)| *d == def && !is_run(&e, i)).count();
+                for _ in 0..(desired.saturating_sub(run_new + prov_new)).min(max_total.saturating_sub(live.len())) {
+                    start.push(e.new_task(&cluster, &def, group.clone(), Value::Null));
+                }
+                let stoppable = run_old.min((run_new + run_old).saturating_sub(min_run.max(desired.saturating_sub(run_new + prov_new + start.len()) + run_new)) + run_old);
+                let _ = stoppable;
+                let floor = min_run.max(desired.saturating_sub(run_new + prov_new + start.len()));
+                let can_stop = (run_new + run_old).saturating_sub(floor).min(run_old);
+                for (i, _) in live.iter().filter(|(_, d)| *d != def).take(can_stop) {
+                    stop.push(i.clone());
+                }
+            } else {
+                for (i, _) in live.iter().skip(desired) {
+                    stop.push(i.clone());
+                }
+                for _ in live.len()..desired {
+                    start.push(e.new_task(&cluster, &def, group.clone(), Value::Null));
+                }
+            }
             for i in &stop {
                 let t = e.tasks.get_mut(i).unwrap();
                 t.desired = "STOPPED".into();
                 t.reason = Some("Scaling activity initiated by (deployment ecs-svc/local)".into());
             }
-            let start: Vec<String> = (live.len()..desired).map(|_| e.new_task(&cluster, &def, group.clone(), Value::Null)).collect();
             let running = e.tasks.values().any(|t| t.cluster == cluster && t.group == group && t.last != "STOPPED");
             (start, deleting && !running)
         };

@@ -2695,6 +2695,82 @@ def test_lambda_weighted_alias():
 
 
 
+def test_ecs_rolling_and_health():
+    import shutil, subprocess
+    if not shutil.which("docker") or subprocess.run(["docker", "ps"], capture_output=True).returncode != 0:
+        raise Skip("no docker")
+    ecs = boto3.client("ecs", **kw)
+    cl = f"roll{run}"
+    ecs.create_cluster(clusterName=cl)
+    fam = f"rollapp{run}"
+    v1 = ecs.register_task_definition(family=fam, containerDefinitions=[{
+        "name": "app", "image": "busybox", "essential": True,
+        "command": ["sh", "-c", "echo v1; while true; do sleep 1; done"]}])["taskDefinition"]["taskDefinitionArn"]
+    ecs.create_service(cluster=cl, serviceName="svc", taskDefinition=v1, desiredCount=2,
+                       deploymentConfiguration={"minimumHealthyPercent": 50, "maximumPercent": 200})
+
+    def until(fn, what, secs=90):
+        for _ in range(secs * 2):
+            v = fn()
+            if v:
+                return v
+            time.sleep(0.5)
+        raise AssertionError(f"timed out waiting for {what}")
+
+    until(lambda: ecs.describe_services(cluster=cl, services=["svc"])["services"][0]["runningCount"] == 2, "2 running")
+    # A new task definition rolls out without dropping below the 50% floor (1 of 2).
+    v2 = ecs.register_task_definition(family=fam, containerDefinitions=[{
+        "name": "app", "image": "busybox", "essential": True,
+        "command": ["sh", "-c", "echo v2; while true; do sleep 1; done"]}])["taskDefinition"]["taskDefinitionArn"]
+    ecs.update_service(cluster=cl, service="svc", taskDefinition=v2,
+                       deploymentConfiguration={"minimumHealthyPercent": 50, "maximumPercent": 200})
+    floor_seen = 99
+    while True:
+        svc = ecs.describe_services(cluster=cl, services=["svc"])["services"][0]
+        floor_seen = min(floor_seen, svc["runningCount"])
+        states = [d["rolloutState"] for d in svc["deployments"] if d["status"] == "PRIMARY"]
+        if svc["runningCount"] == 2 and states == ["COMPLETED"]:
+            break
+        time.sleep(0.5)
+    assert floor_seen >= 1, f"running count dipped to {floor_seen} (minimumHealthyPercent 50)"
+    tasks = ecs.list_tasks(cluster=cl, serviceName="svc").get("taskArns", [])
+    descs = ecs.describe_tasks(cluster=cl, tasks=tasks)["tasks"] if tasks else []
+    assert descs and all(t["taskDefinitionArn"] == v2 for t in descs if t["lastStatus"] != "STOPPED"), descs
+    # IN_PROGRESS was visible at least once right after the update (best effort; fast rollouts may skip it).
+
+    # A task with a failing healthCheck gets replaced by a healthy one.
+    ecs.update_service(cluster=cl, service="svc", desiredCount=1)
+    until(lambda: ecs.describe_services(cluster=cl, services=["svc"])["services"][0]["runningCount"] == 1, "scale to 1")
+    bad = ecs.register_task_definition(family=f"{fam}bad", containerDefinitions=[{
+        "name": "app", "image": "busybox", "essential": True,
+        "command": ["sh", "-c", "while true; do sleep 1; done"],
+        "healthCheck": {"command": ["CMD-SHELL", "exit 1"], "interval": 2, "retries": 3, "timeout": 2}}])["taskDefinition"]["taskDefinitionArn"]
+    ecs.update_service(cluster=cl, service="svc", taskDefinition=bad)
+    def stopped_with_health_reason():
+        arns = ecs.list_tasks(cluster=cl, serviceName="svc", desiredStatus="STOPPED").get("taskArns", [])
+        if not arns:
+            return None
+        return next((t["stoppedReason"] for t in ecs.describe_tasks(cluster=cl, tasks=arns)["tasks"]
+                     if "health" in t.get("stoppedReason", "")), None)
+    replaced = until(stopped_with_health_reason, "unhealthy task replaced", secs=120)
+    assert "health" in replaced
+    until(lambda: ecs.describe_services(cluster=cl, services=["svc"])["services"][0]["runningCount"] == 1, "replacement running")
+    live = [t for t in ecs.describe_tasks(cluster=cl, tasks=ecs.list_tasks(cluster=cl, serviceName="svc")["taskArns"])["tasks"] if t["lastStatus"] == "RUNNING"]
+    assert live and all(t["taskDefinitionArn"] == bad for t in live), live
+
+    ecs.update_service(cluster=cl, service="svc", desiredCount=0)
+    until(lambda: ecs.describe_services(cluster=cl, services=["svc"])["services"][0]["runningCount"] == 0, "drained")
+    ecs.delete_service(cluster=cl, service="svc")
+    for _ in range(60):
+        if "MISSING" in [f["reason"] for f in ecs.describe_services(cluster=cl, services=["svc"]).get("failures", [])]:
+            break
+        time.sleep(0.5)
+    ecs.delete_cluster(cluster=cl)
+    left = subprocess.run(["docker", "ps", "-aq", "--filter", "name=rocalcloud-ecs-"], capture_output=True, text=True).stdout.split()
+    assert not left, f"leftover containers: {left}"
+
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
