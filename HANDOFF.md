@@ -306,7 +306,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - 하트비트가 없으면 1초 뒤 Catch로 가야 한다.
   - 엉터리 토큰은 오류가 나야 한다.
 
-## 15일차 (2026-12-09): Lambda 가중치 별칭·한정자별 호출 설정
+## 15일차 (2026-12-09): Lambda 가중치 별칭·한정자별 호출 설정 — ✅ 완료 (`d69a6bc`): AdditionalVersionWeights(1개·0<가중치≤1·버전 달라야)·rand 라우팅·ExecutedVersion, EventInvokeConfig 한정자별 저장($LATEST 상속), 단위/boto3 테스트(49/45)·우분투 두 모드 통과. 확률 테스트(200회 각 30% 이상)는 기준이 느슨함을 보고에 명시
 - **`lambda.rs` 3행:** 별칭 `RoutingConfig.AdditionalVersionWeights`를 지원한다. 한 버전만, 가중치는 0~1이다.
   - 호출할 때 `rand`로 버전을 고르고, 응답 `ExecutedVersion`에 실제 버전을 적는다.
   - 지금은 이 설정을 거부하니, 거부 코드를 지운다.
