@@ -2771,6 +2771,83 @@ def test_ecs_rolling_and_health():
 
 
 
+def test_rds_snapshots_and_params():
+    import shutil, subprocess
+    if not shutil.which("docker") or subprocess.run(["docker", "ps"], capture_output=True).returncode != 0:
+        raise Skip("no docker")
+    import pg8000.native
+    rds = boto3.client("rds", **kw)
+    base = f"sn{run}"
+
+    def until(fn, what, secs=120):
+        for _ in range(secs * 2):
+            v = fn()
+            if v:
+                return v
+            time.sleep(0.5)
+        raise AssertionError(f"timed out waiting for {what}")
+
+    # 1) snapshot -> restore: a row written before the snapshot comes back.
+    rds.create_db_instance(DBInstanceIdentifier=f"{base}-src", Engine="postgres", DBInstanceClass="db.t3.micro",
+                           MasterUsername="app", MasterUserPassword="secret123", DBName="shop", AllocatedStorage=20)
+    db = lambda i: rds.describe_db_instances(DBInstanceIdentifier=i)["DBInstances"][0]
+    d = until(lambda: (x := db(f"{base}-src"))["DBInstanceStatus"] == "available" and x, "source instance")
+    c = pg8000.native.Connection("app", host=d["Endpoint"]["Address"], port=d["Endpoint"]["Port"], password="secret123", database="shop")
+    c.run("create table t (n int)"); c.run("insert into t values (7)")
+    c.close()
+    snap = f"{base}-snap1"
+    rds.create_db_snapshot(DBInstanceIdentifier=f"{base}-src", DBSnapshotIdentifier=snap)
+    s = until(lambda: (y := rds.describe_db_snapshots(DBSnapshotIdentifier=snap)["DBSnapshots"][0])["Status"] == "available" and y, "snapshot")
+    assert s["DBInstanceIdentifier"] == f"{base}-src"
+    rds.delete_db_instance(DBInstanceIdentifier=f"{base}-src", SkipFinalSnapshot=True)
+    rds.restore_db_instance_from_db_snapshot(DBInstanceIdentifier=f"{base}-rest", DBSnapshotIdentifier=snap,
+                                             DBInstanceClass="db.t3.small")
+    d2 = until(lambda: (x := db(f"{base}-rest"))["DBInstanceStatus"] == "available" and x, "restored instance")
+    assert d2["DBInstanceClass"] == "db.t3.small"
+    c2 = pg8000.native.Connection("app", host=d2["Endpoint"]["Address"], port=d2["Endpoint"]["Port"], password="secret123", database="shop")
+    assert c2.run("select sum(n) from t") == [[7]], "snapshot data survived the restore"
+    c2.close()
+
+    # 2) parameter group: max_connections visible via SHOW.
+    g = f"{base}-pg"
+    rds.create_db_parameter_group(DBParameterGroupName=g, DBParameterGroupFamily="postgres16", Description="day17")
+    rds.modify_db_parameter_group(DBParameterGroupName=g, Parameters=[
+        {"ParameterName": "max_connections", "ParameterValue": "37", "ApplyMethod": "pending-reboot"}])
+    prms = rds.describe_db_parameters(DBParameterGroupName=g)["Parameters"]
+    assert prms == [{"ParameterName": "max_connections", "ParameterValue": "37", "Source": "user",
+                     "ApplyType": "dynamic", "ApplyMethod": "pending-reboot"}], prms
+    assert code(rds.modify_db_parameter_group, DBParameterGroupName=g, Parameters=[
+        {"ParameterName": "no_such_param", "ParameterValue": "1", "ApplyMethod": "pending-reboot"}]) == "InvalidParameterValue"
+    rds.create_db_instance(DBInstanceIdentifier=f"{base}-pgi", Engine="postgres", DBInstanceClass="db.t3.micro",
+                           MasterUsername="app", MasterUserPassword="secret123", DBName="shop", DBParameterGroupName=g)
+    d3 = until(lambda: (x := db(f"{base}-pgi"))["DBInstanceStatus"] == "available" and x, "param instance")
+    assert d3["DBParameterGroups"][0]["DBParameterGroupName"] == g
+    c3 = pg8000.native.Connection("app", host=d3["Endpoint"]["Address"], port=d3["Endpoint"]["Port"], password="secret123", database="shop")
+    assert c3.run("show max_connections") == [["37"]], "parameter applied to the container"
+    # A reboot re-applies the group after a modification (recreates the container).
+    rds.modify_db_parameter_group(DBParameterGroupName=g, Parameters=[
+        {"ParameterName": "max_connections", "ParameterValue": "19", "ApplyMethod": "pending-reboot"}])
+    rds.reboot_db_instance(DBInstanceIdentifier=f"{base}-pgi")
+    d4 = until(lambda: (x := db(f"{base}-pgi"))["DBInstanceStatus"] == "available" and x, "rebooted instance")
+    c4 = pg8000.native.Connection("app", host=d4["Endpoint"]["Address"], port=d4["Endpoint"]["Port"], password="secret123", database="shop")
+    assert c4.run("show max_connections") == [["19"]], "reboot re-applied the parameter"
+    c4.close()
+    assert code(rds.delete_db_parameter_group, DBParameterGroupName=g) == "InvalidParameterGroup"  # in use
+
+    # 3) cleanup: instances, snapshot, group; no containers or snapshot images left.
+    rds.delete_db_instance(DBInstanceIdentifier=f"{base}-rest", SkipFinalSnapshot=True)
+    rds.delete_db_instance(DBInstanceIdentifier=f"{base}-pgi", SkipFinalSnapshot=True)
+    rds.delete_db_snapshot(DBSnapshotIdentifier=snap)
+    rds.delete_db_parameter_group(DBParameterGroupName=g)
+    assert code(rds.describe_db_snapshots, DBSnapshotIdentifier=snap) == "DBSnapshotNotFound"
+    def leftovers():
+        c = subprocess.run(["docker", "ps", "-aq", "--filter", "name=rocalcloud-"], capture_output=True, text=True).stdout.split()
+        i = subprocess.run(["docker", "images", "-q", "rocalcloud-snap-"], capture_output=True, text=True).stdout.split()
+        return [] if not c and not i else c + i
+    assert until(lambda: not leftovers(), "cleanup: no containers or snapshot images", secs=30), leftovers()
+
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

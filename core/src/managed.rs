@@ -20,11 +20,21 @@ pub struct Node {
     class: String,
     storage: u64,
     created: String,
+    pgroup: Option<String>,
 }
 
 #[derive(Default)]
 pub struct Managed {
     nodes: BTreeMap<(String, String), Node>, // (kind "rds" | "cache", id)
+    snaps: BTreeMap<String, Snap>,           // snapshot id -> committed-image metadata
+    pgroups: BTreeMap<String, (String, Vec<(String, String)>)>, // name -> (family, params)
+}
+
+struct Snap {
+    instance: String,
+    status: String,
+    created: String,
+    node: Node, // captured at snapshot time; Restore re-images it
 }
 
 pub enum Job {
@@ -32,6 +42,9 @@ pub enum Job {
     Start,
     Stop,
     Delete,
+    Reboot,          // recreate the container so parameter groups re-apply
+    Snapshot(String), // docker commit the instance container into this snapshot id
+    DeleteSnap(String),
 }
 
 pub fn container(kind: &str, id: &str) -> String {
@@ -57,6 +70,11 @@ pub async fn cleanup() {
     if let Ok(ids) = docker_ok(&["ps", "-aq", "--filter", "name=rocalcloud-"]).await {
         for id in ids.lines().filter(|l| !l.is_empty()) {
             let _ = docker_ok(&["rm", "-f", id]).await;
+        }
+    }
+    if let Ok(imgs) = docker_ok(&["images", "-q", "rocalcloud-snap-"]).await {
+        for img in imgs.lines().filter(|l| !l.is_empty()) {
+            let _ = docker_ok(&["rmi", "-f", img]).await;
         }
     }
 }
@@ -95,18 +113,33 @@ pub async fn run_job(app: Arc<App>, kind: String, id: String, job: Job) {
                 set("stopped", None);
                 Ok(())
             }
-            Job::Create | Job::Start => {
+            Job::Snapshot(sid) => {
+                let img = format!("rocalcloud-snap-{sid}");
+                let out = docker_ok(&["commit", &name, &img]).await;
+                let _ = app.managed.lock().unwrap().snaps.get_mut(&sid).map(|s| s.status = if out.is_ok() { "available".into() } else { "failed".into() });
+                out.map(|_| ())
+            }
+            Job::DeleteSnap(sid) => {
+                let img = format!("rocalcloud-snap-{sid}");
+                docker_ok(&["rmi", "-f", &img]).await.map(|_| ())
+            }
+            Job::Create | Job::Start | Job::Reboot => {
                 let n = node.ok_or("node vanished")?;
                 if matches!(job, Job::Start) {
                     docker_ok(&["start", &name]).await?;
                 } else {
+                    if matches!(job, Job::Reboot) {
+                        // recreate the container so parameter-group changes re-apply
+                        let _ = docker_ok(&["rm", "-f", &name]).await;
+                    }
                     let port = free_port();
                     let mem = std::env::var("RC_CONTAINER_MEMORY").unwrap_or_else(|_| "512m".into());
                     let publish = format!("127.0.0.1:{port}:{}", n.inner);
                     let mut args: Vec<String> = ["run", "-d", "--name", &name, "--memory", &mem, "--cpus", "1", "-p", &publish, "--label", "rocalcloud=1"]
                         .iter().map(|s| s.to_string()).collect();
                     let env: Vec<(&str, &str)> = match n.engine.as_str() {
-                        "postgres" => vec![("POSTGRES_USER", &n.user), ("POSTGRES_PASSWORD", &n.password), ("POSTGRES_DB", &n.db)],
+                        // PGDATA outside the image's VOLUME path so docker commit (snapshots) captures the data.
+                        "postgres" => vec![("POSTGRES_USER", &n.user), ("POSTGRES_PASSWORD", &n.password), ("POSTGRES_DB", &n.db), ("PGDATA", "/pgdata")],
                         "mysql" | "mariadb" => {
                             let mut e = vec![("MYSQL_ROOT_PASSWORD", n.password.as_str()), ("MYSQL_DATABASE", n.db.as_str()), ("MARIADB_ROOT_PASSWORD", n.password.as_str())];
                             if n.user != "root" {
@@ -120,6 +153,21 @@ pub async fn run_job(app: Arc<App>, kind: String, id: String, job: Job) {
                         args.extend(["-e".to_string(), format!("{k}={v}")]);
                     }
                     args.push(n.image.clone());
+                    if kind == "rds" && matches!(n.engine.as_str(), "mysql" | "mariadb") {
+                        // same volume-avoidance for MySQL/MariaDB: keep data in the container layer
+                        args.push("--datadir=/var/lib/mysql-local".into());
+                    }
+                    // Parameter group values ride after the image: postgres -ckey=value, mysql --key=value.
+                    if let Some(g) = &n.pgroup {
+                        let params = app.managed.lock().unwrap().pgroups.get(g).map(|(_, p)| p.clone()).unwrap_or_default();
+                        for (k, v) in &params {
+                            if n.engine == "postgres" {
+                                args.push(format!("-c{k}={v}"));
+                            } else {
+                                args.push(format!("--{k}={v}"));
+                            }
+                        }
+                    }
                     docker_ok(&args.iter().map(String::as_str).collect::<Vec<_>>()).await?;
                     set("creating", Some(port));
                 }
@@ -151,6 +199,17 @@ pub async fn run_job(app: Arc<App>, kind: String, id: String, job: Job) {
 fn rds_arn(id: &str) -> String {
     format!("arn:aws:rds:{}:{ACCOUNT}:db:{id}", *REGION)
 }
+fn snap_arn(id: &str) -> String {
+    format!("arn:aws:rds:{}:{ACCOUNT}:snapshot:{id}", *REGION)
+}
+fn snap_json(id: &str, s: &Snap) -> Value {
+    json!({"DBSnapshotIdentifier": id, "DBSnapshotArn": snap_arn(id), "DBInstanceIdentifier": s.instance,
+           "SnapshotCreateTime": s.created, "Status": s.status, "Engine": s.node.engine, "EngineVersion": s.node.version,
+           "AllocatedStorage": s.node.storage, "MasterUsername": s.node.user, "Port": s.node.inner})
+}
+// Parameter names we know how to pass to postgres (-c key=value) or mysql (--key=value).
+const KNOWN_PARAMS: &[&str] = &["max_connections", "shared_buffers", "work_mem", "innodb_buffer_pool_size",
+    "sql_mode", "log_min_duration_statement", "character_set_server", "time_zone"];
 fn cache_arn(id: &str) -> String {
     format!("arn:aws:elasticache:{}:{ACCOUNT}:cluster:{id}", *REGION)
 }
@@ -158,6 +217,7 @@ fn cache_arn(id: &str) -> String {
 fn rds_json(id: &str, n: &Node) -> Value {
     let mut v = json!({"DBInstanceIdentifier": id, "DBInstanceArn": rds_arn(id), "DBInstanceClass": n.class, "Engine": n.engine,
         "EngineVersion": n.version, "DBInstanceStatus": n.status, "MasterUsername": n.user, "DBName": n.db, "AllocatedStorage": n.storage,
+        "DBParameterGroups": n.pgroup.as_ref().map(|g| json!([{"DBParameterGroupName": g, "ParameterApplyStatus": "in-sync"}])).unwrap_or(json!([])),
         "InstanceCreateTime": n.created, "AvailabilityZone": format!("{}a", *REGION), "MultiAZ": false, "PubliclyAccessible": false,
         "StorageType": "gp3", "DbiResourceId": format!("db-{}", id.to_uppercase())});
     if let Some(p) = n.port {
@@ -205,6 +265,15 @@ impl Managed {
                 let engine = if engine == "postgresql" { "postgres".to_string() } else { engine };
                 let version = q.get("EngineVersion").cloned().unwrap_or(default_v.into());
                 let major: String = if engine == "postgres" { version.split('.').next().unwrap_or("16").into() } else { version.split('.').take(2).collect::<Vec<_>>().join(".") };
+                let pgroup = match q.get("DBParameterGroupName") {
+                    Some(g) => {
+                        if !self.pgroups.contains_key(g) {
+                            return Err(ApiErr { status: 404, ..err("DBParameterGroupNotFound", format!("DBParameterGroup {g} not found.")) });
+                        }
+                        Some(g.clone())
+                    }
+                    None => None,
+                };
                 let pw = p("MasterUserPassword")?;
                 if pw.len() < 8 {
                     return Err(err("InvalidParameterValue", "The parameter MasterUserPassword is not a valid password because it is shorter than 8 characters."));
@@ -214,7 +283,7 @@ impl Managed {
                     db: q.get("DBName").cloned().unwrap_or(if engine == "postgres" { "postgres".into() } else { "mysql".into() }),
                     class: q.get("DBInstanceClass").cloned().unwrap_or("db.t3.micro".into()),
                     storage: q.get("AllocatedStorage").and_then(|s| s.parse().ok()).unwrap_or(20), created: chrono::Utc::now().to_rfc3339(),
-                    engine, version };
+                    engine, version, pgroup };
                 let out = json!({"DBInstance": rds_json(&id, &n)});
                 self.nodes.insert(key, n);
                 (out, Some(("rds".into(), id, Job::Create)))
@@ -233,6 +302,7 @@ impl Managed {
                 let (status, job) = match action {
                     "DeleteDBInstance" => ("deleting", Job::Delete),
                     "StopDBInstance" => ("stopping", Job::Stop),
+                    "RebootDBInstance" => ("rebooting", Job::Reboot),
                     _ => ("starting", Job::Start),
                 };
                 if action == "StopDBInstance" && n.status != "available" {
@@ -243,7 +313,120 @@ impl Managed {
                 if matches!(job, Job::Delete) {
                     self.nodes.remove(&key);
                 }
-                (out, Some(("rds".into(), id, if action == "RebootDBInstance" { Job::Start } else { job })))
+                (out, Some(("rds".into(), id, job)))
+            }
+            "CreateDBSnapshot" => {
+                let inst = p("DBInstanceIdentifier")?;
+                let sid = p("DBSnapshotIdentifier")?;
+                let key = ("rds".to_string(), inst.clone());
+                let n = self.nodes.get(&key).ok_or_else(|| nf(&inst))?.clone();
+                if n.status != "available" {
+                    return Err(err("InvalidDBInstanceState", format!("Instance {inst} is not in available state.")));
+                }
+                if self.snaps.contains_key(&sid) {
+                    return Err(err("DBSnapshotAlreadyExists", format!("Snapshot {sid} already exists.")));
+                }
+                self.snaps.insert(sid.clone(), Snap { instance: inst.clone(), status: "creating".into(), created: chrono::Utc::now().to_rfc3339(), node: n });
+                (json!({"DBSnapshot": snap_json(&sid, &self.snaps[&sid])}), Some(("rds".into(), inst, Job::Snapshot(sid))))
+            }
+            "DescribeDBSnapshots" => {
+                let list: Vec<Value> = match q.get("DBSnapshotIdentifier") {
+                    Some(id) => vec![snap_json(id, self.snaps.get(id).ok_or_else(|| ApiErr { status: 404, ..err("DBSnapshotNotFound", format!("Snapshot {id} not found.")) })?)],
+                    None => self.snaps.iter().map(|(id, s)| snap_json(id, s)).collect(),
+                };
+                (json!({ "DBSnapshots|DBSnapshot": list }), None)
+            }
+            "DeleteDBSnapshot" => {
+                let sid = p("DBSnapshotIdentifier")?;
+                if !self.snaps.contains_key(&sid) {
+                    return Err(ApiErr { status: 404, ..err("DBSnapshotNotFound", format!("Snapshot {sid} not found.")) });
+                }
+                self.snaps.remove(&sid);
+                (json!({ "DBSnapshot": json!({"DBSnapshotIdentifier": sid}) }), Some(("rds".into(), sid.clone(), Job::DeleteSnap(sid))))
+            }
+            "RestoreDBInstanceFromDBSnapshot" => {
+                let sid = p("DBSnapshotIdentifier")?;
+                let id = p("DBInstanceIdentifier")?;
+                let key = ("rds".to_string(), id.clone());
+                if self.nodes.contains_key(&key) {
+                    return Err(err("DBInstanceAlreadyExists", format!("DB instance already exists: {id}")));
+                }
+                let s = self.snaps.get(&sid).ok_or_else(|| ApiErr { status: 404, ..err("DBSnapshotNotFound", format!("Snapshot {sid} not found.")) })?;
+                if s.status != "available" {
+                    return Err(err("InvalidDBSnapshotState", format!("Snapshot {sid} is not in available state.")));
+                }
+                let mut n = s.node.clone();
+                n.image = format!("rocalcloud-snap-{sid}");
+                n.status = "creating".into();
+                n.port = None;
+                n.created = chrono::Utc::now().to_rfc3339();
+                n.class = q.get("DBInstanceClass").cloned().unwrap_or(n.class);
+                let out = json!({"DBInstance": rds_json(&id, &n)});
+                self.nodes.insert(key, n);
+                (out, Some(("rds".into(), id, Job::Create)))
+            }
+            "CreateDBParameterGroup" => {
+                let g = p("DBParameterGroupName")?;
+                let fam = p("DBParameterGroupFamily")?;
+                if self.pgroups.contains_key(&g) {
+                    return Err(err("DBParameterGroupAlreadyExists", format!("Parameter group {g} already exists.")));
+                }
+                let desc = q.get("Description").cloned().unwrap_or_default();
+                self.pgroups.insert(g.clone(), (fam, vec![]));
+                (json!({"DBParameterGroup": {"DBParameterGroupName": g, "DBParameterGroupFamily": self.pgroups[&g].0, "Description": desc}}), None)
+            }
+            "ModifyDBParameterGroup" => {
+                let g = p("DBParameterGroupName")?;
+                if !self.pgroups.contains_key(&g) {
+                    return Err(ApiErr { status: 404, ..err("DBParameterGroupNotFound", format!("DBParameterGroup {g} not found.")) });
+                }
+                let mut params: Vec<(usize, String, String)> = vec![];
+                for (k, v) in q.iter() {
+                    if let Some(rest) = k.strip_prefix("Parameters.Parameter.") {
+                        if let Some(idx) = rest.strip_suffix(".ParameterName") {
+                            let i: usize = idx.parse().unwrap_or(0);
+                            let val = q.get(&format!("Parameters.Parameter.{idx}.ParameterValue")).cloned().unwrap_or_default();
+                            params.push((i, v.clone(), val));
+                        }
+                    }
+                }
+                params.sort_by_key(|(i, _, _)| *i);
+                if params.is_empty() {
+                    return Err(err("InvalidParameterValue", "Parameters must not be empty"));
+                }
+                for (_, name, _) in &params {
+                    if !KNOWN_PARAMS.contains(&name.as_str()) {
+                        return Err(err("InvalidParameterValue", format!("{name} is not a modifiable parameter locally (known: {KNOWN_PARAMS:?})")));
+                    }
+                }
+                let (_, slot) = self.pgroups.get_mut(&g).unwrap();
+                for (_, name, val) in params {
+                    slot.retain(|(k, _)| *k != name);
+                    slot.push((name, val));
+                }
+                (json!({"DBParameterGroupName": g}), None)
+            }
+            "DescribeDBParameters" => {
+                let g = p("DBParameterGroupName")?;
+                let (fam, params) = self.pgroups.get(&g).ok_or_else(|| ApiErr { status: 404, ..err("DBParameterGroupNotFound", format!("DBParameterGroup {g} not found.")) })?;
+                let source: Option<&str> = q.get("Source").map(String::as_str);
+                let list: Vec<Value> = params.iter()
+                    .filter(|(_, _)| source.is_none_or(|s| s == "user"))
+                    .map(|(k, v)| json!({"ParameterName": k, "ParameterValue": v, "Source": "user", "ApplyType": "dynamic", "ApplyMethod": "pending-reboot"}))
+                    .collect();
+                let _ = fam;
+                (json!({ "Parameters|Parameter": list }), None)
+            }
+            "DeleteDBParameterGroup" => {
+                let g = p("DBParameterGroupName")?;
+                if !self.pgroups.contains_key(&g) {
+                    return Err(ApiErr { status: 404, ..err("DBParameterGroupNotFound", format!("DBParameterGroup {g} not found.")) });
+                }
+                if self.nodes.values().any(|n| n.pgroup.as_deref() == Some(g.as_str())) {
+                    return Err(err("InvalidParameterGroup", format!("One or more DB instances are using the parameter group {g}.")));
+                }
+                self.pgroups.remove(&g);
+                (Value::Null, None)
             }
             a => return Err(err("InvalidAction", format!("{a} is not supported yet"))),
         })
@@ -271,7 +454,7 @@ impl Managed {
                 let major = if engine == "memcached" { version.split('.').take(2).collect::<Vec<_>>().join(".") } else { version.split('.').next().unwrap_or(default_v).to_string() };
                 let n = Node { image: format!("{image}:{major}-alpine"), inner, port: None, status: "creating".into(), user: String::new(), password: String::new(),
                     db: String::new(), class: q.get("CacheNodeType").cloned().unwrap_or("cache.t3.micro".into()), storage: 0,
-                    created: chrono::Utc::now().to_rfc3339(), engine, version };
+                    created: chrono::Utc::now().to_rfc3339(), engine, version, pgroup: None };
                 let out = json!({"CacheCluster": cache_json(&id, &n, false)});
                 self.nodes.insert(key, n);
                 (out, Some(("cache".into(), id, Job::Create)))
