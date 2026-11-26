@@ -2539,6 +2539,91 @@ def test_cloudformation_exports_and_inplace():
     assert all(e["Name"] != f"{base}-url" for e in cf.list_exports()["Exports"]), "export disappears with its stack"
 
 
+def test_sfn_task_tokens():
+    sfn, sqs = boto3.client("stepfunctions", **kw), boto3.client("sqs", **kw)
+    base = f"wtt{run}"
+    role = "arn:aws:iam::000000000000:role/none"  # invokes fall back to the root keys
+    q = sqs.create_queue(QueueName=base)["QueueUrl"]
+
+    def start(defn, inp):
+        arn = sfn.create_state_machine(name=base, definition=json.dumps(defn), roleArn=role)["stateMachineArn"]
+        e = sfn.start_execution(stateMachineArn=arn, input=json.dumps(inp))
+        return arn, e["executionArn"]
+
+    def settle(ear, want="SUCCEEDED", secs=15):
+        for _ in range(secs * 10):
+            d = sfn.describe_execution(executionArn=ear)
+            if d["status"] != "RUNNING":
+                break
+            time.sleep(0.1)
+        assert d["status"] == want, (d["status"], d.get("cause", d))
+        return d
+
+    # 1) SQS .waitForTaskToken: the token rides the message; SendTaskSuccess resumes the execution.
+    arn1, e1 = start({
+        "StartAt": "WaitReply", "States": {"WaitReply": {
+            "Type": "Task", "Resource": "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
+            "Parameters": {"QueueUrl.$": "$.queue", "MessageBody.$": "$.msg",
+                            "MessageAttributes": {"Token": {"DataType": "String", "StringValue.$": "$$.Task.Token"}}},
+            "TimeoutSeconds": 20, "Next": "Done"}, "Done": {"Type": "Succeed"}}},
+        {"queue": q, "msg": "hello-token"})
+    m = []
+    for _ in range(50):
+        m = sqs.receive_message(QueueUrl=q, MaxNumberOfMessages=1, MessageAttributeNames=["All"]).get("Messages", [])
+        if m:
+            break
+        time.sleep(0.1)
+    assert m and m[0]["Body"] == "hello-token", m
+    tok = m[0]["MessageAttributes"]["Token"]["StringValue"]
+    sqs.delete_message(QueueUrl=q, ReceiptHandle=m[0]["ReceiptHandle"])
+    sfn.send_task_success(taskToken=tok, output=json.dumps({"answer": 42}))
+    d = settle(e1)
+    assert json.loads(d["output"]) == {"answer": 42}
+    # The token is spent now.
+    assert code(sfn.send_task_success, taskToken=tok, output="{}") == "TaskTimedOut"
+    sfn.delete_state_machine(stateMachineArn=arn1)
+
+    # 2) No heartbeats: HeartbeatSeconds=1 fires States.Timeout and the Catch branch runs.
+    arn2, e2 = start({
+        "StartAt": "Slow", "States": {"Slow": {
+            "Type": "Task", "Resource": "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
+            "Parameters": {"QueueUrl.$": "$.queue", "MessageBody.$": "$.msg"},
+            "HeartbeatSeconds": 1, "TimeoutSeconds": 10,
+            "Catch": [{"ErrorEquals": ["States.Timeout"], "Next": "Caught", "ResultPath": "$.err"}], "Next": "Done"},
+            "Caught": {"Type": "Pass", "Parameters": {"caught": True, "err.$": "$.err"}, "Next": "Done"}, "Done": {"Type": "Succeed"}}},
+        {"queue": q, "msg": "will-timeout"})
+    # drain the queued message so it does not leak to later assertions
+    for _ in range(30):
+        if sqs.receive_message(QueueUrl=q, MaxNumberOfMessages=1).get("Messages", []):
+            break
+        time.sleep(0.1)
+    d = settle(e2)
+    assert d["output"] and json.loads(d["output"]).get("err"), d["output"]
+    sfn.delete_state_machine(stateMachineArn=arn2)
+
+    # 3) Bogus token.
+    assert code(sfn.send_task_success, taskToken="no-such-token", output="{}") == "TaskDoesNotExist"
+    assert code(sfn.send_task_failure, taskToken="no-such-token", error="E", cause="c") == "TaskDoesNotExist"
+    assert code(sfn.send_task_heartbeat, taskToken="no-such-token") == "TaskDoesNotExist"
+
+    # 4) Plain Task TimeoutSeconds: a slow Lambda trips States.Timeout into Catch.
+    lam = boto3.client("lambda", **kw)
+    z = zipped({"index.py": "import time\ndef handler(e, c):\n    time.sleep(3)\n    return {}\n"})
+    fn = f"{base}-slow"
+    lam.create_function(FunctionName=fn, Runtime="python3.12", Role=role, Handler="index.handler", Code={"ZipFile": z}, Timeout=20)
+    arn3, e3 = start({
+        "StartAt": "Invoke", "States": {"Invoke": {
+            "Type": "Task", "Resource": f"arn:aws:lambda:us-east-1:000000000000:function:{fn}", "TimeoutSeconds": 1,
+            "Catch": [{"ErrorEquals": ["States.Timeout"], "Next": "Caught", "ResultPath": "$.err"}], "Next": "Done"},
+            "Caught": {"Type": "Pass", "Parameters": {"timed_out": True, "err.$": "$.err"}, "Next": "Done"}, "Done": {"Type": "Succeed"}}}, {})
+    d = settle(e3, secs=30)
+    assert json.loads(d["output"]).get("err"), d["output"]
+    lam.delete_function(FunctionName=fn)
+    sfn.delete_state_machine(stateMachineArn=arn3)
+    sqs.delete_queue(QueueUrl=q)
+
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

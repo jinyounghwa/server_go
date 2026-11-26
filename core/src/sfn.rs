@@ -1,13 +1,15 @@
 // Step Functions (JSON 1.0) with an Amazon States Language interpreter.
 // Parallel branches and Map items run concurrently (Map honours MaxConcurrency).
 // A failing branch or item stops the rest. JSONPath supports $.a.b[0], [*], [-1], ['key'], and $$ context paths;
-// filter expressions ?(...) are rejected. ponytail: no JSONata, task tokens, activities, Express sync starts or state TimeoutSeconds.
+// filter expressions ?(...) are rejected. Task states honour TimeoutSeconds (default 60s) and heartbeats,
+// and .waitForTaskToken integrations pause until SendTaskSuccess/Failure (see Sfn.waiting). ponytail: no JSONata, no
+// Express sync starts, waiting task tokens are memory-only and lost on restart.
 use crate::{b64, epoch, err, need, unb64, ApiErr, App, ACCOUNT, REGION};
 use md5::Md5;
 use rand::Rng;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256, Sha384, Sha512};
-use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{collections::{BTreeMap, BTreeSet}, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 struct Machine {
     name: String,
@@ -32,6 +34,24 @@ struct Exec {
 pub struct Sfn {
     machines: BTreeMap<String, Machine>,
     execs: BTreeMap<String, Exec>,
+    // Task tokens paused at a .waitForTaskToken integration. ponytail: memory only,
+    // a restart forgets them (the paired executions fail with States.Timeout at their deadline).
+    waiting: BTreeMap<String, Wait>,
+    // Tokens already resolved/timed out, so late SendTask* gets TaskTimedOut. Capped at 4096.
+    done: BTreeSet<String>,
+}
+
+enum TaskOutcome {
+    Ok(Value),
+    Err(String, String),
+}
+
+struct Wait {
+    exec: String,
+    deadline: i64,                 // epoch ms
+    hb_interval: Option<u64>,      // HeartbeatSeconds in ms
+    heartbeat: Option<i64>,        // next heartbeat deadline, epoch ms
+    tx: tokio::sync::mpsc::UnboundedSender<TaskOutcome>,
 }
 
 type Fail = (String, String); // (error, cause)
@@ -473,6 +493,45 @@ fn error_matches(list: &Value, e: &str) -> bool {
 
 // ---------- tasks ----------
 
+// Pause the execution until SendTaskSuccess/Failure resolves the token, a heartbeat is missed or TimeoutSeconds passes.
+async fn wait_task(app: &Arc<App>, exec: &str, state: &str, token: &str, st: &Value) -> Result<Value, Fail> {
+    let timeout_ms = st["TimeoutSeconds"].as_u64().unwrap_or(60).clamp(1, u64::MAX / 2) * 1000;
+    let hb_interval = st["HeartbeatSeconds"].as_u64().filter(|s| *s > 0).map(|s| s * 1000);
+    let deadline = crate::now_ms() + timeout_ms as i64;
+    let heartbeat = hb_interval.map(|h| crate::now_ms() + h as i64);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    app.sfn.lock().unwrap().waiting.insert(token.to_string(), Wait { exec: exec.into(), deadline, hb_interval, heartbeat, tx });
+    loop {
+        let wake = {
+            let s = app.sfn.lock().unwrap();
+            let Some(w) = s.waiting.get(token) else { return Err(fail("States.Timeout", "task token was resolved while waiting")) };
+            w.heartbeat.unwrap_or(w.deadline).min(w.deadline)
+        };
+        let sleep_ms = (wake - crate::now_ms()).max(1) as u64;
+        tokio::select! {
+            out = rx.recv() => {
+                let _ = app.sfn.lock().unwrap().waiting.remove(token);
+                return match out {
+                    Some(TaskOutcome::Ok(v)) => Ok(v),
+                    Some(TaskOutcome::Err(e, c)) => Err((e, c)),
+                    None => Err(fail("States.Timeout", format!("State {state} timed out"))),
+                };
+            }
+            _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {
+                let n = crate::now_ms();
+                let mut s = app.sfn.lock().unwrap();
+                let Some(w) = s.waiting.get(token) else { return Err(fail("States.Timeout", "task token was resolved while waiting")) };
+                if w.heartbeat.is_some_and(|h| n >= h) || n >= w.deadline {
+                    s.waiting.remove(token);
+                    s.done.insert(token.to_string());
+                    return Err(fail("States.Timeout", format!("State {state} timed out: no task token activity within its limit")));
+                }
+                // else: the heartbeat deadline was pushed forward by SendTaskHeartbeat while we slept.
+            }
+        }
+    }
+}
+
 async fn task(app: &Arc<App>, resource: &str, p: Value) -> Result<Value, Fail> {
     if resource.starts_with("arn:aws:lambda:") {
         return invoke(app, &crate::lambda::name_of(resource), p).await;
@@ -578,10 +637,35 @@ fn run_states<'a>(app: &'a Arc<App>, exec: &'a str, def: &'a Value, input: Value
                     tokio::time::sleep(Duration::from_secs_f64(secs.max(0.0))).await;
                     Ok(eff.clone())
                 }
-                "Task" => match params(&eff) {
-                    Ok(p) => task(app, st["Resource"].as_str().unwrap_or(""), p).await,
-                    Err(e) => Err(e),
-                },
+                "Task" => {
+                    let res = st["Resource"].as_str().unwrap_or("");
+                    let wtt = res.strip_suffix(".waitForTaskToken");
+                    let resource = wtt.unwrap_or(res);
+                    // The token is exposed to Parameters as $$.Task.Token (AWS) and $.Task.Token (locally too).
+                    let mut eff2 = eff.clone();
+                    let mut sctx2 = sctx.clone();
+                    let mut token = String::new();
+                    if wtt.is_some() {
+                        token = uuid::Uuid::new_v4().simple().to_string();
+                        eff2["Task"] = json!({"Token": token.clone()});
+                        sctx2["Task"] = json!({"Token": token.clone()});
+                    }
+                    let p = match st.get("Parameters") {
+                        Some(pp) => template(pp, &eff2, &sctx2)?,
+                        None => eff2,
+                    };
+                    if wtt.is_some() {
+                        let _sent = task(app, resource, p).await?;
+                        wait_task(app, exec, &cur, &token, st).await
+                    } else {
+                        // TimeoutSeconds applies to plain tasks too (AWS default: 60s).
+                        let secs = st["TimeoutSeconds"].as_u64().unwrap_or(60).max(1);
+                        match tokio::time::timeout(Duration::from_secs(secs), task(app, resource, p)).await {
+                            Ok(r) => r,
+                            Err(_) => Err(fail("States.Timeout", format!("State {cur} timed out after {secs}s"))),
+                        }
+                    }
+                }
                 "Parallel" => match params(&eff) {
                     // Branches run concurrently; the first branch to fail stops the others (their futures are dropped).
                     Ok(p) => {
@@ -798,6 +882,11 @@ impl Sfn {
                     x.status = "ABORTED";
                     x.stop = Some(epoch());
                     x.error = r["error"].as_str().map(|e| (e.to_string(), r["cause"].as_str().unwrap_or("").to_string()));
+                    let a2 = a;
+                    for (tok, w) in self.waiting.split_off(&String::new()).into_iter().filter(|(_, w)| w.exec == a2) {
+                        let _ = w.tx.send(TaskOutcome::Err("States.Timeout".into(), "execution was stopped while waiting for the task token".into()));
+                        self.done.insert(tok);
+                    }
                 }
                 json!({"stopDate": x.stop})
             }
@@ -810,9 +899,52 @@ impl Sfn {
                 }
                 json!({ "events": h })
             }
+            "SendTaskSuccess" | "SendTaskFailure" => {
+                let t = need(r, "taskToken")?;
+                let out = if op == "SendTaskSuccess" {
+                    let v = match r["output"].clone() {
+                        Value::String(s) => serde_json::from_str::<Value>(&s).map_err(|e| err("InvalidExecutionInput", format!("Invalid Output: {e}")))?,
+                        other => other,
+                    };
+                    TaskOutcome::Ok(v)
+                } else {
+                    TaskOutcome::Err(r["error"].as_str().unwrap_or("").into(), r["cause"].as_str().unwrap_or("").into())
+                };
+                let w = self.waiting.remove(t).ok_or_else(|| self.token_err(t))?;
+                self.remember_done(t);
+                let _ = w.tx.send(out);
+                json!({})
+            }
+            "SendTaskHeartbeat" => {
+                let t = need(r, "taskToken")?;
+                let miss = self.token_err(t);
+                let w = self.waiting.get_mut(t).ok_or(miss)?;
+                let interval = w.hb_interval.ok_or_else(|| err("TaskTimedOut", format!("Task Timed Out: '{t}' does not use heartbeats")))?;
+                w.heartbeat = Some(crate::now_ms() + interval as i64);
+                json!({})
+            }
             _ => return Err(err("UnknownOperationException", format!("{op} is not supported yet"))),
         };
         Ok((v, None))
+    }
+
+    fn token_err(&self, t: &str) -> ApiErr {
+        if self.done.contains(t) {
+            err("TaskTimedOut", format!("Task Timed Out: '{t}' has already been resolved"))
+        } else {
+            err("TaskDoesNotExist", format!("Task Does Not Exist: '{t}'"))
+        }
+    }
+
+    fn remember_done(&mut self, t: &str) {
+        self.done.insert(t.into());
+        while self.done.len() > 4096 {
+            let first = self.done.iter().next().cloned();
+            match first {
+                Some(f) => { self.done.remove(&f); }
+                None => break,
+            }
+        }
     }
 
     pub fn admin(&self) -> Value {
@@ -886,5 +1018,33 @@ mod tests {
         let r2 = ev("States.MathRandom(1, 100, 42)").unwrap().as_i64().unwrap();
         assert!(r1 == r2 && (1..100).contains(&r1));
         assert!(ev("States.MathRandom(10, 10)").is_err());
+    }
+#[test]
+    fn task_token_lifecycle() {
+        let mut s = Sfn::default();
+        // Unknown token: TaskDoesNotExist.
+        let e = s.handle("SendTaskSuccess", &json!({"taskToken": "bogus", "output": {"a": 1}})).unwrap_err();
+        assert_eq!(e.code, "TaskDoesNotExist");
+        // Register a wait, resolve it, then reuse the token: TaskTimedOut.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        s.waiting.insert("tok1".into(), Wait { exec: "e".into(), deadline: i64::MAX, hb_interval: None, heartbeat: None, tx });
+        s.handle("SendTaskSuccess", &json!({"taskToken": "tok1", "output": "{\"a\": 1}"})).unwrap();
+        let e = s.handle("SendTaskFailure", &json!({"taskToken": "tok1", "error": "X", "cause": "c"})).unwrap_err();
+        assert_eq!(e.code, "TaskTimedOut");
+        // Heartbeat on a task without HeartbeatSeconds: TaskTimedOut.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        s.waiting.insert("tok2".into(), Wait { exec: "e".into(), deadline: i64::MAX, hb_interval: None, heartbeat: None, tx });
+        let e = s.handle("SendTaskHeartbeat", &json!({"taskToken": "tok2"})).unwrap_err();
+        assert_eq!(e.code, "TaskTimedOut");
+        // Heartbeat with an interval resets the next deadline.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        s.waiting.insert("tok3".into(), Wait { exec: "e".into(), deadline: i64::MAX, hb_interval: Some(5000), heartbeat: Some(0), tx });
+        s.handle("SendTaskHeartbeat", &json!({"taskToken": "tok3"})).unwrap();
+        assert!(s.waiting["tok3"].heartbeat.unwrap() > 0);
+        // Output must be JSON.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        s.waiting.insert("tok4".into(), Wait { exec: "e".into(), deadline: i64::MAX, hb_interval: None, heartbeat: None, tx });
+        let e = s.handle("SendTaskSuccess", &json!({"taskToken": "tok4", "output": "not-json{"})).unwrap_err();
+        assert_eq!(e.code, "InvalidExecutionInput");
     }
 }
