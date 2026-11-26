@@ -32,6 +32,7 @@
 - 2026-11-26 추가21: Lambda 가중치 별칭·한정자별 호출 설정 — 별칭 `RoutingConfig.AdditionalVersionWeights`(1개 버전, 가중치 0 초과 1 이하, 별칭 버전과 달라야 함, 2개 이상·범위 밖·같은 버전은 `InvalidParameterValueException`), 호출 시 `rand`로 버 선택·`ExecutedVersion`에 실제 버전, EventInvokeConfig를 한정자(`$LATEST`·버전 스냅션·별칭)별 저장(별칭 미설정 시 `$LATEST` 상속), `Get/Put/Update/DeleteFunctionEventInvokeConfig`가 `?Qualifier=`를 따름. 단위 테스트 49개, boto3 테스트 45개.
 - 2026-11-26 추가22: ECS 롤링 배포·헬스 체크 — 서비스 업데이트 시 `deploymentConfiguration`(minimumHealthyPercent·maximumPercent, 기본 100/200)에 따라 새 정의 태스크를 surge로 띄우고 오래된 태스크를 최소 건강 수 아래로 안 내려가게 교체(`deployments`에 PRIMARY·ACTIVE, `rolloutState` IN_PROGRESS/COMPLETED), 컨테이너 `healthCheck.command`를 docker `--health-cmd`(2초 간격·3회 재시도)로 전달하고 unhealthy 태스크는 교체(사유 `Task failed container health checks`). 단위 테스트 49개, boto3 테스트 46개.
 - 2026-11-26 추가23: RDS 스냅샷·파라미터 그룹 — `Create/Describe/DeleteDBSnapshot`·`RestoreDBInstanceFromDBSnapshot`(docker commit, 데이터는 볼륨 아닌 컨테이너 레이어에: postgres `PGDATA=/pgdata`, mysql `--datadir=/var/lib/mysql-local`; 기본 이미지 크기 postgres:16-alpine 420MB·mysql:8.4 1.12GB 참고), `Create/Modify/Describe/DeleteDBParameterGroup`(허용 파라미터 화이트리스트 8종, 알 수 없는 이름 거부, 사용 중 그룹 삭제 거부) — 값은 컨테이너 (재)생성 시 적용, `RebootDBInstance`는 컨테이너 재생성. 단위 테스트 49개, boto3 테스트 47개.
+- 2026-11-26 추가24: Route53 헬스 체크·DNS over TCP — `Create/Get/List/DeleteHealthCheck`·`GetHealthCheckStatus`(TCP·HTTP, 루프백 전용 SSRF 차단, `RequestInterval>=10`, HTTP `ResourcePath` 반영, 사용 중 삭제 거부·미존재 `NoSuchHealthCheck`), 페일오버/가중치 레코드 `HealthCheckId` 게이트, DNS TCP(같은 포트 2바이트 길이 접두사) 및 UDP >512B `TC` 비트 절단. 단위 테스트 50개, boto3 테스트 48개.
 - 2026-11-25 추가20: 검증 에이전트 시나리오 6개 추가(21→27: 보안 4종 `sec-clock-skew`·`sec-sts-expired`·`sec-strict-delivery`·`sec-jwt-bypass`, 사고 2종 `inc-lambda-dest`·`inc-events-dlq`, `poll_sqs_body`·`xml_tag` 리팩토링), JS v3(5→8)·Rust SDK(4→7) 스위트 확장(FIFO·고정밀 숫자 키·중첩 경로·IAM 조건/버킷 정책·S3 페이지네이션), 연대기 섬 숫자 동기화.
 - `v0.1.0` 릴리스 완료(2026-11-21): 바이너리 3종 + SHA256SUMS, Homebrew sha256 반영.
 - `v0.1.6` 릴리스 준비(2026-11-26, 13일차): 8~12일차 기능 포함 — API Gateway CORS·HTTP_PROXY(루프백)·스테이지 변수·PATCH/PUT UpdateApi, Cognito 그룹·Lambda 트리거(PreSignUp/PostConfirmation/PreTokenGeneration), Kinesis 보존기간·UpdateShardCount, S3 목록 경계, CloudFormation 제자리 업데이트·Export/ImportValue, 검사관 시나리오 27개, JS(8)·Rust(7) SDK 스위트 확장. Pages 배포 재시도 스텝 추가. 태그 푸시는 사용자 승인 대기.
@@ -53,7 +54,7 @@ core/            Rust 단일 바이너리 (axum + tokio), 모든 서비스가 �
   src/<svc>.rs   서비스별 모듈. 상태 struct + handle() + admin()
   src/ui.html    관리 GUI (/_ui), town.html 캐릭터 마을 (/_town) — include_str!로 내장
 gui/             Tauri 2 창. /_ui를 여는 껍데기일 뿐
-tests/sdk_test.py  boto3 호환성 테스트 43개 (주 통합 테스트), tests/js·tests/rust는 JS v3(8개)·Rust SDK(7개) 스위트
+tests/sdk_test.py  boto3 호환성 테스트 48개 (주 통합 테스트), tests/js·tests/rust는 JS v3(8개)·Rust SDK(7개) 스위트
 netlify.toml     예전 Netlify 설정(지금은 GitHub Pages `pages.yml`로 배포)
 ```
 

@@ -78,7 +78,7 @@ All options can be set via environment variables or a `KEY=VALUE` file pointed t
 | `RC_TOWN_ORIGIN` | `https://jinyounghwa.github.io` | Single CORS origin allowed to read scrubbed `/_events` for GitHub Pages; set `off` to disable |
 | `RC_LLM_URL` | `http://127.0.0.1:11434` | Local Ollama endpoint for the explanation and verification agents |
 | `RC_LLM_MODEL` | `qwen3.5:9b` | Model name used by Ollama |
-| `RC_DNS_PORT` | `10053` | Local UDP port (`127.0.0.1`) for the Route 53 DNS server |
+| `RC_DNS_PORT` | `10053` | Local UDP/TCP port (`127.0.0.1`) for the Route 53 DNS server |
 | `RC_DOCKER` | `docker` | Docker CLI binary used by RDS, ElastiCache, and ECS |
 | `RC_CONTAINER_MEMORY` | `512m` | Memory limit applied to each spawned Docker container |
 
@@ -108,7 +108,7 @@ All options can be set via environment variables or a `KEY=VALUE` file pointed t
 | **ElastiCache** | `redis` / `valkey` / `memcached` clusters as Docker containers; create, describe (with node endpoints), delete |
 | **ECS** | Clusters, task definitions (revisions), `RunTask`/`StopTask` as Docker containers with port mappings, env, overrides, task-role credentials, `awslogs` → CloudWatch Logs; services maintain `desiredCount` and register with ALB target groups |
 | **ELB v2 (ALB)** | Load balancers, target groups, listeners bound to `127.0.0.1:{Port}` (>= 1024) with round-robin L4 forwarding to healthy targets, fixed responses, target health |
-| **Route 53** | Hosted zones, record sets (`CREATE`/`UPSERT`/`DELETE`, aliases, wildcards), routing policies (weighted, failover, latency), plus a local UDP DNS server on `127.0.0.1:10053` (`RC_DNS_PORT`) answering `A`/`AAAA`/`CNAME`/`TXT` |
+| **Route 53** | Hosted zones, record sets (`CREATE`/`UPSERT`/`DELETE`, aliases, wildcards), loopback TCP/HTTP health checks, routing policies (weighted, failover with health checks, latency), plus a local UDP/TCP DNS server on `127.0.0.1:10053` (`RC_DNS_PORT`, UDP >512B truncation with TC bit) answering `A`/`AAAA`/`CNAME`/`TXT` |
 | **CloudFormation** | JSON/YAML templates (short tags), Parameters, Conditions, Mappings, `Ref`/`GetAtt`/`Sub`/`Join`/`Select`/`Split`/`If`/`FindInMap`/`GetAZs`/`Base64`, dependency ordering, Outputs with exports, `Fn::ImportValue`/`ListExports`/`ListImports` (imported exports block delete/change), in-place property updates (SQS attributes, Lambda env/memory/timeout, SNS DisplayName, DDB throughput) vs replacement, create/update/delete with rollback |
 | **EC2 (Network)** | VPCs, subnets, internet gateways, route tables, security groups, instances (metadata records), `DescribeAvailabilityZones`, step-by-step reachability analysis at `/_admin/reach` |
 

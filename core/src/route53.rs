@@ -1,7 +1,7 @@
-// Route 53 (REST-XML) hosted zones and record sets, plus a tiny DNS server on 127.0.0.1:{RC_DNS_PORT or 10053}/udp
-// that answers A, AAAA, CNAME and TXT from the zones (aliases resolve inside the zones; anything else → 127.0.0.1).
-// Routing policies: weighted (random by Weight; 0 never wins), failover (PRIMARY beats SECONDARY; no health checks)
-// and latency (first set — the client's region is unknown). ponytail: no health checks, DNSSEC, TCP DNS or zone transfers.
+// Route 53 (REST-XML) hosted zones, record sets, loopback-only TCP/HTTP health checks, and a tiny DNS server on
+// 127.0.0.1:{RC_DNS_PORT or 10053} (UDP + TCP; UDP truncates >512B with TC=1) answering A, AAAA, CNAME and TXT.
+// Routing policies: weighted (random by Weight; 0 never wins), failover (PRIMARY beats SECONDARY, gated by HealthCheckId)
+// and latency (first set — the client's region is unknown). ponytail: no DNSSEC or zone transfers; RequestInterval is validated (>=10) but probed every 2s locally.
 use crate::s3::{esc, tags};
 use crate::{err, ApiErr, App};
 use std::{collections::BTreeMap, net::{Ipv4Addr, Ipv6Addr}, sync::Arc};
@@ -19,6 +19,7 @@ struct RecordSet {
     weight: Option<u64>,
     region: Option<String>,
     failover: Option<String>, // PRIMARY | SECONDARY
+    health: Option<String>,   // HealthCheckId gate
 }
 struct Zone {
     name: String,
@@ -31,6 +32,31 @@ struct Zone {
 #[derive(Default)]
 pub struct Route53 {
     zones: BTreeMap<String, Zone>,
+    checks: BTreeMap<String, HealthCheck>,
+}
+
+struct HealthCheck {
+    kind: String,   // TCP | HTTP
+    host: String,   // loopback only (SSRF guard)
+    port: u16,
+    path: String,   // HTTP resource path
+    #[allow(dead_code)]
+    period: u64,    // RequestInterval (validated >= 10, not enforced locally)
+    status: String, // Healthy | Unhealthy | Unknown
+    created: String,
+}
+
+fn health_xml(id: &str, h: &HealthCheck) -> String {
+    format!("<HealthCheck><Id>{id}</Id><CallerReference>{id}</CallerReference><HealthCheckConfig><Type>{}</Type><IPAddress>{}</IPAddress><Port>{}</Port>{}</HealthCheckConfig><HealthCheckVersion>1</HealthCheckVersion></HealthCheck>",
+        esc(&h.kind), esc(&h.host), h.port,
+        if h.kind == "HTTP" { format!("<ResourcePath>{}</ResourcePath>", esc(&h.path)) } else { String::new() })
+}
+
+fn is_loopback(host: &str) -> bool {
+    if host == "localhost" {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 fn fqdn(n: &str) -> String {
@@ -63,7 +89,8 @@ fn rrset_xml(r: &RecordSet) -> String {
     let pol = r.set_id.as_ref().map_or(String::new(), |s| format!("<SetIdentifier>{}</SetIdentifier>", esc(s))
         + &r.weight.map_or(String::new(), |w| format!("<Weight>{w}</Weight>"))
         + &r.region.as_ref().map_or(String::new(), |g| format!("<Region>{}</Region>", esc(g)))
-        + &r.failover.as_ref().map_or(String::new(), |f| format!("<Failover>{}</Failover>", esc(f))));
+        + &r.failover.as_ref().map_or(String::new(), |f| format!("<Failover>{}</Failover>", esc(f)))
+        + &r.health.as_ref().map_or(String::new(), |h| format!("<HealthCheckId>{}</HealthCheckId>", esc(h))));
     format!("<ResourceRecordSet><Name>{}</Name><Type>{}</Type>{pol}{body}</ResourceRecordSet>", esc(&r.name), r.ty)
 }
 const DELEGATION: &str = "<DelegationSet><NameServers><NameServer>ns1.rocalcloud.local</NameServer><NameServer>ns2.rocalcloud.local</NameServer></NameServers></DelegationSet>";
@@ -84,8 +111,8 @@ impl Route53 {
                     return Err(ApiErr { status: 409, ..err("HostedZoneAlreadyExists", format!("A hosted zone has already been created with the specified caller reference {caller}")) });
                 }
                 let id = format!("Z{}", &uuid::Uuid::new_v4().simple().to_string()[..20].to_uppercase());
-                let soa = RecordSet { name: name.clone(), ty: "SOA".into(), ttl: 900, values: vec![format!("ns1.rocalcloud.local. hostmaster.{name} 1 7200 900 1209600 86400")], alias: None, set_id: None, weight: None, region: None, failover: None };
-                let ns = RecordSet { name: name.clone(), ty: "NS".into(), ttl: 172800, values: vec!["ns1.rocalcloud.local.".into(), "ns2.rocalcloud.local.".into()], alias: None, set_id: None, weight: None, region: None, failover: None };
+                let soa = RecordSet { name: name.clone(), ty: "SOA".into(), ttl: 900, values: vec![format!("ns1.rocalcloud.local. hostmaster.{name} 1 7200 900 1209600 86400")], alias: None, set_id: None, weight: None, region: None, failover: None, health: None };
+                let ns = RecordSet { name: name.clone(), ty: "NS".into(), ttl: 172800, values: vec!["ns1.rocalcloud.local.".into(), "ns2.rocalcloud.local.".into()], alias: None, set_id: None, weight: None, region: None, failover: None, health: None };
                 let z = Zone { name, caller, comment: first(body, "Comment"), private: first(body, "PrivateZone") == "true", records: vec![soa, ns] };
                 let out = wrap("CreateHostedZoneResponse", format!("{}{}{DELEGATION}", z.xml(&id), change_info()));
                 self.zones.insert(id, z);
@@ -129,7 +156,13 @@ impl Route53 {
                         weight: first(&set, "Weight").parse().ok(),
                         region: ne(first(&set, "Region")),
                         failover: ne(first(&set, "Failover")),
+                        health: ne(first(&set, "HealthCheckId")),
                     };
+                    if let Some(h) = &r.health {
+                        if !self.checks.contains_key(h) {
+                            return Err(err("InvalidInput", format!("No health check exists with the specified ID {h}")));
+                        }
+                    }
                     if !r.name.ends_with(&z.name) {
                         return Err(err("InvalidChangeBatch", format!("RRSet with DNS name {} is not permitted in zone {}", r.name, z.name)));
                     }
@@ -145,6 +178,61 @@ impl Route53 {
                 }
                 z.records = recs;
                 (200, wrap("ChangeResourceRecordSetsResponse", change_info()))
+            }
+            ("POST", ["healthcheck"]) => {
+                let cfg = first(body, "HealthCheckConfig");
+                let kind = first(&cfg, "Type");
+                if kind != "TCP" && kind != "HTTP" {
+                    return Err(err("InvalidInput", format!("Type must be TCP or HTTP, not {kind}")));
+                }
+                let raw_host = first(&cfg, "IPAddress");
+                let host = (if raw_host.is_empty() { first(&cfg, "FullyQualifiedDomainName") } else { raw_host }).to_lowercase();
+                if !is_loopback(&host) {
+                    return Err(err("InvalidInput", format!("IPAddress {host} is not permitted: health check targets must be loopback addresses locally")));
+                }
+                let port = first(&cfg, "Port").parse::<u16>().unwrap_or(80);
+                let period = first(&cfg, "RequestInterval").parse::<u64>().unwrap_or(30);
+                if period < 10 {
+                    return Err(err("InvalidInput", "RequestInterval must be at least 10 seconds"));
+                }
+                let raw_path = first(&cfg, "ResourcePath");
+                let path = if raw_path.is_empty() {
+                    "/".into()
+                } else if raw_path.starts_with('/') {
+                    raw_path
+                } else {
+                    format!("/{raw_path}")
+                };
+                let id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+                let h = HealthCheck { kind, host, port, path, period, status: "Unknown".into(), created: chrono::Utc::now().to_rfc3339() };
+                let out = wrap("CreateHealthCheckResponse", format!("{}{}", health_xml(&id, &h), change_info()));
+                self.checks.insert(id, h);
+                (201, out)
+            }
+            ("GET", ["healthcheck"]) => {
+                let hs: String = self.checks.iter().map(|(id, h)| health_xml(id, h)).collect::<String>();
+                (200, wrap("ListHealthChecksResponse", format!("<HealthChecks>{hs}</HealthChecks><IsTruncated>false</IsTruncated><MaxItems>100</MaxItems>")))
+            }
+            ("GET", ["healthcheck", id]) => {
+                let h = self.checks.get(*id).ok_or_else(|| ApiErr { status: 404, ..err("NoSuchHealthCheck", format!("No health check found with ID: {id}")) })?;
+                (200, wrap("GetHealthCheckResponse", health_xml(id, h)))
+            }
+            ("DELETE", ["healthcheck", id]) => {
+                if !self.checks.contains_key(*id) {
+                    return Err(ApiErr { status: 404, ..err("NoSuchHealthCheck", format!("No health check found with ID: {id}")) });
+                }
+                if self.zones.values().any(|z| z.records.iter().any(|r| r.health.as_deref() == Some(*id))) {
+                    return Err(err("InvalidInput", format!("Health check {id} is in use by one or more resource record sets")));
+                }
+                self.checks.remove(*id);
+                (200, wrap("DeleteHealthCheckResponse", change_info()))
+            }
+            ("GET", ["healthcheck", id, "status"]) => {
+                let h = self.checks.get(*id).ok_or_else(|| ApiErr { status: 404, ..err("NoSuchHealthCheck", format!("No health check found with ID: {id}")) })?;
+                let status = if h.status == "Healthy" { "Healthy" } else { "Unhealthy" };
+                (200, wrap("GetHealthCheckStatusResponse", format!(
+                    "<HealthCheckObservations><HealthCheckObservation><Region>{}</Region><IPAddress>{}</IPAddress><StatusReport><Status>{status}</Status><CheckedTime>{}</CheckedTime></StatusReport></HealthCheckObservation></HealthCheckObservations>",
+                    *crate::REGION, esc(&h.host), esc(&h.created))))
             }
             ("GET", ["hostedzone", id, "rrset"]) => {
                 let z = self.zones.get(*id).ok_or_else(|| nf(id))?;
@@ -169,6 +257,11 @@ impl Route53 {
         } else {
             exact
         };
+        // Records gated by a HealthCheckId only answer while the check is Healthy (failover flips to
+        // SECONDARY, weighted/latency sets skip the unhealthy one).
+        let found: Vec<&RecordSet> = found.into_iter()
+            .filter(|r| r.health.as_deref().map_or(true, |h| self.checks.get(h).is_some_and(|c| c.status == "Healthy")))
+            .collect();
         let mut out = vec![];
         // Routing policies: among same name+type sets carrying a SetIdentifier, weighted picks by Weight
         // (0 never wins), failover prefers PRIMARY, latency takes the first set (client region unknown).
@@ -248,7 +341,7 @@ fn encode_name(n: &str) -> Vec<u8> {
 }
 
 // Build a DNS response for one query packet; None for packets we can't parse.
-fn respond(app: &App, q: &[u8]) -> Option<Vec<u8>> {
+fn respond(app: &App, q: &[u8]) -> Option<(Vec<u8>, usize)> {
     if q.len() < 12 {
         return None;
     }
@@ -301,22 +394,149 @@ fn respond(app: &App, q: &[u8]) -> Option<Vec<u8>> {
     out.extend(count.to_be_bytes());
     out.extend([0, 0, 0, 0]);
     out.extend(q.get(12..qend)?);
+    let at = out.len();
     out.extend(answers);
-    Some(out)
+    Some((out, at))
+}
+
+// Probe every health check (loopback only) every 2s; RequestInterval is stored but not enforced
+// locally (ponytail) to keep failover tests quick. Spawned once per process.
+pub fn serve_health(app: Arc<App>) {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            let checks: Vec<(String, String, String, String)> = {
+                let r = app.route53.lock().unwrap();
+                r.checks.iter().map(|(id, h)| (id.clone(), format!("{}:{}", h.host, h.port), h.kind.clone(), h.path.clone())).collect()
+            };
+            for (id, addr, kind, path) in checks {
+                let ok = probe(&addr, &kind, &path).await;
+                if let Some(h) = app.route53.lock().unwrap().checks.get_mut(&id) {
+                    h.status = if ok { "Healthy".into() } else { "Unhealthy".into() };
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
+}
+
+async fn probe(addr: &str, kind: &str, path: &str) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let Ok(Ok(mut s)) = tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(addr)).await else { return false };
+    if kind == "HTTP" {
+        let p = if path.is_empty() { "/" } else { path };
+        let req = format!("GET {p} HTTP/1.0\r\nHost: health.rocalcloud\r\nConnection: close\r\n\r\n");
+        if s.write_all(req.as_bytes()).await.is_err() {
+            return false;
+        }
+        let mut buf = [0u8; 128];
+        return match tokio::time::timeout(std::time::Duration::from_secs(2), s.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => {
+                let head = String::from_utf8_lossy(&buf[..n]);
+                let status = head.lines().next().and_then(|l| l.split_whitespace().nth(1)).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+                (200..400).contains(&status)
+            }
+            _ => false,
+        };
+    }
+    true
 }
 
 pub fn serve_dns(app: Arc<App>) {
+    serve_health(app.clone());
+    let app2 = app.clone();
     tokio::spawn(async move {
+        let app = app2;
         let Ok(sock) = tokio::net::UdpSocket::bind(("127.0.0.1", dns_port())).await else {
             eprintln!("DNS: cannot bind 127.0.0.1:{} (set RC_DNS_PORT)", dns_port());
             return;
         };
-        let mut buf = [0u8; 512];
+        let mut buf = [0u8; 4096];
         loop {
             let Ok((n, from)) = sock.recv_from(&mut buf).await else { continue };
-            if let Some(resp) = respond(&app, &buf[..n]) {
+            if let Some((mut resp, at)) = respond(&app, &buf[..n]) {
+                if resp.len() > 512 {
+                    // classic DNS truncation: TC bit set, answer counts zeroed
+                    resp.truncate(at);
+                    resp[2] |= 0x02;
+                    resp[6..8].copy_from_slice(&0u16.to_be_bytes());
+                }
                 let _ = sock.send_to(&resp, from).await;
             }
         }
     });
+    tokio::spawn(async move {
+        // DNS over TCP on the same port: 2-byte length prefix per message, no 512-byte cap.
+        let app = app;
+        let Ok(l) = tokio::net::TcpListener::bind(("127.0.0.1", dns_port())).await else { return };
+        loop {
+            let Ok((mut s, _)) = l.accept().await else { continue };
+            let app = app.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut len = [0u8; 2];
+                while s.read_exact(&mut len).await.is_ok() {
+                    let n = u16::from_be_bytes(len) as usize;
+                    let mut q = vec![0u8; n];
+                    if s.read_exact(&mut q).await.is_err() {
+                        return;
+                    }
+                    if let Some((resp, _)) = respond(&app, &q) {
+                        let mut out = (resp.len() as u16).to_be_bytes().to_vec();
+                        out.extend(resp);
+                        if s.write_all(&out).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn health_check_and_failover_gate() {
+        assert!(is_loopback("127.0.0.1") && is_loopback("::1") && is_loopback("localhost"));
+        assert!(!is_loopback("93.184.216.34") && !is_loopback("example.com") && !is_loopback(""));
+
+        let mut r = Route53::default();
+        // External IP rejected
+        let err = r.handle("POST", "healthcheck", "<HealthCheckConfig><Type>HTTP</Type><IPAddress>93.184.216.34</IPAddress><Port>80</Port></HealthCheckConfig>").unwrap_err();
+        assert_eq!(err.code, "InvalidInput");
+        // Interval < 10 rejected
+        let err = r.handle("POST", "healthcheck", "<HealthCheckConfig><Type>TCP</Type><IPAddress>127.0.0.1</IPAddress><Port>8080</Port><RequestInterval>5</RequestInterval></HealthCheckConfig>").unwrap_err();
+        assert_eq!(err.code, "InvalidInput");
+
+        let (st, xml) = r.handle("POST", "healthcheck", "<HealthCheckConfig><Type>HTTP</Type><IPAddress>127.0.0.1</IPAddress><Port>8080</Port><ResourcePath>ok</ResourcePath><RequestInterval>10</RequestInterval></HealthCheckConfig>").unwrap();
+        assert_eq!(st, 201);
+        let hc_id = first(&xml, "Id");
+        assert_eq!(r.checks[&hc_id].path, "/ok");
+
+        let (_, zxml) = r.handle("POST", "hostedzone", "<Name>ex.test</Name><CallerReference>c1</CallerReference>").unwrap();
+        let zid = first(&zxml, "Id").trim_start_matches("/hostedzone/").to_string();
+        let batch = format!(
+            "<ChangeBatch><Changes>\
+             <Change><Action>CREATE</Action><ResourceRecordSet><Name>a.ex.test</Name><Type>A</Type><TTL>60</TTL><SetIdentifier>p</SetIdentifier><Failover>PRIMARY</Failover><HealthCheckId>{hc_id}</HealthCheckId><ResourceRecords><ResourceRecord><Value>127.0.0.1</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change>\
+             <Change><Action>CREATE</Action><ResourceRecordSet><Name>a.ex.test</Name><Type>A</Type><TTL>60</TTL><SetIdentifier>s</SetIdentifier><Failover>SECONDARY</Failover><ResourceRecords><ResourceRecord><Value>127.0.0.2</Value></ResourceRecord></ResourceRecords></ResourceRecordSet></Change>\
+             </Changes></ChangeBatch>"
+        );
+        r.handle("POST", &format!("hostedzone/{zid}/rrset"), &batch).unwrap();
+
+        // Unknown/Unhealthy PRIMARY -> SECONDARY
+        assert_eq!(r.answer("a.ex.test.", "A", 0)[0].values, vec!["127.0.0.2"]);
+        // Healthy PRIMARY -> PRIMARY
+        r.checks.get_mut(&hc_id).unwrap().status = "Healthy".into();
+        assert_eq!(r.answer("a.ex.test.", "A", 0)[0].values, vec!["127.0.0.1"]);
+        // In-use delete rejected
+        assert_eq!(r.handle("DELETE", &format!("healthcheck/{hc_id}"), "").unwrap_err().code, "InvalidInput");
+        // Missing delete returns NoSuchHealthCheck
+        assert_eq!(r.handle("DELETE", "healthcheck/missing", "").unwrap_err().code, "NoSuchHealthCheck");
+    }
 }

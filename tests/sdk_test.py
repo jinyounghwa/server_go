@@ -2848,6 +2848,101 @@ def test_rds_snapshots_and_params():
 
 
 
+def test_route53_health_and_dns_tcp():
+    import socket, threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import dns.message, dns.query, dns.flags, dns.rdatatype
+    r53 = boto3.client("route53", **kw)
+    base = f"hc{run}"
+    zone = r53.create_hosted_zone(Name=f"{base}.test", CallerReference=base)["HostedZone"]["Id"]
+    DNS_PORT = int(os.environ.get("RC_DNS_PORT", "10053"))
+
+    def q(name, tcp=False, rtype=dns.rdatatype.A):
+        m = dns.message.make_query(name, rtype)
+        return (dns.query.tcp if tcp else dns.query.udp)(m, "127.0.0.1", port=DNS_PORT, timeout=5)
+
+    def hc_status(hid):
+        return r53.get_health_check_status(HealthCheckId=hid)["HealthCheckObservations"][0]["StatusReport"]["Status"]
+
+    # Local HTTP server verifying ResourcePath + TCP failover.
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200 if self.path == "/health" else 500)
+            self.end_headers()
+        def log_message(self, *a): pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    hp = srv.server_address[1]
+    th = threading.Thread(target=srv.serve_forever, daemon=True); th.start()
+    try:
+        hc = r53.create_health_check(CallerReference=base, HealthCheckConfig={
+            "Type": "HTTP", "IPAddress": "127.0.0.1", "Port": hp, "ResourcePath": "/health", "RequestInterval": 10})["HealthCheck"]["Id"]
+        assert any(h["Id"] == hc for h in r53.list_health_checks()["HealthChecks"])
+        assert r53.get_health_check(HealthCheckId=hc)["HealthCheck"]["HealthCheckConfig"]["ResourcePath"] == "/health"
+        for _ in range(30):  # poller runs every 2s
+            if hc_status(hc) == "Healthy":
+                break
+            time.sleep(0.3)
+        assert hc_status(hc) == "Healthy", hc_status(hc)
+        # External addresses and <10s interval are refused at creation (SSRF guard).
+        assert code(r53.create_health_check, CallerReference="x", HealthCheckConfig={
+            "Type": "HTTP", "IPAddress": "93.184.216.34", "Port": 80}) == "InvalidInput"
+        r53_raw = boto3.client("route53", config=Config(parameter_validation=False), **kw)
+        assert code(r53_raw.create_health_check, CallerReference="x", HealthCheckConfig={
+            "Type": "TCP", "IPAddress": "127.0.0.1", "Port": hp, "RequestInterval": 5}) == "InvalidInput"
+
+        r53.change_resource_record_sets(HostedZoneId=zone, ChangeBatch={"Changes": [
+            {"Action": "CREATE", "ResourceRecordSet": {"Name": f"app.{base}.test", "Type": "A", "TTL": 60,
+             "SetIdentifier": "primary", "Failover": "PRIMARY", "HealthCheckId": hc,
+             "ResourceRecords": [{"Value": "127.0.0.1"}]}},
+            {"Action": "CREATE", "ResourceRecordSet": {"Name": f"app.{base}.test", "Type": "A", "TTL": 60,
+             "SetIdentifier": "secondary", "Failover": "SECONDARY",
+             "ResourceRecords": [{"Value": "127.0.0.2"}]}}]})
+        # PRIMARY is healthy: UDP and TCP both answer 127.0.0.1.
+        for use_tcp in (False, True):
+            r = q(f"app.{base}.test", tcp=use_tcp)
+            ips = sorted(a.to_text() for a in r.answer[0])
+            assert ips == ["127.0.0.1"], (use_tcp, ips)
+    finally:
+        srv.shutdown(); srv.server_close()
+
+    # Server closed -> the check flips Unhealthy -> failover answers SECONDARY.
+    for _ in range(30):
+        if hc_status(hc) == "Unhealthy":
+            break
+        time.sleep(0.3)
+    assert hc_status(hc) == "Unhealthy"
+    r = q(f"app.{base}.test")
+    assert sorted(a.to_text() for a in r.answer[0]) == ["127.0.0.2"], r.answer
+    # A health check in use cannot be deleted; a record with an unknown check id is rejected.
+    assert code(r53.delete_health_check, HealthCheckId=hc) == "InvalidInput"
+    assert code(r53.change_resource_record_sets, HostedZoneId=zone, ChangeBatch={"Changes": [
+        {"Action": "UPSERT", "ResourceRecordSet": {"Name": f"bad.{base}.test", "Type": "A", "TTL": 60,
+         "SetIdentifier": "x", "HealthCheckId": "no-such-check",
+         "ResourceRecords": [{"Value": "127.0.0.1"}]}}]}) == "InvalidInput"
+
+    # Oversized UDP responses (>512B) set the TC bit; TCP carries the full answer.
+    txts = [{"Value": f'"chunk-{i:02d}-{"x" * 50}"'} for i in range(15)]
+    r53.change_resource_record_sets(HostedZoneId=zone, ChangeBatch={"Changes": [
+        {"Action": "CREATE", "ResourceRecordSet": {"Name": f"big.{base}.test", "Type": "TXT", "TTL": 60, "ResourceRecords": txts}}]})
+    ru = q(f"big.{base}.test", rtype=dns.rdatatype.TXT)
+    assert bool(ru.flags & dns.flags.TC), f"expected TC on oversized UDP reply: {ru}"
+    rt = q(f"big.{base}.test", tcp=True, rtype=dns.rdatatype.TXT)
+    assert not (rt.flags & dns.flags.TC) and len(rt.answer[0]) == 15, len(rt.answer[0])
+
+    r53.change_resource_record_sets(HostedZoneId=zone, ChangeBatch={"Changes": [
+        {"Action": "DELETE", "ResourceRecordSet": {"Name": f"big.{base}.test", "Type": "TXT", "TTL": 60, "ResourceRecords": txts}},
+        {"Action": "DELETE", "ResourceRecordSet": {"Name": f"app.{base}.test", "Type": "A", "TTL": 60, "SetIdentifier": "primary",
+         "Failover": "PRIMARY", "HealthCheckId": hc, "ResourceRecords": [{"Value": "127.0.0.1"}]}},
+        {"Action": "DELETE", "ResourceRecordSet": {"Name": f"app.{base}.test", "Type": "A", "TTL": 60, "SetIdentifier": "secondary",
+         "Failover": "SECONDARY", "ResourceRecords": [{"Value": "127.0.0.2"}]}}]})
+    r53.delete_health_check(HealthCheckId=hc)
+    assert code(r53.get_health_check, HealthCheckId=hc) == "NoSuchHealthCheck"
+    assert code(r53.delete_health_check, HealthCheckId=hc) == "NoSuchHealthCheck"
+    r53.delete_hosted_zone(Id=zone)
+
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

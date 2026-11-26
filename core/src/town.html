@@ -654,7 +654,7 @@ const B = [
   {id: "logs",     name: "CloudWatch 로그탑", sub: "Log Groups · Filter",  district: "인프라 지구", kind: "logtower",  color: 0x65a30d, hex: "#bef264", svc: ["logs"],           x: 33,  z: 10,  roadZ: 0},
   {id: "cfn",      name: "CloudFormation 현장", sub: "IaC Stacks · Rollback", district: "인프라 지구", kind: "crane",   color: 0xca8a04, hex: "#facc15", svc: ["cloudformation"], x: 43,  z: 10,  roadZ: 0},
   {id: "ecs",      name: "ECS 컨테이너항구",  sub: "Docker Tasks · Svc",   district: "항구·AI 지구", kind: "harbor",   color: 0x0284c7, hex: "#38bdf8", svc: ["ecs"],            x: 11,  z: 29,  roadZ: 20},
-  {id: "r53",      name: "Route 53 DNS등대",  sub: "Zones · UDP :10053",   district: "항구·AI 지구", kind: "lighthouse", color: 0xef4444, hex: "#fca5a5", svc: ["route53"],      x: 21,  z: 29,  roadZ: 20},
+  {id: "r53",      name: "Route 53 DNS등대",  sub: "Zones · UDP/TCP :10053", district: "항구·AI 지구", kind: "lighthouse", color: 0xef4444, hex: "#fca5a5", svc: ["route53"],      x: 21,  z: 29,  roadZ: 20},
   {id: "agent",    name: "AI 해설연구소",     sub: "Ollama · Explain/Ask", district: "항구·AI 지구", kind: "ai_lab",   color: 0x6366f1, hex: "#818cf8", svc: ["agent"],          x: 32,  z: 29,  roadZ: 20},
   {id: "insp",     name: "검사관 본부",       sub: "27 Security/Fuzz Tests", district: "항구·AI 지구", kind: "hq",     color: 0x9333ea, hex: "#c084fc", svc: ["inspector"],      x: 42,  z: 29,  roadZ: 20},
   {id: "chaos",    name: "Chaos 장애발전소",  sub: "Fault · Latency · 5xx", district: "항구·AI 지구", kind: "chaos",   color: 0xeab308, hex: "#fde047", svc: ["chaos"],          x: 51,  z: 0,   roadZ: 0},
@@ -1968,7 +1968,7 @@ const pans = [-3.4, 3.4].map(px => { const p = new THREE.Group(); p.position.x =
 pans[0].add(mkBox(1.2, 1.2, 1.2, mStd({ color: 0x3b82f6, emissive: 0x1d4ed8, emissiveIntensity: 0.3 }), 0, -1.05, 0));
 pans[1].add(mkBox(0.5, 0.5, 0.5, mStd({ color: 0x93c5fd }), 0, -1.4, 0));
 
-landmark("sdk", "SDK 호환성 경기장", "boto3 47 · JS v3 8 · Rust 7", "#fbbf24", -16, 156, "공식 SDK 3종(Python boto3 47개, JS @aws-sdk v3 8개, Rust aws-sdk 7개)으로 기본·서명 검증 두 모드를 CI가 매번 돌립니다. 전광판은 이 마을이 받은 실제 요청 수입니다.", 20, 7, 20, 7.8);
+landmark("sdk", "SDK 호환성 경기장", "boto3 48 · JS v3 8 · Rust 7", "#fbbf24", -16, 156, "공식 SDK 3종(Python boto3 48개, JS @aws-sdk v3 8개, Rust aws-sdk 7개)으로 기본·서명 검증 두 모드를 CI가 매번 돌립니다. 전광판은 이 마을이 받은 실제 요청 수입니다.", 20, 7, 20, 7.8);
 {
   const pts = [[6.2, 0], [10, 0], [10, 3.4], [9.5, 3.4], [6.2, 0.6]].map(([x, y]) => new THREE.Vector2(x, y));
   hp("matte", new THREE.LatheGeometry(pts, 48), 0xd1d5db, -16, 0.05, 156);
@@ -2140,7 +2140,7 @@ function drawHeritageScreens() {
   c = board.getContext("2d");
   c.fillStyle = "#020617"; c.fillRect(0, 0, 1024, 384);
   c.textAlign = "center"; c.fillStyle = "#fbbf24"; c.font = "800 44px system-ui, sans-serif"; c.fillText("SDK 호환성 경기장", 512, 64);
-  [["Python boto3", "43", "#60a5fa"], ["JS @aws-sdk v3", "8", "#fde047"], ["Rust aws-sdk", "7", "#fdba74"]].forEach(([n, k, col], i) => {
+  [["Python boto3", "48", "#60a5fa"], ["JS @aws-sdk v3", "8", "#fde047"], ["Rust aws-sdk", "7", "#fdba74"]].forEach(([n, k, col], i) => {
     const x = 180 + i * 332; c.fillStyle = col; c.font = "700 27px system-ui, sans-serif"; c.fillText(n, x, 130);
     c.font = "800 64px system-ui, sans-serif"; c.fillText(k + " ✓", x, 204);
   });
