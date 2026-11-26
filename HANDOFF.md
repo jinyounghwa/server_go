@@ -316,7 +316,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - 가중치 1.0을 넘으면 거부되어야 한다.
   - 별칭별 OnFailure 대상이 서로 섞이지 않아야 한다.
 
-## 16일차 (2026-12-10): ECS 롤링 배포·헬스 체크 (Docker 필요, 우분투에서만)
+## 16일차 (2026-12-10): ECS 롤링 배포·헬스 체크 (Docker 필요, 우분투에서만) — ✅ 완료 (`e8c0fff`): deploymentConfiguration 롤링(최소 건강 수 유지·surge 상한)·deployments(PRIMARY/ACTIVE)·rolloutState, healthCheck→docker --health-cmd·unhealthy 교체, 단위/boto3 테스트(49/46)·우분투 두 모드 통과·컨테이너 0개
 - **`ecs.rs` 246행:** 서비스 업데이트를 `deploymentConfiguration`(`minimumHealthyPercent`, `maximumPercent`)에 따라 단계적으로 바꾼다.
   - `deployments` 배열(PRIMARY·ACTIVE)과 `rolloutState`를 보여 준다.
 - **헬스 체크:** 컨테이너 `healthCheck.command`를 Docker `--health-cmd`로 넘긴다. unhealthy 태스크는 교체한다.
