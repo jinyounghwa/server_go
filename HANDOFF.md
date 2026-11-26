@@ -325,7 +325,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - 2개 태스크 서비스의 태스크 정의를 바꾸는 동안 실행 중인 태스크가 1개 아래로 떨어지지 않아야 한다(min 50%).
   - 실패하는 헬스 체크를 가진 태스크는 교체되어야 한다.
 
-## 17일차 (2026-12-11): RDS 스냅샷·파라미터 그룹 (Docker 필요)
+## 17일차 (2026-12-11): RDS 스냅샷·파라미터 그룹 (Docker 필요) — ✅ 완료 (`5874074`): docker commit 스냅샷·복원(데이터를 볼륨 밖 PGDATA/--datadir에 둬서 commit에 잡힘, 기본 이미지 크기 postgres 420MB·mysql 1.12GB), 파라미터 그룹 CRUD·화이트리스트·재부팅 시 재적용, 단위/boto3 테스트(49/47)·우분투 두 모드 통과·컨테이너·스냅샷 이미지 0개
 - **`managed.rs` 3행:**
   - 스냅샷: `CreateDBSnapshot`, `DescribeDBSnapshots`, `DeleteDBSnapshot`, `RestoreDBInstanceFromDBSnapshot`
   - 구현은 `docker commit`이 가장 짧다. 이미지 크기를 보고에 적는다. 스냅샷 이미지는 `rocalcloud-snap-` 접두사로 만들고, 리셋·삭제할 때 지운다.
