@@ -36,10 +36,10 @@ jobs:
           path: _site
       - id: deployment
         uses: actions/deploy-pages@v5
-      - name: Retry deployment once (artifact lookup is occasionally flaky)
-        if: failure()
-        run: |
-          sleep 30
+        continue-on-error: true # artifact lookup is occasionally flaky; retried below
+      - name: Wait for artifact visibility
+        if: steps.deployment.outcome == 'failure'
+        run: sleep 30
       - id: deployment-retry
-        if: failure()
+        if: steps.deployment.outcome == 'failure'
         uses: actions/deploy-pages@v5
