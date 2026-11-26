@@ -336,7 +336,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - `max_connections` 파라미터가 `SHOW`로 확인되어야 한다.
   - 끝나면 남은 컨테이너와 스냅샷 이미지가 0개여야 한다.
 
-## 18일차 (2026-12-12): Route53 헬스 체크·DNS TCP
+## 18일차 (2026-12-12): Route53 헬스 체크·DNS TCP — ✅ 완료 (`590ed38`): TCP/HTTP 루프백 헬스 체크(`Create/Get/List/DeleteHealthCheck`·`GetHealthCheckStatus` `StatusReport`·`ResourcePath` 반영·`serve_health` 중복 스폰 방지)·페일오버/가중치 게이트·DNS TCP(2바이트 길이) 및 UDP >512B TC 절단, 단위/boto3 테스트(50/48)·우분투 두 모드 통과·컨테이너/스냅샷 0개
 - **`route53.rs` 4행:** `CreateHealthCheck`, `GetHealthCheck`, `ListHealthChecks`, `DeleteHealthCheck`, `GetHealthCheckStatus`
   - 종류는 TCP와 HTTP이고, **대상은 루프백만 허용한다**(SSRF 방지). 주기는 10초 이상이다.
 - 페일오버와 가중치 레코드의 `HealthCheckId`를 반영한다. PRIMARY가 unhealthy면 SECONDARY로 답한다.
