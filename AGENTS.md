@@ -30,6 +30,7 @@
 - 2026-11-25 추가19: CloudFormation 제자리 업데이트·Export — 속성 변화가 타입별 in-place 목록(SQS 큐 속성·Lambda 환경/메모리/타임아웃/설명·SNS DisplayName·DDB 처리량, `UpdateTable` 신규)에 있으면 같은 물리 ID로 업데이트(이벤트 UPDATE_IN_PROGRESS/COMPLETE), 아니면 기존처럼 교체. `Outputs.Export.Name` → `ListExports`(이름 정렬)·`ListImports`·`Fn::ImportValue`(배포된 스택의 export에서 해석), import하는 스택이 있으면 export 스택 삭제·값 변경 거부. 단위 테스트 48개, boto3 테스트 43개.
 - 2026-11-25 추가20: 검증 에이전트 시나리오 6개 추가(21→27: 보안 4종 `sec-clock-skew`·`sec-sts-expired`·`sec-strict-delivery`·`sec-jwt-bypass`, 사고 2종 `inc-lambda-dest`·`inc-events-dlq`, `poll_sqs_body`·`xml_tag` 리팩토링), JS v3(5→8)·Rust SDK(4→7) 스위트 확장(FIFO·고정밀 숫자 키·중첩 경로·IAM 조건/버킷 정책·S3 페이지네이션), 연대기 섬 숫자 동기화.
 - `v0.1.0` 릴리스 완료(2026-11-21): 바이너리 3종 + SHA256SUMS, Homebrew sha256 반영.
+- `v0.1.6` 릴리스 준비(2026-11-26, 13일차): 8~12일차 기능 포함 — API Gateway CORS·HTTP_PROXY(루프백)·스테이지 변수·PATCH/PUT UpdateApi, Cognito 그룹·Lambda 트리거(PreSignUp/PostConfirmation/PreTokenGeneration), Kinesis 보존기간·UpdateShardCount, S3 목록 경계, CloudFormation 제자리 업데이트·Export/ImportValue, 검사관 시나리오 27개, JS(8)·Rust(7) SDK 스위트 확장. Pages 배포 재시도 스텝 추가. 태그 푸시는 사용자 승인 대기.
 - `v0.1.5` 릴리스(2026-11-25): EventBridge `cron()`·InputTransformer, Kinesis→Lambda 매핑, DynamoDB 중첩 경로, Lambda 버전·별칭, IAM 조건 연산자(Numeric·Date·IpAddress·한정자), `STRICT_DELIVERY=1`, SNS 필터 numeric·suffix, SigV4 시계 오차, STS 만료, Kinesis 리샤딩, S3 알림 대상 검증, Route53 라우팅 정책, Logs 필터 패턴. 우분투 전체 검증(스위트 두 모드) 통과 뒤 태그. Homebrew는 태그 뒤 반영.
 - `v0.1.4` 릴리스(2026-11-22): ALB 요청별 규칙 라우팅, aws-chunked 트레일러 서명 검증, SNS·EventBridge·S3 배달의 대상 정책 판정(서비스 주체). Homebrew 0.1.4.
 - `v0.1.3` 릴리스 완료(2026-11-21): SNS·Lambda 리소스 정책, ALB 리스너 규칙, aws-chunked 서명 검증. release.yml도 Node 24 액션으로. Homebrew 0.1.3.
@@ -131,8 +132,8 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
   `VERIFY_SIGV4=1`이면 서명 없는 요청도 루트로 서명한다. 서명 없이 보내야 하는 검사는 `x-rc-unsigned` 헤더를 단다.
 - 새 시나리오: `sc_x()` 함수 → `run_inner()`의 `plan` 목록과 `match id`에 추가 → `make_result()`로 결과.
 
-## 7. 다음에 할 일 (2026-11-23 기준, 우선순위 순)
-계획서 4장 체크리스트는 전부 완료, 최신 릴리스는 `v0.1.4`(Homebrew 반영). 지난 할 일 목록(v0.1.1~v0.1.4 릴리스, 버킷·큐·토픽·함수 정책,
+## 7. 다음에 할 일 (2026-11-26 기준, 우선순위 순)
+최신 태그는 `v0.1.4`, `v0.1.6` 릴리스 준비 완료(태그 푸시는 사용자 승인 대기, v0.1.5는 태그 없이 건너뜀). 13일 연속 계획(HANDOFF.md 1~13일차) 완료, 14~23일차 계획이 이어진다. 지난 할 일 목록(v0.1.1~v0.1.4 릴리스, 버킷·큐·토픽·함수 정책,
 SQS 메시지 속성, Step Functions 동시 실행·실패 중단, ALB 경로·호스트 규칙(요청별), aws-chunked 조각·트레일러 서명, 서비스 주체 배달 정책,
 3D 마을 브라우저·휴대폰 점검)은 모두 끝났다. 남은 한계는 각 파일의 `ponytail:` 주석(`grep -rn ponytail core/src`)이 목록이다.
 
@@ -145,6 +146,7 @@ SQS 메시지 속성, Step Functions 동시 실행·실패 중단, ALB 경로·�
 6. ~~IAM 조건 연산자~~ 완료(2026-11-23): `cond_ok`에 Numeric*·Date*·IpAddress/NotIpAddress(IPv4·IPv6 CIDR)·ForAnyValue/ForAllValues 추가, 요청 컨텍스트에 `aws:SourceIp`(피어 IP, `authorize_ip` 체인)·`aws:EpochTime`·`aws:CurrentTime`. 남은 한계: 컨텍스트 키가 단일 값(다중 값 집합 시맨틱 불가), Date는 에포크·RFC 3339·`YYYY-MM-DD`만, IPv6 존 인덱스 미지원.
 7. ~~(선택) 배달 정책을 AWS처럼 엄격하게~~ 완료(2026-11-23): `STRICT_DELIVERY=1` 스위치(`service_may` 6번째 인자, `service_gate`에서 전달). 정책 없는 대상은 403 배달 거부. 기본값은 종전처럼 관대.
 8. (선택) `?api=`로 IPv6 `[::1]`: CSP가 IPv6 리터럴을 못 받으므로 요청이 있을 때만.
+9. 14일차(2026-12-08)부터 HANDOFF.md의 Step Functions 작업 토큰·타임아웃 등 10일 계획을 따른다.
 
 각 항목은 sdk_test.py에 정상·오류 경로 테스트를 같이 넣고, 끝나면 마을(`town.html`)·GUI·문서를 같이 갱신한다.
 큰 변경 뒤에는 4절 방법으로 우분투 전체 검증을 돌린다.
@@ -154,4 +156,4 @@ SQS 메시지 속성, Step Functions 동시 실행·실패 중단, ALB 경로·�
 aws-chunked 조각 서명·트레일러 서명 검증, 트레일러 체크섬 값 자체는 다시 계산하지 않음), 리소스 기반 정책은 S3 버킷·SQS 큐·SNS 토픽·Lambda 함수(AddPermission)를 평가, SNS·EventBridge·S3의 배달도 `ENFORCE_IAM=1`이면 대상 정책을 서비스 주체(`sns.amazonaws.com` 등)와 `aws:SourceArn`으로 판정(대상에 정책이 없으면 기본 허용, `STRICT_DELIVERY=1`이면 AWS처럼 거부), KMS는 진짜 암호 아님,
 IAM 조건 연산자는 String·Arn·Bool·Numeric·Date·IpAddress(+IfExists, ForAnyValue/ForAllValues)를 지원하지만 컨텍스트 키가 단일 값이라 다중 값 집합 시맨틱은 없음,
 ALB 리스너 규칙(path-pattern·host-header)은 요청마다 고르되 규칙이 있는 리스너는 `Connection: close`로 요청당 연결 하나, Query 프로토콜 구버전 SQS 미지원,
-ECS 태스크가 에뮬레이터를 부르려면 `BIND=0.0.0.0:4566` 필요. Lambda 비동기 호출 대상 설정은 함수 단위(버전·별칙별 아님), Kinesis 매핑의 OnFailure 메시지는 배치 메타데이터(레코드 복제 아님). 세부는 각 파일의 `ponytail:` 주석.
+ECS 태스크가 에뮬레이터를 부르려면 `BIND=0.0.0.0:4566` 필요, CloudFormation 교체 대상 자원의 롤백은 미지원(in-place 속성 업데이트·Export 가드는 지원). Lambda 비동기 호출 대상 설정은 함수 단위(버전·별칙별 아님), Kinesis 매핑의 OnFailure 메시지는 배치 메타데이터(레코드 복제 아님). 세부는 각 파일의 `ponytail:` 주석.
