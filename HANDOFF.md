@@ -294,7 +294,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
 
 ---
 
-## 14일차 (2026-12-08): Step Functions 작업 토큰·타임아웃
+## 14일차 (2026-12-08): Step Functions 작업 토큰·타임아웃 — ✅ 완료 (`d932454`): `.waitForTaskToken`·SendTaskSuccess/Failure/Heartbeat·TaskDoesNotExist/TaskTimedOut, TimeoutSeconds(기본 60초)·HeartbeatSeconds → States.Timeout→Retry/Catch, 단위/boto3 테스트(49/44)·우분투 두 모드 통과
 - **`sfn.rs` 4행:** `.waitForTaskToken` 통합을 넣는다.
   - `$.Task.Token`을 Parameters로 넘기고, 실행은 토큰이 돌아올 때까지 멈춘다. 대상은 SQS `sendMessage`, SNS `publish`, Lambda `invoke`다.
   - 토큰을 돌려주는 연산은 `SendTaskSuccess`, `SendTaskFailure`, `SendTaskHeartbeat`다.
