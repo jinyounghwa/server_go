@@ -19,7 +19,7 @@ jobs:
   deploy:
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: ${{ steps.deployment-retry.outputs.page_url || steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -35,4 +35,11 @@ jobs:
         with:
           path: _site
       - id: deployment
+        uses: actions/deploy-pages@v5
+      - name: Retry deployment once (artifact lookup is occasionally flaky)
+        if: failure()
+        run: |
+          sleep 30
+      - id: deployment-retry
+        if: failure()
         uses: actions/deploy-pages@v5
