@@ -397,7 +397,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - `GetObjectAttributes`의 Checksum이 맞아야 한다.
   - 두 모드에서 모두 통과해야 한다. VERIFY_SIGV4 모드에서는 트레일러 경로를 탄다.
 
-## 23일차 (2026-12-17): v0.1.7 릴리스 + 다음 10일 계획 — ✅ 완료·태그 대기 (`893506b`): Cargo 0.1.7·`town.html` 동기화(v0.1.0~v0.1.7, boto3 52)·AGENTS 1/2/7/8절 갱신, 우분투 전체 검증(단위 51·boto3 52 두 모드·JS 8·Rust 7·컨테이너/스냅샷 0개), Playwright 라이브 Pages 점검(HTTP 200·에러 0건). **태그 푸시(v0.1.5/v0.1.6/v0.1.7 정리 포함)는 사용자 승인 대기**
+## 23일차 (2026-12-17): v0.1.7 릴리스 + 다음 10일 계획 — ✅ 완료 (`16f3202`): 우분투 전체 검증 ALL PASSED(단위 51·경고 0·JS 스위트·두 모드·부분 실패·메모리 +1.19MiB·SQLite·컨테이너 0개), v0.1.7 준비(Cargo·town.html·AGENTS 1/7/8), Playwright 점검 0 에러. 태그 푸시는 계속 사용자 승인 대기 — ✅ 완료·태그 대기 (`893506b`): Cargo 0.1.7·`town.html` 동기화(v0.1.0~v0.1.7, boto3 52)·AGENTS 1/2/7/8절 갱신, 우분투 전체 검증(단위 51·boto3 52 두 모드·JS 8·Rust 7·컨테이너/스냅샷 0개), Playwright 라이브 Pages 점검(HTTP 200·에러 0건). **태그 푸시(v0.1.5/v0.1.6/v0.1.7 정리 포함)는 사용자 승인 대기**
 - 우분투 전체 검증을 돌린다(두 모드, JS·Rust 스위트, `ubuntu_verify.sh`, 컨테이너 0개, 스냅샷 이미지 0개).
 - v0.1.7을 준비한다. 절차는 1일차 1-2와 같다.
   - **태그 푸시는 사용자 승인을 받은 뒤에만 한다.**
