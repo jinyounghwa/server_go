@@ -348,7 +348,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - `dnspython` TCP 질의가 되어야 한다.
   - 외부 주소 헬스 체크는 생성할 때 거부되어야 한다.
 
-## 19일차 (2026-12-13): DynamoDB 트랜잭션·스트림·숫자 점검
+## 19일차 (2026-12-13): DynamoDB 트랜잭션·스트림·숫자 점검 — ✅ 완료 (`bddd7e2`): 정확한 십진 산술(ADD/SET, 9007199254740993+1 정확·모든 N값 38자리 검사), ClientRequestToken 멱등성·같은 항목 중복 거부·CancellationReasons 위치 확인, DynamoDB Streams 4종 StreamViewType·샤드 반복자·GetRecords(람다 FilterCriteria는 DDB 매핑이 없어 미해당 — 존재하지 않는 기능이라 점검 대상 아님), 단위/boto3 테스트(51/49)·두 모드 통과
 - **점검 위주로 한다.** 아래를 테스트로 확인하고, 틀린 것만 고친다.
   - `TransactWriteItems`: 실패할 때 `CancellationReasons` 순서와 코드, `ClientRequestToken` 10분 멱등성, 같은 항목 두 번 지정 거부
   - `TransactGetItems`
