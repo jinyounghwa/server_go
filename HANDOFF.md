@@ -435,7 +435,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - 없는 레이어 ARN은 거부되어야 한다.
   - 경로 탈출 zip은 거부되어야 한다.
 
-## 26일차 (2026-12-20): Lambda 웜 실행 (상주 프로세스)
+## 26일차 (2026-12-20): Lambda 웜 실행 (상주 프로세스) — ✅ 완료 (`185f13b`): 함수·버전·수정시각 키의 상주 프로세스 재사용(전역 변수 유지·동시 호출은 풀), stdin/fd1 한 줄 JSON 프로토콜+로그는 결과의 logs 배열(경합 제거, print 조각은 버퍼로 병합), `x-rc-cold-start`·Init Duration 첫 호출만, 유휴 5분 스윕+30초 리퍼, 설정 변경·exit()·타임아웃 교체, 셧다운 잔여 0(`pgrep -f rocalcloud-lambda-warm`), 단위/boto3(52/54)·두 모드 통과
 - **`lambda.rs` 3행 "no warm containers":** 호출마다 인터프리터를 새로 띄우지 않고, 함수·버전별 상주 프로세스 하나를 재사용한다.
   - 프로세스와 줄 단위 JSON으로 주고받는 작은 부트스트랩 스크립트를 런타임별로 하나씩 둔다.
 - 유휴 5분 뒤 종료한다. 코드·설정·환경 변수가 바뀌면 바로 교체한다. 동시 실행 한도(8개, `lambda.rs` 17행)를 그대로 지킨다.
