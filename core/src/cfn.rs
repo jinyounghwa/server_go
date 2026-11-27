@@ -1,7 +1,7 @@
 // CloudFormation (Query): JSON/YAML templates (short tags included), parameters, conditions, mappings, intrinsic
 // functions, dependency ordering, outputs, create/update/delete with rollback. Resources are created by calling the
 // emulator's own services.
-// ponytail: no nested stacks, change sets, macros/transforms (SAM), custom resources, exports/imports or drift.
+// ponytail: no nested stacks, change sets, macros/transforms (SAM), custom resources or drift.
 use crate::{err, ApiErr, App, ACCOUNT, REGION};
 use axum::http::{HeaderMap, Method, Uri};
 use serde_json::{json, Map, Value};

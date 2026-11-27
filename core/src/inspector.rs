@@ -1116,14 +1116,6 @@ async fn poll_sqs_body(q_url: &str, max_tries: usize) -> Option<String> {
     None
 }
 
-// Extract the text inside `<tag>...</tag>` from an XML response.
-fn xml_tag(body: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let rest = body.split_once(&open)?.1;
-    Some(rest.split_once(&close)?.0.to_string())
-}
-
 // Security: stale x-amz-date (>15 min clock skew) must be rejected with RequestTimeTooSkewed under VERIFY_SIGV4=1.
 async fn sc_clock_skew() -> Value {
     let t0 = Instant::now();
@@ -1166,7 +1158,7 @@ async fn sc_sts_expired(tag: &str) -> Value {
     let _ = call_query("iam", "2010-05-08", "CreateRole", &[("RoleName", &role), ("AssumeRolePolicyDocument", &trust)], Some("test")).await;
     let rarn = format!("arn:aws:iam::{ACCOUNT}:role/{role}");
     let ar = call_query("sts", "2011-06-15", "AssumeRole", &[("RoleArn", &rarn), ("RoleSessionName", "insp"), ("DurationSeconds", "-1")], Some("test")).await;
-    let akid = ar.as_ref().ok().and_then(|r| xml_tag(&r.body, "AccessKeyId")).unwrap_or_default();
+    let akid = ar.as_ref().ok().and_then(|r| s3::tag(&r.body, "AccessKeyId")).unwrap_or_default();
     let probe = if akid.is_empty() {
         Err("AssumeRole 임시 키 발급 실패".into())
     } else {
@@ -1197,7 +1189,7 @@ async fn sc_strict_delivery(tag: &str) -> Value {
     let q_url = q_r.as_ref().ok().and_then(|r| serde_json::from_str::<Value>(&r.body).ok()).and_then(|v| v["QueueUrl"].as_str().map(String::from)).unwrap_or_default();
     let q_arn = format!("arn:aws:sqs:{}:{ACCOUNT}:{q_name}", *REGION);
     let t_r = call_query("sns", "2010-03-31", "CreateTopic", &[("Name", &t_name)], Some("test")).await;
-    let t_arn = t_r.as_ref().ok().and_then(|r| xml_tag(&r.body, "TopicArn")).unwrap_or_default();
+    let t_arn = t_r.as_ref().ok().and_then(|r| s3::tag(&r.body, "TopicArn")).unwrap_or_default();
     if !*crate::STRICT {
         // Default permissive mode allows policy-less targets, so attach an explicit Deny queue policy.
         let pol = json!({"Version": "2012-10-17", "Statement": [{"Effect": "Deny", "Principal": {"Service": "sns.amazonaws.com"}, "Action": "sqs:SendMessage", "Resource": q_arn}]}).to_string();

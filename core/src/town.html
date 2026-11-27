@@ -1909,7 +1909,7 @@ const STAGES = [
   ["6", "GUI", "탐색기·로그·설정", "Tauri 창 + /_ui: 리소스 탐색기, 실시간 로그, IAM·VPC 시각화, 스냅샷, 장애·설정 화면"],
   ["7", "3D 마을", "SSE·애니메이션·Pages", "/_town 3D 도시, 요청마다 밴·드론·정문 경비, 결과 기호, GitHub Pages에서 로컬 에뮬레이터에 연결"],
   ["8", "LLM 해설", "Ollama·도구 4개", "우분투 Ollama qwen3.5:9b, 스키마 제한 출력, 도구 4개, LLM 없을 때 규칙 기반 설명, 파괴 작업 확인 토큰"],
-  ["9", "품질·릴리스", "SDK 3종·v0.1.6", "boto3·JS v3·Rust SDK 스위트, 퍼징·벤치, 보안 강화, 바이너리 3종·Homebrew·Dockerfile, v0.1.0~v0.1.6"],
+  ["9", "품질·릴리스", "SDK 3종·v0.1.7", "boto3·JS v3·Rust SDK 스위트, 퍼징·벤치, 보안 강화, 바이너리 3종·Homebrew·Dockerfile, v0.1.0~v0.1.7"],
   ["10", "검증 에이전트", "시나리오 27·재생", "보안 12·장애 6·사고 6·성능 2·퍼징 1, SDK 응답 대조, 회귀 재생, 127.0.0.1 전용 결정적 실행기"],
 ];
 {
@@ -1988,7 +1988,7 @@ const boardMesh = new THREE.Mesh(new THREE.PlaneGeometry(8.4, 3.15), boardMat);
 boardMesh.position.set(-16, 6.6, 144.9); boardMesh.rotation.y = Math.PI; scene.add(boardMesh);
 hp("matte", Bx(8.8, 3.5, 0.3), 0x0f172a, -16, 6.6, 145.1);
 
-landmark("rocket", "v0.1.6 발사대", "CI · Release · SHA256SUMS", "#f472b6", 12, 154, "GitHub Actions가 태그마다 리눅스·맥 바이너리 3종과 SHA256SUMS를 만들어 릴리스합니다. 로켓이 주기적으로 발사됩니다.", 9, 14, 9, 13);
+landmark("rocket", "v0.1.7 발사대", "CI · Release · SHA256SUMS", "#f472b6", 12, 154, "GitHub Actions가 태그마다 리눅스·맥 바이너리 3종과 SHA256SUMS를 만들어 릴리스합니다. 로켓이 주기적으로 발사됩니다.", 9, 14, 9, 13);
 hp("matte", Cy(3.4, 3.8, 0.9, 32), 0x9ca3af, 12, 0.45, 154);
 for (const [gx, gz] of [[2.6, -0.8], [4.0, -0.8], [2.6, 0.8], [4.0, 0.8]]) hp("metal", Bx(0.25, 12, 0.25), 0xb91c1c, 12 + gx, 6.4, 154 + gz);
 for (let k = 1; k <= 5; k++) hp("metal", Bx(1.7, 0.18, 1.85), 0xb91c1c, 15.3, k * 2.3, 154);
@@ -2140,7 +2140,7 @@ function drawHeritageScreens() {
   c = board.getContext("2d");
   c.fillStyle = "#020617"; c.fillRect(0, 0, 1024, 384);
   c.textAlign = "center"; c.fillStyle = "#fbbf24"; c.font = "800 44px system-ui, sans-serif"; c.fillText("SDK 호환성 경기장", 512, 64);
-  [["Python boto3", "48", "#60a5fa"], ["JS @aws-sdk v3", "8", "#fde047"], ["Rust aws-sdk", "7", "#fdba74"]].forEach(([n, k, col], i) => {
+  [["Python boto3", "52", "#60a5fa"], ["JS @aws-sdk v3", "8", "#fde047"], ["Rust aws-sdk", "7", "#fdba74"]].forEach(([n, k, col], i) => {
     const x = 180 + i * 332; c.fillStyle = col; c.font = "700 27px system-ui, sans-serif"; c.fillText(n, x, 130);
     c.font = "800 64px system-ui, sans-serif"; c.fillText(k + " ✓", x, 204);
   });

@@ -115,6 +115,9 @@ pub fn pct_decode(s: &str) -> String {
 }
 
 // ponytail: string-scanning XML reader; enough for DeleteObjects / CompleteMultipartUpload bodies.
+pub(crate) fn tag(x: &str, t: &str) -> Option<String> {
+    tags(x, t).into_iter().next()
+}
 pub(crate) fn tags(x: &str, tag: &str) -> Vec<String> {
     let (o, c) = (format!("<{tag}>"), format!("</{tag}>"));
     x.split(o.as_str()).skip(1).filter_map(|s| s.split_once(c.as_str()).map(|(v, _)| unesc(v))).collect()

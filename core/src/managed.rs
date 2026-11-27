@@ -1,6 +1,6 @@
 // RDS (Postgres/MySQL/MariaDB) and ElastiCache (Redis/Valkey/Memcached) backed by real Docker containers.
 // Containers publish on 127.0.0.1 only and are capped (RC_CONTAINER_MEMORY, default 512m; 1 CPU).
-// ponytail: single-node only — no Aurora clusters, replicas, replication groups, snapshots or parameter groups.
+// ponytail: single-node only — no Aurora clusters, replicas or replication groups.
 use crate::{err, ApiErr, App, ACCOUNT, REGION};
 use serde_json::{json, Value};
 use std::{collections::{BTreeMap, HashMap}, sync::Arc, time::Duration};

@@ -1,6 +1,6 @@
 // Lambda (REST-JSON). Functions run as local processes (python3 / node) per invocation.
 // Versions (PublishVersion snapshots config + code) and aliases resolve "fn:qualifier" / ?Qualifier= on Invoke and Get*.
-// ponytail: no warm containers, layers, weighted alias routing, or container images; the host interpreter is used
+// ponytail: no warm containers, layers, or container images; the host interpreter is used
 // regardless of the runtime's minor version. Add a container runner when isolation matters.
 use crate::{b64, err, now_ms, unb64, ApiErr, App, ACCOUNT, REGION};
 use axum::{body::Body, http::HeaderMap, response::Response};
