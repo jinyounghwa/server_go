@@ -3061,6 +3061,96 @@ def test_ddb_transactions_streams_numbers():
 
 
 
+REST_FN = """
+import json
+def h(event, ctx):
+    return {"statusCode": 200, "headers": {"content-type": "application/json"},
+            "body": json.dumps({"resource": event.get("resource"), "httpMethod": event.get("httpMethod"),
+                                 "stage": event.get("requestContext", {}).get("stage"),
+                                 "pathParameters": event.get("pathParameters", {}),
+                                 "query": event.get("queryStringParameters", {}),
+                                 "body": event.get("body", "")})}
+"""
+
+
+def test_apigateway_rest_v1():
+    import urllib.request, urllib.error
+    ag = boto3.client("apigateway", **kw)
+    lam = boto3.client("lambda", **kw)
+    fn = f"rfn{run}"
+    lam.create_function(FunctionName=fn, Runtime="python3.12", Role="arn:aws:iam::000000000000:role/x", Handler="app.h",
+                        Code={"ZipFile": zipped({"app.py": REST_FN})})
+    lam.get_waiter("function_active_v2").wait(FunctionName=fn)
+
+    def call(m, path, data=None):
+        req = urllib.request.Request(f"http://127.0.0.1:4566{path}", data=data, method=m)
+        try:
+            r = urllib.request.urlopen(req, timeout=30)
+            return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    api = ag.create_rest_api(name=f"rest{run}")["id"]
+    root = ag.get_rest_api(restApiId=api)["rootResourceId"]
+    res = ag.create_resource(restApiId=api, parentId=root, pathPart="items")["id"]
+    var = ag.create_resource(restApiId=api, parentId=res, pathPart="{id}")["id"]
+    uri = f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:{fn}/invocations"
+    ag.put_method(restApiId=api, resourceId=var, httpMethod="GET", authorizationType="NONE")
+    ag.put_integration(restApiId=api, resourceId=var, httpMethod="GET", type="AWS_PROXY", uri=uri)
+    ag.put_method(restApiId=api, resourceId=res, httpMethod="GET", authorizationType="NONE")
+    ag.put_integration(restApiId=api, resourceId=res, httpMethod="GET", type="MOCK")
+    dep = ag.create_deployment(restApiId=api)["id"]
+    ag.create_stage(restApiId=api, stageName="prod", deploymentId=dep)
+
+    # v1 proxy event shape and path/query parameters
+    st, out = call("GET", f"/_restapi/{api}/prod/items/42?x=1")
+    assert st == 200, (st, out)
+    body = json.loads(out)
+    assert body["resource"] == "/items/{id}" and body["httpMethod"] == "GET" and body["stage"] == "prod", body
+    assert body["pathParameters"] == {"id": "42"} and body["query"] == {"x": "1"}, body
+
+    # MOCK answers a fixed 200 with an empty body
+    st, out = call("GET", f"/_restapi/{api}/prod/items")
+    assert st == 200 and out == b"", (st, out)
+
+    # a deployment is a real snapshot: post-deploy changes stay invisible until the next deployment
+    ag.put_integration(restApiId=api, resourceId=res, httpMethod="GET", type="AWS_PROXY", uri=uri)
+    st, out = call("GET", f"/_restapi/{api}/prod/items")
+    assert st == 200 and out == b"", "pre-deploy edit must not leak into the stage"
+    dep2 = ag.create_deployment(restApiId=api)["id"]
+    ag.create_stage(restApiId=api, stageName="v2", deploymentId=dep2)
+    st, out = call("GET", f"/_restapi/{api}/v2/items?x=9")
+    assert st == 200 and json.loads(out)["resource"] == "/items", (st, out)
+
+    # unmatched route is v1's 403 "Missing Authentication Token"
+    st, out = call("GET", f"/_restapi/{api}/prod/nope")
+    assert st == 403 and b"Missing Authentication Token" in out, (st, out)
+
+    # validation: AWS/HTTP integrations and VTL templates are refused, not faked
+    assert code(ag.put_integration, restApiId=api, resourceId=var, httpMethod="GET", type="AWS", uri=uri) == "BadRequestException"
+    assert code(ag.put_integration, restApiId=api, resourceId=var, httpMethod="GET", type="HTTP", uri="http://127.0.0.1:1/") == "BadRequestException"
+    assert code(ag.put_integration, restApiId=api, resourceId=var, httpMethod="GET", type="AWS_PROXY", uri=uri,
+                requestTemplates={"application/json": "{}"}) == "BadRequestException"
+    assert code(ag.put_method, restApiId=api, resourceId=var, httpMethod="GET", authorizationType="CUSTOM") == "BadRequestException"
+
+    # resource tree, method/integration getters, deletes
+    rs = {r["path"]: r for r in ag.get_resources(restApiId=api)["items"]}
+    assert set(rs) >= {"/", "/items", "/items/{id}"}, set(rs)
+    assert rs["/items/{id}"]["resourceMethods"]["GET"]["authorizationType"] == "NONE"
+    assert ag.get_method(restApiId=api, resourceId=var, httpMethod="GET")["methodIntegration"]["type"] == "AWS_PROXY"
+    ag.delete_integration(restApiId=api, resourceId=var, httpMethod="GET")
+    ag.delete_method(restApiId=api, resourceId=var, httpMethod="GET")
+    assert code(ag.get_method, restApiId=api, resourceId=var, httpMethod="GET") == "NotFoundException"
+    ag.delete_stage(restApiId=api, stageName="prod")
+    ag.delete_stage(restApiId=api, stageName="v2")
+    ag.delete_resource(restApiId=api, resourceId=var)
+    ag.delete_resource(restApiId=api, resourceId=res)
+    ag.delete_rest_api(restApiId=api)
+    assert code(ag.get_rest_api, restApiId=api) == "NotFoundException"
+    lam.delete_function(FunctionName=fn)
+
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

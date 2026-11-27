@@ -1,7 +1,11 @@
 // API Gateway HTTP APIs (apigatewayv2, REST-JSON) with Lambda proxy integrations, JWT/Lambda authorizers,
 // CORS configuration and HTTP_PROXY integrations (loopback targets only).
 // Invoke URL: {endpoint}/_api/{apiId}/[{stage}/]path
-// ponytail: REST APIs (v1) are not emulated; HTTP_PROXY forwards method/path/query/headers and reads the reply
+// REST APIs (v1): resources/methods/integrations under /restapis, invoke URL /_restapi/{apiId}/{stage}/path.
+// Unlike HTTP APIs (deploy is a no-op), a v1 CreateDeployment snapshots the resource tree; a stage serves
+// that snapshot, so post-deploy edits stay invisible until the next deployment.
+// ponytail: v1 has no mapping templates (VTL) and no AWS (non-proxy) or HTTP integrations - rejected, not faked;
+// HTTP_PROXY forwards method/path/query/headers and reads the reply
 // to connection close (no chunked decoding, 5s timeout); stage variables are substituted in integration URIs only.
 use crate::{err, ApiErr, App};
 use serde_json::{json, Map, Value};
@@ -108,10 +112,91 @@ struct Api {
 #[derive(Default)]
 pub struct ApiGw {
     apis: BTreeMap<String, Api>,
+    rests: BTreeMap<String, RestApi>,
+}
+
+// ---------- REST APIs (v1) ----------
+#[derive(Clone)]
+struct Res1 {
+    id: String,
+    parent: String, // "" for the root
+    part: String,   // pathPart; "" for the root
+    methods: BTreeMap<String, Method1>,
+}
+#[derive(Clone)]
+struct Method1 {
+    auth: String,                       // NONE | AWS_IAM (authorization is day 21)
+    #[allow(dead_code)] // enforced from day 21 (authorizers)
+    params: BTreeMap<String, bool>,     // requestParameters -> required
+    integration: Option<Integ1>,
+    responses: BTreeMap<String, Value>, // method responses, keyed by status code
+    integ_responses: BTreeMap<String, Value>,
+}
+#[derive(Clone)]
+struct Integ1 {
+    ty: String,  // AWS_PROXY | MOCK
+    uri: String, // Lambda function ARN (parsed out of the apigateway URI)
+}
+struct RestApi {
+    name: String,
+    resources: BTreeMap<String, Res1>,
+    deployments: BTreeMap<String, BTreeMap<String, Res1>>, // deploymentId -> snapshot
+    stages: BTreeMap<String, String>,                      // stage -> deploymentId
 }
 
 fn short_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..10].to_string()
+}
+
+// ---------- REST v1 helpers ----------
+fn root_of(ra: &RestApi) -> String {
+    ra.resources.values().find(|r| r.parent.is_empty()).map(|r| r.id.clone()).unwrap_or_default()
+}
+fn res1_path(resources: &BTreeMap<String, Res1>, rid: &str) -> String {
+    let mut parts = vec![];
+    let mut cur = rid;
+    while let Some(r) = resources.get(cur) {
+        if !r.part.is_empty() {
+            parts.push(r.part.clone());
+        }
+        cur = &r.parent;
+    }
+    if parts.is_empty() {
+        "/".into()
+    } else {
+        format!("/{}", parts.iter().rev().cloned().collect::<Vec<_>>().join("/"))
+    }
+}
+fn res1_path_snap(snap: &BTreeMap<String, Res1>, rid: &str) -> String {
+    res1_path(snap, rid)
+}
+fn res1_json(ra: &RestApi, r: &Res1) -> Value {
+    let mut out = json!({"id": r.id, "parentId": if r.parent.is_empty() { Value::Null } else { json!(r.parent) }, "path": res1_path(&ra.resources, &r.id)});
+    if !r.part.is_empty() {
+        out["pathPart"] = r.part.clone().into();
+    }
+    if !r.methods.is_empty() {
+        let mut m = Map::new();
+        for (k, v) in &r.methods {
+            m.insert(k.clone(), json!({"httpMethod": k, "authorizationType": v.auth}));
+        }
+        out["resourceMethods"] = m.into();
+    }
+    out
+}
+fn method1_json(m: &str, md: &Method1) -> Value {
+    let mut out = json!({"httpMethod": m, "authorizationType": md.auth, "apiKeyRequired": false});
+    if let Some(i) = &md.integration {
+        out["methodIntegration"] = integ1_json(i);
+    }
+    if !md.responses.is_empty() {
+        out["methodResponses"] = md.responses.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Map<String, Value>>().into();
+    }
+    out
+}
+fn integ1_json(i: &Integ1) -> Value {
+    json!({"type": i.ty, "httpMethod": "POST", "uri": i.uri, "integrationResponses": {"200": {"statusCode": "200"}},
+        "requestTemplates": {}, "passthroughBehavior": "WHEN_NO_MATCH", "cacheNamespace": short_id(), "timeoutInMillis": 29000})
 }
 fn nf(what: &str) -> ApiErr {
     ApiErr { status: 404, ..err("NotFoundException", format!("Invalid {what} identifier specified")) }
@@ -592,8 +677,214 @@ impl ApiGw {
         })
     }
 
+    // REST v1 control plane. `path` is what follows /restapis.
+    pub fn handle_rest(&mut self, method: &str, path: &str, b: &Value) -> Result<(u16, Value), ApiErr> {
+        let p: Vec<&str> = path.trim_matches('/').split('/').filter(|x| !x.is_empty()).collect();
+        let strv = |k: &str| b[k].as_str().map(String::from);
+        let bad = |m: &str| err("BadRequestException", m);
+        // POST /restapis creates an API; everything else needs an API id first.
+        if method == "POST" && p.is_empty() {
+            let name = strv("name").ok_or_else(|| bad("name is required"))?;
+            let id = short_id();
+            let root = format!("r{}", short_id());
+            let mut resources = BTreeMap::new();
+            resources.insert(root.clone(), Res1 { id: root.clone(), parent: String::new(), part: String::new(), methods: BTreeMap::new() });
+            let r = RestApi { name, resources, deployments: BTreeMap::new(), stages: BTreeMap::new() };
+            let out = json!({"id": id, "name": r.name, "createdDate": chrono::Utc::now().to_rfc3339(),
+                "endpointConfiguration": {"types": ["REGIONAL"]}, "rootResourceId": root, "tags": {}});
+            self.rests.insert(id, r);
+            return Ok((201, out));
+        }
+        let api = p.first().copied().ok_or_else(|| nf("API")).map(|x| x.to_string())?;
+        let rest: Vec<&str> = p[1..].to_vec();
+        let ra = self.rests.get_mut(&api).ok_or_else(|| nf("API"))?;
+        Ok(match (method, rest.as_slice()) {
+            ("GET", []) => (200, json!({"id": api, "name": ra.name, "createdDate": chrono::Utc::now().to_rfc3339(),
+                "endpointConfiguration": {"types": ["REGIONAL"]}, "rootResourceId": root_of(ra)})),
+            ("DELETE", []) => {
+                self.rests.remove(&api);
+                (200, json!({"id": api}))
+            }
+            // the wire name is "item" (the shape's serialization name), not "items"
+            ("GET", ["resources"]) => (200, json!({"item": ra.resources.values().map(|r| res1_json(ra, r)).collect::<Vec<_>>()})),
+            // CreateResource carries the parent id in the path: POST /restapis/{api}/resources/{parent}
+            ("POST", ["resources", parent]) => {
+                let parent = parent.to_string();
+                let part = strv("pathPart").ok_or_else(|| bad("pathPart is required"))?;
+                if !ra.resources.contains_key(&parent) {
+                    return Err(nf("parent resource"));
+                }
+                if ra.resources.values().any(|r| r.parent == parent && r.part == part) {
+                    return Err(err("ConflictException", format!("A resource already exists at path {part}")));
+                }
+                let id = format!("r{}", short_id());
+                let r = Res1 { id: id.clone(), parent, part, methods: BTreeMap::new() };
+                ra.resources.insert(id.clone(), r);
+                let out = res1_json(ra, ra.resources.get(&id).unwrap());
+                (201, out)
+            }
+            ("GET", ["resources", rid]) => (200, res1_json(ra, ra.resources.get(*rid).ok_or_else(|| nf("resource"))?)),
+            ("DELETE", ["resources", rid]) => {
+                let r = ra.resources.get(*rid).ok_or_else(|| nf("resource"))?;
+                if r.parent.is_empty() {
+                    return Err(bad("Cannot delete the root resource"));
+                }
+                if ra.resources.values().any(|x| x.parent == *rid) {
+                    return Err(bad("Resource has child resources; delete them first"));
+                }
+                ra.resources.remove(*rid);
+                (200, json!({"id": rid}))
+            }
+            ("PUT", ["resources", rid, "methods", m]) => {
+                let r = ra.resources.get_mut(*rid).ok_or_else(|| nf("resource"))?;
+                let auth = strv("authorizationType").unwrap_or_else(|| "NONE".into());
+                if !["NONE", "AWS_IAM"].contains(&auth.as_str()) {
+                    return Err(bad("authorizationType must be NONE or AWS_IAM (authorizers arrive later)"));
+                }
+                let params: BTreeMap<String, bool> = b.get("requestParameters").and_then(Value::as_object)
+                    .map(|m| m.iter().map(|(k, v)| (k.clone(), v.as_bool().unwrap_or(false))).collect()).unwrap_or_default();
+                let md = Method1 { auth, params, integration: None, responses: BTreeMap::new(), integ_responses: BTreeMap::new() };
+                let out = method1_json(m, &md);
+                r.methods.insert(m.to_string(), md);
+                (200, out)
+            }
+            ("GET", ["resources", rid, "methods", m]) => {
+                let r = ra.resources.get(*rid).ok_or_else(|| nf("resource"))?;
+                (200, method1_json(m, r.methods.get(*m).ok_or_else(|| nf("method"))?))
+            }
+            ("DELETE", ["resources", rid, "methods", m]) => {
+                let r = ra.resources.get_mut(*rid).ok_or_else(|| nf("resource"))?;
+                r.methods.remove(*m).ok_or_else(|| nf("method"))?;
+                (200, json!({"httpMethod": m}))
+            }
+            ("PUT", ["resources", rid, "methods", m, "responses", code]) => {
+                let r = ra.resources.get_mut(*rid).ok_or_else(|| nf("resource"))?;
+                let md = r.methods.get_mut(*m).ok_or_else(|| nf("method"))?;
+                md.responses.insert(code.to_string(), json!({"statusCode": code}));
+                (200, json!({"statusCode": code}))
+            }
+            ("PUT", ["resources", rid, "methods", m, "integration", "responses", code]) => {
+                let r = ra.resources.get_mut(*rid).ok_or_else(|| nf("resource"))?;
+                let md = r.methods.get_mut(*m).ok_or_else(|| nf("method"))?;
+                md.integ_responses.insert(code.to_string(), json!({"statusCode": code}));
+                (200, json!({"statusCode": code}))
+            }
+            ("PUT", ["resources", rid, "methods", m, "integration"]) => {
+                let ty = strv("type").ok_or_else(|| bad("type is required"))?;
+                if ty != "AWS_PROXY" && ty != "MOCK" {
+                    return Err(bad("Only AWS_PROXY and MOCK integrations are supported locally (no AWS/HTTP integrations)"));
+                }
+                if b.get("requestTemplates").is_some_and(|t| t.as_object().is_some_and(|o| !o.is_empty())) {
+                    return Err(bad("Mapping templates (VTL) are not supported locally"));
+                }
+                let uri = strv("uri").unwrap_or_default();
+                let uri = if ty == "AWS_PROXY" {
+                    if uri.is_empty() {
+                        return Err(bad("uri is required for AWS_PROXY integrations"));
+                    }
+                    if lambda_fn_of(&uri).is_empty() {
+                        return Err(bad("uri must address a local Lambda function"));
+                    }
+                    uri
+                } else {
+                    uri
+                };
+                let i = Integ1 { ty, uri };
+                let out = integ1_json(&i);
+                let r = ra.resources.get_mut(*rid).ok_or_else(|| nf("resource"))?;
+                let md = r.methods.get_mut(*m).ok_or_else(|| nf("method"))?;
+                md.integration = Some(i);
+                (200, out)
+            }
+            ("GET", ["resources", rid, "methods", m, "integration"]) => {
+                let r = ra.resources.get(*rid).ok_or_else(|| nf("resource"))?;
+                let md = r.methods.get(*m).ok_or_else(|| nf("method"))?;
+                (200, integ1_json(md.integration.as_ref().ok_or_else(|| nf("integration"))?))
+            }
+            ("DELETE", ["resources", rid, "methods", m, "integration"]) => {
+                let r = ra.resources.get_mut(*rid).ok_or_else(|| nf("resource"))?;
+                let md = r.methods.get_mut(*m).ok_or_else(|| nf("method"))?;
+                md.integration.take().ok_or_else(|| nf("integration"))?;
+                (200, json!({"type": "AWS_PROXY"}))
+            }
+            ("POST", ["deployments"]) => {
+                // The snapshot is the point: a stage serves this exact tree.
+                let id = short_id();
+                let snap = ra.resources.clone();
+                let out = json!({"id": id, "createdDate": chrono::Utc::now().to_rfc3339()});
+                ra.deployments.insert(id, snap);
+                (201, out)
+            }
+            ("GET", ["deployments"]) => (200, json!({"item": ra.deployments.iter().map(|(id, _)| json!({"id": id, "createdDate": chrono::Utc::now().to_rfc3339()})).collect::<Vec<_>>()})),
+            ("GET", ["deployments", did]) => {
+                ra.deployments.get(*did).ok_or_else(|| nf("deployment"))?;
+                (200, json!({"id": did, "createdDate": chrono::Utc::now().to_rfc3339()}))
+            }
+            ("POST", ["stages"]) => {
+                let stage = strv("stageName").ok_or_else(|| bad("stageName is required"))?;
+                let dep = strv("deploymentId").ok_or_else(|| bad("deploymentId is required"))?;
+                if !ra.deployments.contains_key(&dep) {
+                    return Err(nf("deployment"));
+                }
+                let out = json!({"stageName": stage, "deploymentId": dep});
+                ra.stages.insert(stage, dep);
+                (201, out)
+            }
+            ("GET", ["stages"]) => (200, json!({"item": ra.stages.iter().map(|(s, d)| json!({"stageName": s, "deploymentId": d})).collect::<Vec<_>>()})),
+            ("GET", ["stages", st]) => {
+                let d = ra.stages.get(*st).ok_or_else(|| nf("stage"))?;
+                (200, json!({"stageName": st, "deploymentId": d}))
+            }
+            ("DELETE", ["stages", st]) => {
+                ra.stages.remove(*st).ok_or_else(|| nf("stage"))?;
+                (200, json!({"stageName": st}))
+            }
+            _ => return Err(err("NotFoundException", format!("{method} /restapis/{api}/{} is not supported yet", rest.join("/")))),
+        })
+    }
+
+    // Resolve a REST v1 request against the stage's deployment snapshot:
+    // (resource path, resource id, integration, path parameters).
+    fn rest_target(&self, api: &str, stage: &str, method: &str, path: &str) -> Option<(String, String, Integ1, Map<String, Value>)> {
+        let ra = self.rests.get(api)?;
+        let dep = ra.stages.get(stage)?;
+        let snap = ra.deployments.get(dep)?;
+        let segs: Vec<&str> = path.trim_matches('/').split('/').filter(|x| !x.is_empty()).collect();
+        let root = snap.values().find(|r| r.parent.is_empty())?.id.clone();
+        let mut found: Option<(String, Map<String, Value>)> = None;
+        let mut queue: Vec<(String, usize, Map<String, Value>)> = vec![(root, 0, Map::new())];
+        while let Some((rid, at, params)) = queue.pop() {
+            let r = snap.get(&rid)?;
+            if at == segs.len() {
+                if r.methods.contains_key(method) {
+                    found = Some((rid, params));
+                    break;
+                }
+                continue;
+            }
+            for child in snap.values().filter(|c| c.parent == rid) {
+                let seg = segs[at];
+                let mut p = params.clone();
+                if let Some(name) = child.part.strip_prefix('{').and_then(|x| x.strip_suffix("+}")) {
+                    // greedy {proxy+} consumes the rest of the path
+                    p.insert(name.into(), segs[at..].join("/").into());
+                    queue.push((child.id.clone(), segs.len(), p));
+                } else if child.part == seg {
+                    queue.push((child.id.clone(), at + 1, p));
+                } else if let Some(name) = child.part.strip_prefix('{').and_then(|x| x.strip_suffix('}')) {
+                    p.insert(name.into(), seg.into());
+                    queue.push((child.id.clone(), at + 1, p));
+                }
+            }
+        }
+        let (rid, params) = found?;
+        let r = snap.get(&rid)?;
+        let i = r.methods.get(method)?.integration.clone()?;
+        Some((res1_path_snap(snap, &rid), r.id.clone(), i, params))
+    }
+
     pub fn admin(&self) -> Value {
-        self.apis
+        let http: Vec<Value> = self.apis
             .iter()
             .map(|(id, a)| {
                 let rows: Vec<Value> = a.routes.values().map(|r| {
@@ -605,7 +896,18 @@ impl ApiGw {
                 json!({"name": a.name, "count": rows.len(), "sub": format!("{}/_api/{id} · 스테이지 {} · 인가자 {}", crate::endpoint(), a.stages.keys().cloned().collect::<Vec<_>>().join(", "), a.authorizers.len()),
                        "cols": ["라우트", "Lambda"], "rows": rows})
             })
-            .collect()
+            .collect();
+        // REST v1: one row per resource path with its methods
+        let rest: Vec<Value> = self.rests.iter().map(|(id, r)| {
+            let rows: Vec<Value> = r.resources.values().map(|res| {
+                let ms = res.methods.keys().cloned().collect::<Vec<_>>().join(",");
+                let i = res.methods.values().filter_map(|m| m.integration.as_ref()).map(|i| i.ty.clone()).collect::<Vec<_>>().join("/");
+                json!([res1_path(&r.resources, &res.id), ms, i])
+            }).collect();
+            json!({"name": r.name, "count": rows.len(), "sub": format!("{id} · /_restapi/{id}/{{stage}}/ · 스테이지 {} · 배포 {}", r.stages.keys().cloned().collect::<Vec<_>>().join(", "), r.deployments.len()),
+                   "cols": ["리소스", "메서드", "통합"], "rows": rows})
+        }).collect();
+        http.into_iter().chain(rest).collect()
     }
 }
 
@@ -756,6 +1058,69 @@ pub async fn invoke(app: &Arc<App>, method: &str, api: &str, rest: &str, query: 
             (p["statusCode"].as_u64().unwrap_or(200) as u16, h, b, t.route_key)
         }
         _ => json_err(500, "Internal Server Error", t.route_key),
+    }
+}
+
+// REST v1 data plane: /_restapi/{apiId}/{stage}/path. AWS_PROXY builds the v1 proxy event; MOCK answers
+// a fixed 200 with an empty body (no VTL).
+pub async fn rest_invoke(app: &Arc<App>, method: &str, api: &str, stage: &str, rest: &str, query: &str, headers: &axum::http::HeaderMap, body: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>, String) {
+    let json_err = |st: u16, m: &str| (st, vec![("content-type".into(), "application/json".into())], json!({"message": m}).to_string().into_bytes(), String::new());
+    let t = {
+        let gw = app.apigw.lock().unwrap();
+        if gw.rests.contains_key(api) { gw.rest_target(api, stage, method, &rest) } else { None }
+    };
+    let Some((resource, rid, integ, params)) = t else {
+        // v1's quirk: an unmatched route is a 403 "Missing Authentication Token".
+        return json_err(403, "Missing Authentication Token");
+    };
+    if integ.ty == "MOCK" {
+        return (200, vec![("content-type".into(), "application/json".into())], Vec::new(), resource);
+    }
+    let func = lambda_fn_of(&integ.uri);
+    if func.is_empty() {
+        return json_err(500, "Internal Server Error");
+    }
+    let hdrs: Map<String, Value> = headers.iter().filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.into()))).collect();
+    let qs: Map<String, Value> = query.split('&').filter(|p| !p.is_empty())
+        .map(|p| { let (k, v) = p.split_once('=').unwrap_or((p, "")); (crate::s3::pct_decode(k), crate::s3::pct_decode(v).into()) }).collect();
+    let text = std::str::from_utf8(body);
+    let now = chrono::Utc::now();
+    let mut event = json!({
+        "resource": resource, "path": rest, "httpMethod": method,
+        "headers": hdrs, "requestContext": {
+            "resourceId": rid, "resourcePath": resource, "httpMethod": method,
+            "requestId": uuid::Uuid::new_v4().to_string(), "accountId": crate::ACCOUNT, "apiId": api, "stage": stage,
+            "identity": {"sourceIp": "127.0.0.1", "userAgent": headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("")},
+            "path": rest, "protocol": "HTTP/1.1",
+            "requestTime": now.format("%d/%b/%Y:%H:%M:%S +0000").to_string(), "requestTimeEpoch": now.timestamp_millis()},
+        "isBase64Encoded": text.is_err()});
+    if !qs.is_empty() {
+        event["queryStringParameters"] = qs.into();
+    }
+    if !params.is_empty() {
+        event["pathParameters"] = params.into();
+    }
+    if !body.is_empty() {
+        event["body"] = text.map_or_else(|_| crate::b64(body), String::from).into();
+    }
+    match crate::lambda::invoke(app, &func, event).await {
+        Ok(inv) if inv.error.is_none() => {
+            let p = inv.payload;
+            let (mut h, b) = if p.get("statusCode").is_some() {
+                let h: Vec<(String, String)> = p["headers"].as_object().into_iter().flatten()
+                    .map(|(k, v)| (k.clone(), v.as_str().map_or(v.to_string(), String::from))).collect();
+                let raw = p["body"].as_str().unwrap_or("");
+                let b = if p["isBase64Encoded"] == true { crate::unb64(raw).unwrap_or_default() } else { raw.as_bytes().to_vec() };
+                (h, b)
+            } else {
+                (vec![], p.to_string().into_bytes())
+            };
+            if !h.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
+                h.push(("content-type".into(), "application/json".into()));
+            }
+            (p["statusCode"].as_u64().unwrap_or(200) as u16, h, b, resource)
+        }
+        _ => json_err(500, "Internal Server Error"),
     }
 }
 

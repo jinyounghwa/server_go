@@ -248,6 +248,7 @@ enum Svc {
     SesV1(HashMap<String, String>),
     SesV2(String, String), // method, path after /v2/email/
     ApiGw(String, String), // method, path after /v2/
+    RestGw(String, String), // method, path after /restapis (REST v1)
     Lambda(&'static str, String, HashMap<String, String>), // op, path after the API version, query
     Json(&'static str, String),
     Sns(HashMap<String, String>),
@@ -277,6 +278,10 @@ fn checks(app: &App, svc: &Svc, body: &[u8]) -> Vec<(String, String)> {
         Svc::SesV2(m, path) => vec![(format!("ses:{m} {}", path.split('/').next().unwrap_or("")), "*".into())],
         // API Gateway's IAM model: action = HTTP verb, resource = API path.
         Svc::ApiGw(m, path) => vec![(format!("apigateway:{m}"), format!("arn:aws:apigateway:{}::/{path}", *REGION))],
+        Svc::RestGw(m, path) => {
+            let id = path.trim_matches('/').split('/').next().unwrap_or("");
+            vec![(format!("apigateway:{m}"), if id.is_empty() { "*".into() } else { format!("arn:aws:apigateway:{}::/restapis/{id}", *REGION) })]
+        }
         Svc::Lambda(op, path, _) => {
             let res = lambda::path_name(path).or_else(|| j["FunctionName"].as_str().map(lambda::name_of)).map_or("*".into(), |n| lambda::arn(&n));
             // IAM names the Invoke API "lambda:InvokeFunction".
@@ -357,6 +362,8 @@ async fn handle(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<std:
         Svc::SesV2(method.to_string(), path.to_string())
     } else if let Some(path) = uri.path().strip_prefix("/v2/").filter(|_| scope == "apigateway") {
         Svc::ApiGw(method.to_string(), path.to_string())
+    } else if let Some(path) = uri.path().strip_prefix("/restapis").filter(|_| scope == "apigateway") {
+        Svc::RestGw(method.to_string(), path.to_string())
     } else if let Some(path) = lambda_path {
         Svc::Lambda(lambda::op_of(method.as_str(), path), path.to_string(), form(uri.query().unwrap_or("")).collect())
     } else if let Some(op) = target.strip_prefix("DynamoDB_20120810.") {
@@ -403,6 +410,7 @@ async fn handle(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<std:
         Svc::Json(name, op) => (*name, op.clone()),
         Svc::Lambda(op, ..) => ("lambda", op.to_string()),
         Svc::ApiGw(_, path) => ("apigateway", format!("{method} /{}", path.split('/').take(3).collect::<Vec<_>>().join("/"))),
+        Svc::RestGw(_, _) => ("apigateway", format!("{method} /restapis")),
         Svc::Sns(q) => ("sns", q.get("Action").cloned().unwrap_or_default()),
         Svc::Ec2(q) => ("ec2", q.get("Action").cloned().unwrap_or_default()),
         Svc::Ddb(op) => ("dynamodb", op.clone()),
@@ -560,6 +568,14 @@ async fn handle(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<std:
             let j: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
             match app.apigw.lock().unwrap().handle(method.as_str(), &path, &j) {
                 Ok((204, _)) => Response::builder().status(204).body(Body::empty()).unwrap(),
+                Ok((s, v)) => Response::builder().status(s).header("content-type", "application/json").body(Body::from(v.to_string())).unwrap(),
+                Err(e) => lambda::error_reply(e),
+            }
+        }
+        (Svc::RestGw(..), Some(e)) => lambda::error_reply(e),
+        (Svc::RestGw(_, path), None) => {
+            let j: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+            match app.apigw.lock().unwrap().handle_rest(method.as_str(), &path, &j) {
                 Ok((s, v)) => Response::builder().status(s).header("content-type", "application/json").body(Body::from(v.to_string())).unwrap(),
                 Err(e) => lambda::error_reply(e),
             }
@@ -1258,6 +1274,25 @@ async fn api_invoke(State(app): State<Arc<App>>, method: Method, uri: Uri, heade
     r.body(Body::from(out)).unwrap_or_else(|_| Response::builder().status(502).body(Body::from("bad response headers from function")).unwrap())
 }
 
+// Invoke URL for REST APIs (v1): /_restapi/{apiId}/{stage}/path
+async fn rest_api_invoke(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
+    let t0 = Instant::now();
+    let rest = uri.path().strip_prefix("/_restapi/").unwrap_or("");
+    // /_restapi/{apiId}/{stage}/{path...}; splitn keeps the path whole
+    let (api, stage, path) = {
+        let mut it = rest.splitn(3, '/');
+        (it.next().unwrap_or("").to_string(), it.next().unwrap_or("").to_string(), format!("/{}", it.next().unwrap_or("")))
+    };
+    let (status, hdrs, out, route) = apigw::rest_invoke(&app, method.as_str(), &api, &stage, &path, uri.query().unwrap_or(""), &headers, &body).await;
+    emit(&app, json!({"ts": chrono::Utc::now().to_rfc3339(), "service": "apigateway", "op": "Invoke (v1)", "target": format!("{api}/{stage} {route}"),
+        "path": format!("{method} {path}"), "status": status, "ms": t0.elapsed().as_secs_f64() * 1000.0}));
+    let mut r = Response::builder().status(status);
+    for (k, v) in hdrs {
+        r = r.header(k, v);
+    }
+    r.body(Body::from(out)).unwrap_or_else(|_| Response::builder().status(502).body(Body::from("bad response headers from function")).unwrap())
+}
+
 // OIDC discovery and JWKS for Cognito user pools: /_cognito/{pool}/.well-known/...
 async fn cognito_wellknown(axum::extract::Path((pool, doc)): axum::extract::Path<(String, String)>) -> Json<Value> {
     Json(if doc == "jwks.json" { cognito::jwks() } else { cognito::openid_config(&pool) })
@@ -1465,6 +1500,7 @@ async fn serve() {
         .route("/_admin/reset", post(reset))
         .route("/_admin/reach", get(reach))
         .route("/_api/{*rest}", axum::routing::any(api_invoke))
+        .route("/_restapi/{*rest}", axum::routing::any(rest_api_invoke))
         .route("/_cognito/{pool}/.well-known/{doc}", get(cognito_wellknown))
         .route("/_admin/chaos", get(get_chaos).post(set_chaos))
         .fallback(handle)
