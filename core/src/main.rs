@@ -1264,6 +1264,18 @@ async fn reset(State(app): State<Arc<App>>, h: HeaderMap) -> axum::http::StatusC
     *app.route53.lock().unwrap() = Default::default();
     *app.cfn.lock().unwrap() = Default::default();
     tokio::spawn(managed::cleanup());
+    // Idle Lambda warm processes exit after lambda::WARM_IDLE (default 5 minutes).
+    {
+        let app = app.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let lam = app.lambda.lock().unwrap();
+                let mut w = lam.warm.lock().unwrap();
+                lambda::sweep_warm(&mut w);
+            }
+        });
+    }
     route53::serve_dns(app.clone());
     let _ = app.events.send(json!({"ts": chrono::Utc::now().to_rfc3339(), "service": "admin", "op": "Reset", "status": 200}).to_string());
     axum::http::StatusCode::NO_CONTENT
@@ -1532,6 +1544,18 @@ async fn serve() {
         }
     }
     tokio::spawn(managed::cleanup());
+    // Idle Lambda warm processes exit after lambda::WARM_IDLE (default 5 minutes).
+    {
+        let app = app.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let lam = app.lambda.lock().unwrap();
+                let mut w = lam.warm.lock().unwrap();
+                lambda::sweep_warm(&mut w);
+            }
+        });
+    }
     route53::serve_dns(app.clone());
     let l = tokio::net::TcpListener::bind(&bind).await.expect("bind");
     eprintln!("rocalcloud listening on http://{bind}  (GUI: /_ui, town: /_town, events: /_events, ENFORCE_IAM={})", *ENFORCE as u8);

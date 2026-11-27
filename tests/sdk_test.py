@@ -3299,7 +3299,7 @@ Resources:
 
 
 def test_s3_checksums():
-    import base64, hashlib, zlib
+    import base64, hashlib, subprocess, zlib
     s3 = boto3.client("s3", **kw)
     b = f"ck{run}"
     s3.create_bucket(Bucket=b)
@@ -3407,6 +3407,47 @@ def test_lambda_layers():
     assert code(lam.update_function_configuration, FunctionName=fn, Layers=[la["LayerVersionArn"]]) == "InvalidParameterValueException"
     assert [v["Version"] for v in lam.list_layer_versions(LayerName=f"{base}-a")["LayerVersions"]] == [2]
     lam.delete_function(FunctionName=fn)
+
+
+def test_lambda_warm():
+    import base64, subprocess
+    lam = boto3.client("lambda", **kw)
+    role = "arn:aws:iam::000000000000:role/none"
+    name = f"warm{run}"
+    PY = "import sys\ncount = 0\ndef h(e, c):\n    global count\n    if e.get('die'): sys.exit(1)\n    count += 1\n    return {'n': count}\n"
+    lam.create_function(FunctionName=name, Runtime="python3.12", Role=role, Handler="app.h",
+                        Code={"ZipFile": zipped({"app.py": PY})})
+
+    # globals survive across invocations (warm process); cold start on the first call only
+    r1 = lam.invoke(FunctionName=name, LogType="Tail")
+    r2 = lam.invoke(FunctionName=name, LogType="Tail")
+    assert json.loads(r1["Payload"].read()) == {"n": 1}, "first call starts from 0"
+    assert json.loads(r2["Payload"].read()) == {"n": 2}, "second call reuses the process"
+    hh = lambda r: r["ResponseMetadata"]["HTTPHeaders"]
+    assert hh(r1)["x-rc-cold-start"] == "true" and hh(r2)["x-rc-cold-start"] == "false"
+    assert "Init Duration" in base64.b64decode(r1["LogResult"]).decode()  # first call logged it
+
+    # a configuration change replaces the process
+    lam.update_function_configuration(FunctionName=name, Environment={"Variables": {"A": "B"}})
+    r3 = lam.invoke(FunctionName=name)
+    assert json.loads(r3["Payload"].read()) == {"n": 1} and hh(r3)["x-rc-cold-start"] == "true"
+
+    # handler exit(): this call fails, the next one starts a new process
+    re = lam.invoke(FunctionName=name, Payload=json.dumps({"die": 1}))
+    assert re["FunctionError"] == "Unhandled"
+    r4 = lam.invoke(FunctionName=name)
+    assert json.loads(r4["Payload"].read()) == {"n": 1} and hh(r4)["x-rc-cold-start"] == "true"
+
+    # a warm process is resident on this host (marker line in the bootstrap)
+    n = "0"
+    for _ in range(20):
+        n = subprocess.run(["pgrep", "-fc", "rocalcloud-lambda-warm"], capture_output=True, text=True).stdout.strip() or "0"
+        if int(n) >= 1:
+            break
+        time.sleep(0.5)
+    assert int(n) >= 1, "expected a resident lambda process"
+    lam.delete_function(FunctionName=name)
+
 
 
 if __name__ == "__main__":

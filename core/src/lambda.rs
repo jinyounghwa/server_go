@@ -3,7 +3,7 @@
 // Layers (PublishLayerVersion …) unpack once per version; a function's layers go on PYTHONPATH / NODE_PATH, later layers first,
 // which matches AWS's "later layers overwrite earlier ones in /opt". ponytail: NODE_PATH only reaches require(), not ESM
 // import of bare specifiers; /opt itself is not emulated.
-// ponytail: no warm containers or container images; the host interpreter is used
+// ponytail: no container images (PackageType=Image) yet; Zip functions run in warm resident host processes
 // regardless of the runtime's minor version. Add a container runner when isolation matters.
 use crate::{b64, err, now_ms, unb64, ApiErr, App, ACCOUNT, REGION};
 use axum::{body::Body, http::HeaderMap, response::Response};
@@ -15,7 +15,7 @@ use std::{
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
-use tokio::{io::AsyncWriteExt, process::Command, sync::Semaphore};
+use tokio::{io::{AsyncBufReadExt, AsyncWriteExt}, process::Command, sync::{mpsc, Semaphore}};
 
 // ponytail: at most 8 function processes at once, to stay inside the host's CPU budget.
 static SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(8));
@@ -78,6 +78,8 @@ pub struct Mapping {
 pub struct Lambda {
     f: BTreeMap<String, Func>,
     maps: BTreeMap<String, Mapping>,
+    // idle warm processes per "name|version|last-modified" key; reset() drops them (kill_on_drop)
+    pub warm: std::sync::Mutex<std::collections::HashMap<String, Vec<WarmProc>>>,
     layers: BTreeMap<String, Vec<Option<LayerVer>>>,
 }
 
@@ -203,57 +205,155 @@ pub struct Invocation {
     pub error: Option<String>, // "Unhandled" when the handler threw or timed out
     pub log_tail: String,
     pub version: String,
+    pub cold: bool, // true when a process was started for this invocation
 }
 
-const PY_BOOT: &str = r#"
+// A resident runtime process. Line protocol: one JSON request per line on stdin,
+// one JSON result line on fd 1; function logs go to stderr. {"ready":1} marks init done.
+pub struct WarmProc {
+    pub child: tokio::process::Child,
+    pub stdin: tokio::process::ChildStdin,
+    pub res: mpsc::Receiver<String>,
+    pub since: Instant, // last idle since
+}
+
+// Idle processes exit after 5 minutes (swept on invoke and by the reaper in main.rs).
+const WARM_IDLE: Duration = Duration::from_secs(300);
+
+pub fn sweep_warm(w: &mut std::collections::HashMap<String, Vec<WarmProc>>) {
+    for v in w.values_mut() {
+        v.retain(|p| p.since.elapsed() < WARM_IDLE);
+    }
+    w.retain(|_, v| !v.is_empty());
+}
+
+async fn pipe_lines<R: tokio::io::AsyncRead + Unpin + Send + 'static>(r: R, tx: mpsc::Sender<String>) {
+    let mut br = tokio::io::BufReader::new(r);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match br.read_line(&mut line).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                if tx.send(line.trim_end_matches(['\r', '\n']).to_string()).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// Warm variant: the handler module is imported once and kept; each invocation is one JSON
+// request line on stdin answered by one JSON result line on fd 1 (function prints go to stderr).
+// The first comment line doubles as a pgrep marker for tests.
+const PY_BOOT_WARM: &str = r#"
+# rocalcloud-lambda-warm
 import json, os, sys, time, traceback, importlib
 sys.path.insert(0, os.getcwd())
+_p = os.fdopen(1, "w", 1)
 mod, fn = os.environ["_HANDLER"].rsplit(".", 1)
-deadline = time.time() + float(os.environ["_RC_TIMEOUT"])
+class _Cap:
+    def __init__(self): self.buf = ""; self.lines = []
+    def write(self, s):
+        self.buf += str(s)
+        if "\n" in self.buf:
+            parts = self.buf.split("\n")
+            self.buf = parts.pop()
+            self.lines.extend(p for p in parts if p)
+        return len(s)
+    def flush(self): pass
+_cap = _Cap()
+sys.stdout = sys.stderr = _cap
 class Context:
     function_name = os.environ["AWS_LAMBDA_FUNCTION_NAME"]
-    function_version = "$LATEST"
+    function_version = os.environ.get("AWS_LAMBDA_FUNCTION_VERSION", "$LATEST")
     invoked_function_arn = os.environ["_RC_ARN"]
     memory_limit_in_mb = os.environ["AWS_LAMBDA_FUNCTION_MEMORY_SIZE"]
-    aws_request_id = os.environ["_RC_REQUEST_ID"]
     log_group_name = "/aws/lambda/" + function_name
-    def get_remaining_time_in_millis(self): return int(max(0, deadline - time.time()) * 1000)
-event = json.load(sys.stdin)
+    def __init__(self, rid, deadline):
+        self.aws_request_id = rid
+        self._d = deadline
+    def get_remaining_time_in_millis(self): return int(max(0, self._d - time.time()) * 1000)
 try:
-    out = {"ok": True, "result": getattr(importlib.import_module(mod), fn)(event, Context())}
+    _handler = getattr(importlib.import_module(mod), fn)
 except Exception as e:
     traceback.print_exc()
-    out = {"ok": False, "error": {"errorMessage": str(e), "errorType": type(e).__name__, "stackTrace": traceback.format_tb(e.__traceback__)}}
-sys.stdout.flush()
-with open(os.environ["_RC_RESULT"], "w") as f:
-    json.dump(out, f, default=str)
+    _p.write(json.dumps({"ok": False, "error": {"errorMessage": "module import failed: " + str(e), "errorType": "Runtime.ImportModuleError"}, "logs": _cap.lines}) + "\n")
+    sys.exit(1)
+_p.write('{"ready":1}\n')
+while True:
+    line = sys.stdin.readline()
+    if not line: break
+    try:
+        req = json.loads(line)
+    except Exception:
+        break
+    ctx = Context(req.get("rid", ""), req.get("deadline", time.time() + float(os.environ.get("_RC_TIMEOUT", "3"))))
+    _cap = _Cap()
+    sys.stdout = sys.stderr = _cap
+    try:
+        out = {"ok": True, "result": _handler(req.get("event"), ctx)}
+    except Exception as e:
+        traceback.print_exc()
+        out = {"ok": False, "error": {"errorMessage": str(e), "errorType": type(e).__name__, "stackTrace": traceback.format_tb(e.__traceback__)}}
+    out["logs"] = _cap.lines
+    _p.write(json.dumps(out, default=str) + "\n")
 "#;
 
-const NODE_BOOT: &str = r#"
+const NODE_BOOT_WARM: &str = r#"
+// rocalcloud-lambda-warm
 const fs = require("fs"), path = require("path"), { pathToFileURL } = require("url");
+const _w = (o) => fs.writeSync(1, JSON.stringify(o) + "\n");
+let _logs = [];
+let _buf = "";
+const _cap = (...a) => {
+  _buf += a.map(x => typeof x === "string" ? x : JSON.stringify(x)).join(" ");
+  if (_buf.includes("\n")) { const parts = _buf.split("\n"); _buf = parts.pop(); for (const ln of parts) if (ln) _logs.push(ln); }
+};
+console.log = console.info = console.warn = console.error = console.debug = _cap;
+process.stdout.write = (s) => { _cap(String(s)); return true; };
+process.stderr.write = (s) => { _cap(String(s)); return true; };
 const h = process.env._HANDLER, file = h.slice(0, h.lastIndexOf(".")), fn = h.slice(h.lastIndexOf(".") + 1);
-const deadline = Date.now() + Number(process.env._RC_TIMEOUT) * 1000;
-const ctx = { functionName: process.env.AWS_LAMBDA_FUNCTION_NAME, functionVersion: "$LATEST", invokedFunctionArn: process.env._RC_ARN,
-  memoryLimitInMB: process.env.AWS_LAMBDA_FUNCTION_MEMORY_SIZE, awsRequestId: process.env._RC_REQUEST_ID,
-  getRemainingTimeInMillis: () => Math.max(0, deadline - Date.now()) };
-const done = out => fs.writeFileSync(process.env._RC_RESULT, JSON.stringify(out));
 (async () => {
+  let handler = null;
   try {
     const ext = [".mjs", ".js", ".cjs"].find(e => fs.existsSync(path.resolve(file + e)));
     if (!ext) throw new Error(`Cannot find module '${file}'`);
     const m = await import(pathToFileURL(path.resolve(file + ext)).href);
-    const handler = m[fn] || (m.default && m.default[fn]);
+    handler = m[fn] || (m.default && m.default[fn]);
     if (typeof handler !== "function") throw new Error(`${h} is undefined or not exported`);
-    const event = JSON.parse(fs.readFileSync(0, "utf8") || "{}");
-    const result = await new Promise((res, rej) => {
-      const r = handler(event, ctx, (e, v) => (e ? rej(e) : res(v)));
-      if (r && typeof r.then === "function") r.then(res, rej); else if (handler.length < 3) res(r);
-    });
-    done({ ok: true, result: result === undefined ? null : result });
   } catch (e) {
-    console.error(e);
-    done({ ok: false, error: { errorMessage: String(e && e.message || e), errorType: (e && e.name) || "Error", stackTrace: String(e && e.stack || "").split("\n") } });
+    _cap(e);
+    _w({ ok: false, error: { errorMessage: String(e && e.message || e), errorType: "Runtime.ImportModuleError" }, logs: _logs });
+    process.exit(1);
   }
+  _w({ ready: 1 });
+  const readline = require("readline");
+  const rl = readline.createInterface({ input: process.stdin, terminal: false });
+  let chain = Promise.resolve();
+  rl.on("line", (line) => { chain = chain.then(() => (async () => {
+    let req = {};
+    try { req = JSON.parse(line); } catch (e) { process.exit(1); }
+    const deadline = req.deadline ? req.deadline * 1000 : Date.now() + Number(process.env._RC_TIMEOUT) * 1000;
+    const ctx = { functionName: process.env.AWS_LAMBDA_FUNCTION_NAME, functionVersion: process.env.AWS_LAMBDA_FUNCTION_VERSION || "$LATEST",
+      invokedFunctionArn: process.env._RC_ARN, memoryLimitInMB: process.env.AWS_LAMBDA_FUNCTION_MEMORY_SIZE, awsRequestId: req.rid,
+      getRemainingTimeInMillis: () => Math.max(0, deadline - Date.now()) };
+    const logs = _logs; _logs = [];
+    let out;
+    try {
+      const r = await new Promise((res, rej) => {
+        const p = handler(req.event, ctx, (e, v) => (e ? rej(e) : res(v)));
+        if (p && typeof p.then === "function") p.then(res, rej); else if (handler.length < 3) res(p);
+      });
+      out = { ok: true, result: r === undefined ? null : r };
+    } catch (e) {
+      _cap(e);
+      out = { ok: false, error: { errorMessage: String(e && e.message || e), errorType: (e && e.name) || "Error", stackTrace: String(e && e.stack || "").split("\n") } };
+    }
+    out.logs = logs;
+    _w(out);
+  })()).catch(() => {}); });
+  rl.on("close", () => process.exit(0));
 })();
 "#;
 
@@ -262,15 +362,14 @@ pub async fn invoke(app: &Arc<App>, id: &str, event: Value) -> Result<Invocation
     let (name, qual) = split_qualifier(id);
     let name = name.as_str();
     let f = app.lambda.lock().unwrap().resolve_weighted(name, qual.as_deref(), true)?;
-    let (exe, boot) = if f.runtime.starts_with("python") {
-        (std::env::var("RC_PYTHON").unwrap_or("python3".into()), PY_BOOT)
+    let (exe, warm_boot) = if f.runtime.starts_with("python") {
+        (std::env::var("RC_PYTHON").unwrap_or("python3".into()), PY_BOOT_WARM)
     } else if f.runtime.starts_with("nodejs") {
-        (std::env::var("RC_NODE").unwrap_or("node".into()), NODE_BOOT)
+        (std::env::var("RC_NODE").unwrap_or("node".into()), NODE_BOOT_WARM)
     } else {
         return Err(err("InvalidRuntimeException", format!("Runtime {} is not supported locally (python*, nodejs* only)", f.runtime)));
     };
     let rid = uuid::Uuid::new_v4().to_string();
-    let result = std::env::temp_dir().join(format!("rocalcloud-result-{rid}.json"));
     // Code inside the function calls this emulator, signed as the execution role when it exists.
     let creds = app.iam.lock().unwrap().session_for_role(&f.role, name);
     let (akid, secret, token) = creds.unwrap_or(("test".into(), "test".into(), String::new()));
@@ -282,54 +381,119 @@ pub async fn invoke(app: &Arc<App>, id: &str, event: Value) -> Result<Invocation
         if f.runtime.starts_with("python") { vec![d.join("python"), d.join("python/lib").join(&f.runtime).join("site-packages")] } else { vec![d.join("nodejs/node_modules")] }
     })).unwrap_or_default();
     let path_var = if f.runtime.starts_with("python") { "PYTHONPATH" } else { "NODE_PATH" };
-    let mut cmd = Command::new(&exe);
-    cmd.arg(if f.runtime.starts_with("python") { "-c" } else { "-e" }).arg(boot).current_dir(&f.dir)
-        .env(path_var, &layer_path)
-        .envs(f.env.iter().filter_map(|(k, v)| Some((k, v.as_str()?))))
-        .env("_HANDLER", &f.handler).env("_RC_TIMEOUT", f.timeout.to_string()).env("_RC_ARN", &f.arn)
-        .env("_RC_REQUEST_ID", &rid).env("_RC_RESULT", &result)
-        .env("AWS_LAMBDA_FUNCTION_NAME", name).env("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", f.memory.to_string())
-        .env("AWS_LAMBDA_FUNCTION_VERSION", &f.version).env("AWS_LAMBDA_LOG_GROUP_NAME", format!("/aws/lambda/{name}"))
-        .env("AWS_REGION", REGION.as_str()).env("AWS_DEFAULT_REGION", REGION.as_str())
-        .env("AWS_ENDPOINT_URL", crate::endpoint()).env("AWS_ACCESS_KEY_ID", akid).env("AWS_SECRET_ACCESS_KEY", secret)
-        .env("AWS_SESSION_TOKEN", token).env("PYTHONUNBUFFERED", "1")
-        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = cmd.spawn().map_err(|e| ApiErr { status: 500, ..err("ServiceException", format!("could not start {exe}: {e}")) })?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(event.to_string().as_bytes()).await;
-    }
-    let out = tokio::time::timeout(Duration::from_secs(f.timeout), child.wait_with_output()).await;
-    let ms = t0.elapsed().as_secs_f64() * 1000.0;
-
-    let (mut log, outcome) = match out {
-        Ok(Ok(o)) => {
-            let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
-            let r: Value = std::fs::read(&result).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_else(|| {
-                json!({"ok": false, "error": {"errorMessage": format!("Runtime exited with {} before returning a result", o.status), "errorType": "Runtime.ExitError"}})
-            });
-            (text, r)
-        }
-        Ok(Err(e)) => (String::new(), json!({"ok": false, "error": {"errorMessage": e.to_string(), "errorType": "Runtime.Error"}})),
-        Err(_) => (String::new(), json!({"ok": false, "error": {"errorMessage": format!("Task timed out after {:.2} seconds", f.timeout as f64), "errorType": "Sandbox.Timedout"}})),
+    // One warm process per function, version and code/config stamp; a change replaces it.
+    let key = format!("{name}|{}|{}", f.version, f.modified);
+    let pooled = {
+        let lam = app.lambda.lock().unwrap();
+        let mut w = lam.warm.lock().unwrap();
+        sweep_warm(&mut w);
+        w.get_mut(&key).and_then(|v| v.pop())
     };
-    let _ = std::fs::remove_file(&result);
+    let (mut proc, mut cold) = match pooled {
+        Some(p) => (p, false),
+        None => (spawn_warm(&exe, warm_boot, &f, name, &layer_path, path_var, &akid, &secret, &token).await?, true),
+    };
+    let started = proc.since; // spawn time - elapsed at the {"ready":1} line is the init duration
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+    let req = format!("{}\n", json!({"event": event, "rid": rid, "deadline": now + f.timeout as f64}));
+    // A pooled process may have died meanwhile: write failure restarts it once.
+    if proc.stdin.write_all(req.as_bytes()).await.is_err() || proc.stdin.flush().await.is_err() {
+        proc = spawn_warm(&exe, warm_boot, &f, name, &layer_path, path_var, &akid, &secret, &token).await?;
+        cold = true;
+        proc.stdin.write_all(req.as_bytes()).await.map_err(|e| ApiErr { status: 500, ..err("ServiceException", format!("could not send to function process: {e}")) })?;
+    }
+
+    // One JSON result line per request ({"ready":1} lines from init are skipped).
+    let mut init_ms = 0.0f64;
+    let outcome: Value;
+    let mut keep = false;
+    match tokio::time::timeout(Duration::from_secs(f.timeout), async {
+        loop {
+            match proc.res.recv().await {
+                None => break None,
+                Some(l) if l.contains("\"ready\"") => {
+                    init_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    continue;
+                }
+                Some(l) => break Some(l),
+            }
+        }
+    })
+    .await
+    {
+        Err(_) => {
+            let _ = proc.child.kill().await;
+            outcome = json!({"ok": false, "error": {"errorMessage": format!("Task timed out after {:.2} seconds", f.timeout as f64), "errorType": "Sandbox.Timedout"}});
+        }
+        Ok(None) => {
+            let code = proc.child.wait().await.ok().and_then(|s| s.code());
+            outcome = json!({"ok": false, "error": {"errorMessage": format!("Runtime exited with code {} before returning a result", code.map_or_else(|| "unknown".into(), |c| c.to_string())), "errorType": "Runtime.ExitError"}});
+        }
+        Ok(Some(l)) => {
+            outcome = serde_json::from_str(&l).unwrap_or_else(|_| json!({"ok": false, "error": {"errorMessage": "unparsable result from function process", "errorType": "Runtime.Error"}}));
+            keep = true;
+        }
+    }
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    if keep {
+        proc.since = Instant::now();
+        let lam = app.lambda.lock().unwrap();
+        let mut w = lam.warm.lock().unwrap();
+        sweep_warm(&mut w);
+        w.entry(key).or_default().push(proc);
+    }
+
+    let mut log = outcome["logs"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(String::from)).collect::<Vec<_>>().join("\n");
     if outcome["ok"] != true {
         log += &format!("{}\n", outcome["error"]["errorMessage"].as_str().unwrap_or(""));
     }
+    let init = if cold { format!("\tInit Duration: {init_ms:.2} ms") } else { String::new() };
     let lines = std::iter::once(format!("START RequestId: {rid} Version: {}", f.version))
         .chain(log.lines().map(String::from))
         .chain([format!("END RequestId: {rid}"),
-                format!("REPORT RequestId: {rid}\tDuration: {ms:.2} ms\tBilled Duration: {} ms\tMemory Size: {} MB", ms.ceil() as u64, f.memory)]);
+                format!("REPORT RequestId: {rid}\tDuration: {ms:.2} ms\tBilled Duration: {} ms\tMemory Size: {} MB{init}", ms.ceil() as u64, f.memory)]);
     let now = now_ms();
     let stream = format!("{}/[{}]{}", chrono::Utc::now().format("%Y/%m/%d"), f.version, &rid[..8]);
     let entries: Vec<(i64, String)> = lines.map(|l| (now, l)).collect();
     let tail = entries.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
     app.logs.lock().unwrap().put(&format!("/aws/lambda/{name}"), &stream, entries);
     Ok(match outcome["ok"].as_bool() {
-        Some(true) => Invocation { payload: outcome["result"].clone(), error: None, log_tail: tail, version: f.version.clone() },
-        _ => Invocation { payload: outcome["error"].clone(), error: Some("Unhandled".into()), log_tail: tail, version: f.version.clone() },
+        Some(true) => Invocation { payload: outcome["result"].clone(), error: None, log_tail: tail, version: f.version.clone(), cold },
+        _ => Invocation { payload: outcome["error"].clone(), error: Some("Unhandled".into()), log_tail: tail, version: f.version.clone(), cold },
     })
+}
+
+// Start a resident runtime process with pipes for the line protocol (fd 1) and logs (stderr).
+async fn spawn_warm(
+    exe: &str,
+    boot: &'static str,
+    f: &Func,
+    name: &str,
+    layer_path: &std::ffi::OsString,
+    path_var: &str,
+    akid: &str,
+    secret: &str,
+    token: &str,
+) -> Result<WarmProc, ApiErr> {
+    let mut cmd = Command::new(exe);
+    cmd.arg(if f.runtime.starts_with("python") { "-c" } else { "-e" }).arg(boot).current_dir(&f.dir)
+        .env(path_var, layer_path)
+        .envs(f.env.iter().filter_map(|(k, v)| Some((k, v.as_str()?))))
+        .env("_HANDLER", &f.handler).env("_RC_TIMEOUT", f.timeout.to_string()).env("_RC_ARN", &f.arn)
+        .env("AWS_LAMBDA_FUNCTION_NAME", name).env("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", f.memory.to_string())
+        .env("AWS_LAMBDA_FUNCTION_VERSION", &f.version).env("AWS_LAMBDA_LOG_GROUP_NAME", format!("/aws/lambda/{name}"))
+        .env("AWS_REGION", REGION.as_str()).env("AWS_DEFAULT_REGION", REGION.as_str())
+        .env("AWS_ENDPOINT_URL", crate::endpoint()).env("AWS_ACCESS_KEY_ID", akid).env("AWS_SECRET_ACCESS_KEY", secret)
+        .env("AWS_SESSION_TOKEN", token).env("PYTHONUNBUFFERED", "1")
+        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let mut child = cmd.spawn().map_err(|e| ApiErr { status: 500, ..err("ServiceException", format!("could not start {exe}: {e}")) })?;
+    let stdin = child.stdin.take().expect("piped stdin");
+    let (res_tx, res_rx) = mpsc::channel(8);
+    if let Some(out) = child.stdout.take() {
+        tokio::spawn(pipe_lines(out, res_tx));
+    }
+    Ok(WarmProc { child, stdin, res: res_rx, since: Instant::now() })
 }
 
 fn reply(status: u16, v: Value) -> Response {
@@ -489,7 +653,8 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
         return match invoke(app, &target, event).await {
             Err(e) => error_reply(e),
             Ok(inv) => {
-                let mut r = Response::builder().status(200).header("content-type", "application/json").header("x-amz-executed-version", &inv.version);
+                let mut r = Response::builder().status(200).header("content-type", "application/json").header("x-amz-executed-version", &inv.version)
+                    .header("x-rc-cold-start", if inv.cold { "true" } else { "false" });
                 if let Some(e) = &inv.error {
                     r = r.header("x-amz-function-error", e);
                 }
