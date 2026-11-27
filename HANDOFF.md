@@ -447,7 +447,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - 함수가 `exit()`하면 다음 호출에서 새 프로세스가 떠야 한다.
   - 서버를 종료하면 남은 프로세스가 0개여야 한다.
 
-## 27일차 (2026-12-21): Lambda 컨테이너 이미지 (Docker 필요)
+## 27일차 (2026-12-21): Lambda 컨테이너 이미지 (Docker 필요) — ✅ 완료 (`cf59a8f`): ImageUri(로컬 이미지만, inspect 검증·명확한 오류), docker run -d + RIE POST(최소 HTTP 클라이언트·청크 디코딩·부팅 재시도), `--memory`·host-gateway, 웜 컨테이너 풀(유휴 5분·forget·cold-start·Init Duration), 셧다운 명시적 정리(App 미드롭 대비), 단위/boto3(52/55)·두 모드 통과, 이미지 192MB·첫 호출 402ms·컨테이너 잔여 0
 - `PackageType=Image`와 `Code.ImageUri`를 받는다.
   - 이미지는 로컬 Docker에 이미 있는 것만 받는다. ECR 에뮬레이션을 하지 않으니 `docker pull`도 하지 않는다. 없으면 명확한 오류로 답한다.
 - 실행은 공식 Lambda 베이스 이미지에 들어 있는 RIE(`/lambda-entrypoint.sh`)를 쓴다. 컨테이너를 127.0.0.1 포트에 열고 `/2015-03-31/functions/function/invocations`로 POST한다.
