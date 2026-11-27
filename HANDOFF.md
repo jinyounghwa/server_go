@@ -370,7 +370,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - MOCK은 고정 응답을 돌려주어야 한다.
   - 배포 전 변경은 반영되지 않아야 한다.
 
-## 21일차 (2026-12-15): API Gateway REST v1 (2/2) — 인가자·API 키·CFN
+## 21일차 (2026-12-15): API Gateway REST v1 (2/2) — 인가자·API 키·CFN — ✅ 완료 (`fdb952f`): COGNITO_USER_POOLS(로컬 풀 JWT)·TOKEN/REQUEST(람다 IAM 정책 해석, Deny 우선·글롭), API 키·사용 계획(토큰 버킷 429, 쿼터는 ponytail), CFN 5종 타입(호출 가능한 스택 템플릿 테스트), 단위/boto3 테스트(51/51)·두 모드 통과
 - REST 인가자를 넣는다.
   - `COGNITO_USER_POOLS`: 7일차 JWT 검증 코드를 다시 쓴다.
   - Lambda `TOKEN`, `REQUEST`: IAM 정책 문서 응답을 해석해 Allow·Deny를 판정한다.
