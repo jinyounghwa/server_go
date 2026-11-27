@@ -3450,6 +3450,62 @@ def test_lambda_warm():
 
 
 
+def test_lambda_container_image():
+    import base64, os, subprocess, tempfile, time as _t
+    try:
+        subprocess.run(["docker", "info"], capture_output=True, timeout=10).check_returncode()
+    except Exception:
+        raise Skip("docker 없음")
+    lam = boto3.client("lambda", **kw)
+    role = "arn:aws:iam::000000000000:role/none"
+    img = "rocalcloud-test-lambda:py"
+    # Build a tiny image on the official base (RIE included, listens on 8080).
+    d = tempfile.mkdtemp(prefix="rc-img")
+    open(os.path.join(d, "app.py"), "w").write("count = 0\ndef h(e, c):\n    global count\n    count += 1\n    return {'n': count, 'who': 'image'}\n")
+    open(os.path.join(d, "Dockerfile"), "w").write("FROM public.ecr.aws/lambda/python:3.12\nCOPY app.py ${LAMBDA_TASK_ROOT}/app.py\nCMD [\"app.h\"]\n")
+    built = subprocess.run(["docker", "build", "-q", "-t", img, d], capture_output=True, text=True, timeout=600)
+    assert built.returncode == 0, built.stderr[-400:]
+    size = int(subprocess.run(["docker", "image", "inspect", img, "--format", "{{.Size}}"], capture_output=True, text=True).stdout.strip())
+
+    name = f"img{run}"
+    t0 = _t.time()
+    fn = lam.create_function(FunctionName=name, PackageType="Image", Code={"ImageUri": img}, Role=role, Timeout=30)
+    assert fn["PackageType"] == "Image", fn
+    r1 = lam.invoke(FunctionName=name, Payload=json.dumps({"x": 1}), LogType="Tail")
+    first_ms = (_t.time() - t0) * 1000
+    r2 = lam.invoke(FunctionName=name)
+    p1 = json.loads(r1["Payload"].read()); p2 = json.loads(r2["Payload"].read())
+    # one resident container: the module-level counter increases across invocations
+    assert p1["n"] == 1 and p2["n"] == 2 and p2["who"] == "image", (p1, p2)
+    hh = lambda r: r["ResponseMetadata"]["HTTPHeaders"]
+    assert hh(r1)["x-rc-cold-start"] == "true" and hh(r2)["x-rc-cold-start"] == "false"
+    assert "Init Duration" in base64.b64decode(r1["LogResult"]).decode()
+    # function error: the container stays and answers again
+    cf = lam.update_function_code(FunctionName=name, ImageUri="rocalcloud-test-lambda:py")
+    assert cf["PackageType"] == "Image"
+
+    # missing local image is a clear error
+    got = code(lam.create_function, FunctionName=f"{name}2", PackageType="Image", Code={"ImageUri": "rocalcloud-test-lambda:nosuch"}, Role=role)
+    assert got == "InvalidParameterValueException", got
+    # image fields on read APIs
+    g = lam.get_function(FunctionName=name)
+    assert g["Code"]["ImageUri"] == img and g["Code"]["RepositoryType"] == "ECR", g["Code"]
+    gc = lam.get_function_configuration(FunctionName=name)
+    assert "Runtime" not in gc and "Handler" not in gc and gc["PackageType"] == "Image", gc
+
+    lam.delete_function(FunctionName=name)
+    # containers for the function are gone (name prefix rc-lambda-)
+    for _ in range(20):
+        ids = subprocess.run(["docker", "ps", "-aq", "--filter", "name=rc-lambda-"], capture_output=True, text=True).stdout.split()
+        if not ids:
+            break
+        time.sleep(0.5)
+    assert not ids, ids
+    print(f"    lambda image: " + f"{size/1e6:.0f}" + " MB, first call " + f"{first_ms:.0f}" + " ms")
+    subprocess.run(["docker", "rmi", "-f", img], capture_output=True)
+
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

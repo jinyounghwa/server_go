@@ -31,6 +31,8 @@ pub struct InvokeConfig {
 #[derive(Clone)]
 pub struct Func {
     arn: String,
+    package: String, // "Zip" or "Image"
+    image: Option<String>, // local docker image uri when package is Image
     runtime: String,
     role: String,
     handler: String,
@@ -80,6 +82,8 @@ pub struct Lambda {
     maps: BTreeMap<String, Mapping>,
     // idle warm processes per "name|version|last-modified" key; reset() drops them (kill_on_drop)
     pub warm: std::sync::Mutex<std::collections::HashMap<String, Vec<WarmProc>>>,
+    // idle image containers (PackageType=Image) per the same key scheme; dropping one removes the container
+    pub img: std::sync::Mutex<std::collections::HashMap<String, Vec<ImgWarm>>>,
     layers: BTreeMap<String, Vec<Option<LayerVer>>>,
 }
 
@@ -149,11 +153,18 @@ fn not_found(n: &str) -> ApiErr {
 }
 
 fn config(n: &str, f: &Func) -> Value {
-    json!({"FunctionName": n, "FunctionArn": f.arn, "Runtime": f.runtime, "Role": f.role, "Handler": f.handler,
+    let mut v = json!({"FunctionName": n, "FunctionArn": f.arn, "Runtime": f.runtime, "Role": f.role, "Handler": f.handler,
         "CodeSize": f.size, "CodeSha256": f.sha, "Description": f.description, "Timeout": f.timeout, "MemorySize": f.memory,
-        "LastModified": f.modified, "Version": f.version, "PackageType": "Zip", "State": "Active", "LastUpdateStatus": "Successful",
+        "LastModified": f.modified, "Version": f.version, "PackageType": f.package, "State": "Active", "LastUpdateStatus": "Successful",
         "Environment": {"Variables": f.env}, "Architectures": ["x86_64"], "TracingConfig": {"Mode": "PassThrough"},
-        "Layers": f.layers.iter().map(|(a, _, s)| json!({"Arn": a, "CodeSize": s})).collect::<Vec<_>>()})
+        "Layers": f.layers.iter().map(|(a, _, s)| json!({"Arn": a, "CodeSize": s})).collect::<Vec<_>>()});
+    if f.package == "Image" {
+        // runtime and handler live inside the image
+        v.as_object_mut().unwrap().remove("Runtime");
+        v.as_object_mut().unwrap().remove("Handler");
+        v["CodeImageUri"] = f.image.clone().unwrap_or_default().into();
+    }
+    v
 }
 
 // Unpack a base64 zip into a fresh directory named after its hash.
@@ -225,6 +236,42 @@ pub fn sweep_warm(w: &mut std::collections::HashMap<String, Vec<WarmProc>>) {
         v.retain(|p| p.since.elapsed() < WARM_IDLE);
     }
     w.retain(|_, v| !v.is_empty());
+}
+
+// One resident RIE container ("docker run -d") answering POST /2015-03-31/functions/function/invocations.
+pub struct ImgWarm {
+    pub cid: String,
+    pub port: u16,
+    pub seen: usize, // log lines already handed to earlier invocations
+    pub since: Instant,
+}
+
+impl Drop for ImgWarm {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new(docker_cli()).args(["rm", "-f", &self.cid]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    }
+}
+
+pub fn sweep_img(w: &mut std::collections::HashMap<String, Vec<ImgWarm>>) {
+    for v in w.values_mut() {
+        v.retain(|p| p.since.elapsed() < WARM_IDLE);
+    }
+    w.retain(|_, v| !v.is_empty());
+}
+
+// Drop every pool entry (processes and containers) belonging to a function name.
+fn forget(lam: &mut Lambda, name: &str) {
+    let prefix = format!("{name}|");
+    {
+        let mut w = lam.warm.lock().unwrap();
+        w.retain(|k, _| !k.starts_with(&prefix));
+    }
+    let mut i = lam.img.lock().unwrap();
+    i.retain(|k, _| !k.starts_with(&prefix));
+}
+
+fn docker_cli() -> String {
+    std::env::var("RC_DOCKER").unwrap_or_else(|_| "docker".into())
 }
 
 async fn pipe_lines<R: tokio::io::AsyncRead + Unpin + Send + 'static>(r: R, tx: mpsc::Sender<String>) {
@@ -362,6 +409,9 @@ pub async fn invoke(app: &Arc<App>, id: &str, event: Value) -> Result<Invocation
     let (name, qual) = split_qualifier(id);
     let name = name.as_str();
     let f = app.lambda.lock().unwrap().resolve_weighted(name, qual.as_deref(), true)?;
+    if f.package == "Image" {
+        return invoke_image(app, &f, name, event).await;
+    }
     let (exe, warm_boot) = if f.runtime.starts_with("python") {
         (std::env::var("RC_PYTHON").unwrap_or("python3".into()), PY_BOOT_WARM)
     } else if f.runtime.starts_with("nodejs") {
@@ -494,6 +544,186 @@ async fn spawn_warm(
         tokio::spawn(pipe_lines(out, res_tx));
     }
     Ok(WarmProc { child, stdin, res: res_rx, since: Instant::now() })
+}
+
+// PackageType=Image: one resident RIE container per function+version+stamp, invoked over
+// 127.0.0.1 POST /2015-03-31/functions/function/invocations. Images must exist locally.
+// ponytail: boot time inside the invocation timeout; log tailing is docker logs - based.
+async fn invoke_image(app: &Arc<App>, f: &Func, name: &str, event: Value) -> Result<Invocation, ApiErr> {
+    let rid = uuid::Uuid::new_v4().to_string();
+    let image = f.image.clone().ok_or_else(|| err("InvalidParameterValueException", "function has no image"))?;
+    let creds = app.iam.lock().unwrap().session_for_role(&f.role, name);
+    let (akid, secret, token) = creds.unwrap_or(("test".into(), "test".into(), String::new()));
+    let _slot = SLOTS.acquire().await.expect("semaphore closed");
+    let t0 = Instant::now();
+    let key = format!("{name}|{}|{}", f.version, f.modified);
+    let pooled = {
+        let lam = app.lambda.lock().unwrap();
+        let mut w = lam.img.lock().unwrap();
+        sweep_img(&mut w);
+        w.get_mut(&key).and_then(|v| v.pop())
+    };
+    let (mut cw, cold) = match pooled {
+        Some(c) => (c, false),
+        None => (start_image(f, name, &image, &akid, &secret, &token, &rid).await?, true),
+    };
+
+    // The RIE needs a moment to boot: retry connection failures until the invocation deadline.
+    let deadline = t0 + Duration::from_secs(f.timeout.max(3));
+    let body = event.to_string();
+    let mut resp: Option<(u16, Vec<(String, String)>, Vec<u8>)> = None;
+    let mut boot_err = String::new();
+    while resp.is_none() {
+        let r = tokio::time::timeout_at(deadline.into(), rie_post(cw.port, &body)).await;
+        match r {
+            Err(_) => break,
+            Ok(Err(e)) => {
+                boot_err = e;
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            Ok(Ok(r)) => resp = Some(r),
+        }
+    }
+    let init_ms = if cold { t0.elapsed().as_secs_f64() * 1000.0 } else { 0.0 };
+    let (outcome, keep): (Value, bool) = match resp {
+        None => {
+            // timeout, or the container never answered
+            let reason = if t0.elapsed() >= Duration::from_secs(f.timeout) {
+                format!("Task timed out after {:.2} seconds", f.timeout as f64)
+            } else {
+                format!("container did not answer on port {}: {boot_err}", cw.port)
+            };
+            let _ = tokio::process::Command::new(docker_cli()).args(["rm", "-f", &cw.cid]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().await;
+            (json!({"ok": false, "error": {"errorMessage": reason, "errorType": if t0.elapsed() >= Duration::from_secs(f.timeout) { "Sandbox.Timedout" } else { "Runtime.ContainerError" }}}), false)
+        }
+        Some((status, headers, body)) => {
+            let err_type = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("lambda-runtime-function-error-type")).map(|(_, v)| v.clone());
+            let payload: Value = serde_json::from_slice(&body)
+                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body).into()));
+            if status != 200 {
+                (json!({"ok": false, "error": {"errorMessage": format!("container answered {status}"), "errorType": "Runtime.ContainerError"}}), true)
+            } else if let Some(e) = err_type.filter(|e| !e.is_empty()) {
+                (json!({"ok": false, "error": payload, "containerError": e}), true)
+            } else {
+                (json!({"ok": true, "result": payload}), true)
+            }
+        }
+    };
+
+    // Function logs are the container stdout (docker logs), tailed past what earlier invocations took.
+    let mut log = String::new();
+    if let Ok(o) = tokio::process::Command::new(docker_cli()).args(["logs", &cw.cid]).output().await {
+        let text = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        let lines: Vec<&str> = text.lines().collect();
+        if cw.seen < lines.len() {
+            log = lines[cw.seen..].join("\n");
+        }
+        cw.seen = lines.len();
+    }
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    if keep {
+        cw.since = Instant::now();
+        let lam = app.lambda.lock().unwrap();
+        let mut w = lam.img.lock().unwrap();
+        sweep_img(&mut w);
+        w.entry(key).or_default().push(cw);
+    }
+
+    if outcome["ok"] != true {
+        log += &format!("{}\n", outcome["error"]["errorMessage"].as_str().unwrap_or(""));
+    }
+    let init = if cold { format!("\tInit Duration: {init_ms:.2} ms") } else { String::new() };
+    let lines = std::iter::once(format!("START RequestId: {rid} Version: {}", f.version))
+        .chain(log.lines().map(String::from))
+        .chain([format!("END RequestId: {rid}"),
+                format!("REPORT RequestId: {rid}\tDuration: {ms:.2} ms\tBilled Duration: {} ms\tMemory Size: {} MB{init}", ms.ceil() as u64, f.memory)]);
+    let now = now_ms();
+    let stream = format!("{}/[{}]{}", chrono::Utc::now().format("%Y/%m/%d"), f.version, &rid[..8]);
+    let entries: Vec<(i64, String)> = lines.map(|l| (now, l)).collect();
+    let tail = entries.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+    app.logs.lock().unwrap().put(&format!("/aws/lambda/{name}"), &stream, entries);
+    Ok(match outcome["ok"].as_bool() {
+        Some(true) => Invocation { payload: outcome["result"].clone(), error: None, log_tail: tail, version: f.version.clone(), cold },
+        _ => Invocation { payload: outcome["error"].clone(), error: Some("Unhandled".into()), log_tail: tail, version: f.version.clone(), cold },
+    })
+}
+
+// docker run -d the image on a free loopback port, with the function env and role credentials.
+async fn start_image(f: &Func, name: &str, image: &str, akid: &str, secret: &str, token: &str, rid: &str) -> Result<ImgWarm, ApiErr> {
+    let port = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await
+        .and_then(|l| l.local_addr())
+        .map_err(|e| err("ServiceException", format!("no free port for the function container: {e}")))?
+        .port();
+    let cname = format!("rc-lambda-{}", &rid[..8]);
+    // Containers reach the emulator at host.docker.internal (BIND=0.0.0.0 to allow it).
+    let emu_port = crate::endpoint().rsplit(':').next().unwrap_or("4566").to_string();
+    // docker run [OPTIONS] IMAGE: every flag must come before the image, or it becomes the container command.
+    let mut cmd = tokio::process::Command::new(docker_cli());
+    cmd.args(["run", "-d", "--rm", "--name", &cname, "-p", &format!("127.0.0.1:{port}:8080"),
+              "--memory", &format!("{}m", f.memory), "--add-host", "host.docker.internal:host-gateway"]);
+    for (k, v) in f.env.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))) {
+        cmd.args(["-e", &format!("{k}={v}")]);
+    }
+    for (k, v) in [
+        ("AWS_REGION", REGION.as_str().to_string()),
+        ("AWS_DEFAULT_REGION", REGION.as_str().to_string()),
+        ("AWS_ENDPOINT_URL", format!("http://host.docker.internal:{emu_port}")),
+        ("AWS_ACCESS_KEY_ID", akid.to_string()),
+        ("AWS_SECRET_ACCESS_KEY", secret.to_string()),
+        ("AWS_SESSION_TOKEN", token.to_string()),
+        ("AWS_LAMBDA_FUNCTION_NAME", name.to_string()),
+        ("AWS_LAMBDA_FUNCTION_VERSION", f.version.clone()),
+        ("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", f.memory.to_string()),
+        ("AWS_LAMBDA_LOG_GROUP_NAME", format!("/aws/lambda/{name}")),
+    ] {
+        cmd.args(["-e", &format!("{k}={v}")]);
+    }
+    cmd.arg(image);
+    cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let out = cmd.output().await.map_err(|e| err("ServiceException", format!("docker run failed: {e}")))?;
+    if !out.status.success() {
+        return Err(err("InvalidParameterValueException", format!("could not start image {image}: {}", String::from_utf8_lossy(&out.stderr))));
+    }
+    let cid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Ok(ImgWarm { cid, port, seen: 0, since: Instant::now() })
+}
+
+// Minimal HTTP/1.1 POST to the RIE (Connection: close, chunked bodies decoded).
+async fn rie_post(port: u16, body: &str) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
+    use tokio::io::AsyncReadExt;
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.map_err(|e| e.to_string())?;
+    let req = format!("POST /2015-03-31/functions/function/invocations HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+    s.write_all(req.as_bytes()).await.map_err(|e| e.to_string())?;
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).await.map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&raw).to_string();
+    let mut parts = text.split("\r\n\r\n");
+    let head = parts.next().ok_or("empty response")?;
+    let rest: Vec<&str> = parts.collect();
+    let mut hl = head.lines();
+    let status: u16 = hl.next().and_then(|l| l.split_whitespace().nth(1)).and_then(|c| c.parse().ok()).ok_or("no status")?;
+    let headers: Vec<(String, String)> = hl.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string())).collect();
+    let chunked = headers.iter().any(|(k, v)| k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked"));
+    let body_bytes = if chunked {
+        let mut out = Vec::new();
+        for seg in rest {
+            let mut rem = seg;
+            loop {
+                let (sz, tail) = rem.split_once("\r\n").ok_or("bad chunk")?;
+                let n = usize::from_str_radix(sz.trim().split(';').next().unwrap_or("0"), 16).map_err(|e| e.to_string())?;
+                if n == 0 {
+                    break;
+                }
+                let (data, t2) = tail.split_at_checked(n).ok_or("short chunk")?;
+                out.extend_from_slice(data.as_bytes());
+                rem = t2.strip_prefix("\r\n").unwrap_or(t2);
+            }
+        }
+        out
+    } else {
+        rest.join("\r\n\r\n").into_bytes()
+    };
+    Ok((status, headers, body_bytes))
 }
 
 fn reply(status: u16, v: Value) -> Response {
@@ -674,16 +904,35 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
                 if st.f.contains_key(&n) {
                     return Err(ApiErr { status: 409, ..err("ResourceConflictException", format!("Function already exist: {n}")) });
                 }
-                let zip = j["Code"]["ZipFile"].as_str().ok_or_else(|| err("InvalidParameterValueException", "Code.ZipFile is required (S3 code and images are not supported yet)"))?;
-                let (dir, size, sha) = unpack(&n, zip)?;
+                let (dir, size, sha, image, package) = if j["PackageType"].as_str() == Some("Image") {
+                    // Images must already exist in local Docker: no ECR emulation, no pull.
+                    if j["Code"]["ZipFile"].is_string() || j.get("Layers").is_some_and(|l| l.as_array().is_some_and(|a| !a.is_empty())) {
+                        return Err(err("InvalidParameterValueException", "ZipFile and Layers cannot be used with PackageType=Image"));
+                    }
+                    let uri = j["Code"]["ImageUri"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| err("InvalidParameterValueException", "Code.ImageUri is required for PackageType=Image"))?;
+                    let out = std::process::Command::new(docker_cli()).args(["image", "inspect", uri]).output().map_err(|e| err("ServiceException", format!("docker unavailable: {e}")))?;
+                    if !out.status.success() {
+                        return Err(err("InvalidParameterValueException", format!("Image {uri} does not exist in local Docker (no ECR emulation or pull)")));
+                    }
+                    (std::env::temp_dir(), 0, uri.to_string(), Some(uri.into()), "Image".into())
+                } else if j["Code"]["ImageUri"].is_string() {
+                    return Err(err("InvalidParameterValueException", "ImageUri requires PackageType=Image"));
+                } else {
+                    let zip = j["Code"]["ZipFile"].as_str().ok_or_else(|| err("InvalidParameterValueException", "Code.ZipFile is required (S3 code is not supported)"))?;
+                    let (dir, size, sha) = unpack(&n, zip)?;
+                    (dir, size, sha, None, "Zip".into())
+                };
                 let f = Func {
-                    arn: arn(&n), runtime: crate::need(&j, "Runtime")?.into(), role: crate::need(&j, "Role")?.into(), handler: crate::need(&j, "Handler")?.into(),
+                    arn: arn(&n), package, image, runtime: j["Runtime"].as_str().unwrap_or("").into(), role: j["Role"].as_str().unwrap_or("").into(), handler: j["Handler"].as_str().unwrap_or("").into(),
                     timeout: j["Timeout"].as_u64().unwrap_or(3), memory: j["MemorySize"].as_u64().unwrap_or(128),
                     env: j["Environment"]["Variables"].as_object().cloned().unwrap_or_default(),
                     description: j["Description"].as_str().unwrap_or("").into(), dir, size, sha, modified: modified_now(), perms: vec![],
                     version: "$LATEST".into(), versions: vec![], aliases: BTreeMap::new(), icfg: InvokeConfig::default(),
-                    layers: st.layer_refs(&j["Layers"])?,
+                    layers: if j["PackageType"].as_str() == Some("Image") { vec![] } else { st.layer_refs(&j["Layers"])? },
                 };
+                if f.package == "Zip" && (f.runtime.is_empty() || f.handler.is_empty()) {
+                    return Err(err("InvalidParameterValueException", "Runtime and Handler are required for Zip functions"));
+                }
                 let out = config(&n, &f);
                 st.f.insert(n, f);
                 (201, out)
@@ -691,7 +940,12 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
             "ListFunctions" => (200, json!({"Functions": st.f.iter().map(|(n, f)| config(n, f)).collect::<Vec<_>>()})),
             "GetFunction" => {
                 let f = st.resolve(&name, qual.as_deref())?;
-                (200, json!({"Configuration": config(&name, &f), "Code": {"RepositoryType": "S3", "Location": format!("file://{}", f.dir.display())}}))
+                let code = if f.package == "Image" {
+                    json!({"RepositoryType": "ECR", "ImageUri": f.image.clone().unwrap_or_default()})
+                } else {
+                    json!({"RepositoryType": "S3", "Location": format!("file://{}", f.dir.display())})
+                };
+                (200, json!({"Configuration": config(&name, &f), "Code": code}))
             }
             "GetFunctionConfiguration" => (200, config(&name, &st.resolve(&name, qual.as_deref())?)),
             "PublishVersion" => {
@@ -774,14 +1028,31 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
             "DeleteFunction" => {
                 st.f.remove(&name).ok_or_else(|| not_found(&name))?;
                 st.maps.retain(|_, m| m.function != name);
+                forget(&mut *st, &name);
                 (204, Value::Null)
             }
             "UpdateFunctionCode" => {
-                let zip = j["ZipFile"].as_str().ok_or_else(|| err("InvalidParameterValueException", "ZipFile is required"))?;
-                let (dir, size, sha) = unpack(&name, zip)?;
                 let f = st.f.get_mut(&name).ok_or_else(|| not_found(&name))?;
-                (f.dir, f.size, f.sha, f.modified) = (dir, size, sha, modified_now());
-                (200, config(&name, f))
+                if f.package == "Image" {
+                    let uri = j["ImageUri"].as_str().filter(|s| !s.is_empty())
+                        .ok_or_else(|| err("InvalidParameterValueException", "ImageUri is required for image functions"))?;
+                    let out = std::process::Command::new(docker_cli()).args(["image", "inspect", uri]).output().map_err(|e| err("ServiceException", format!("docker unavailable: {e}")))?;
+                    if !out.status.success() {
+                        return Err(err("InvalidParameterValueException", format!("Image {uri} does not exist in local Docker")));
+                    }
+                    f.image = Some(uri.into());
+                    f.sha = uri.into();
+                    f.modified = modified_now();
+                } else if j["ImageUri"].is_string() {
+                    return Err(err("InvalidParameterValueException", "ImageUri requires a function created with PackageType=Image"));
+                } else {
+                    let zip = j["ZipFile"].as_str().ok_or_else(|| err("InvalidParameterValueException", "ZipFile is required"))?;
+                    let (dir, size, sha) = unpack(&name, zip)?;
+                    (f.dir, f.size, f.sha, f.modified) = (dir, size, sha, modified_now());
+                }
+                let out = config(&name, f);
+                forget(&mut *st, &name);
+                (200, out)
             }
             "UpdateFunctionConfiguration" => {
                 let layers = if j.get("Layers").is_some() { Some(st.layer_refs(&j["Layers"])?) } else { None };
@@ -803,7 +1074,9 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
                     }
                 }
                 f.modified = modified_now();
-                (200, config(&name, f))
+                let out = config(&name, f);
+                forget(&mut *st, &name);
+                (200, out)
             }
             // Resource-based policy: statements are evaluated for IAM-signed calls (see iam::authorize_with).
             // Service principals (sns.amazonaws.com …) gate SNS/EventBridge/S3 triggers with ENFORCE_IAM=1 (main.rs service_gate).

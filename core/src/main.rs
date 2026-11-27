@@ -1559,7 +1559,16 @@ async fn serve() {
     route53::serve_dns(app.clone());
     let l = tokio::net::TcpListener::bind(&bind).await.expect("bind");
     eprintln!("rocalcloud listening on http://{bind}  (GUI: /_ui, town: /_town, events: /_events, ENFORCE_IAM={})", *ENFORCE as u8);
-    axum::serve(l, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).with_graceful_shutdown(shutdown_signal(app)).await.unwrap();
+    axum::serve(l, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).with_graceful_shutdown(shutdown_signal(app.clone())).await.unwrap();
+    // App may not be dropped on exit (Arc clones in tasks), so remove image containers explicitly.
+    {
+        let lam = app.lambda.lock().unwrap();
+        let mut imgs = lam.img.lock().unwrap();
+        for v in imgs.values_mut() {
+            v.clear();
+        }
+        imgs.clear();
+    }
 }
 
 #[cfg(test)]
