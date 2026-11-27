@@ -289,7 +289,7 @@ fn checks(app: &App, svc: &Svc, body: &[u8]) -> Vec<(String, String)> {
             vec![(format!("apigateway:{m}"), arn)]
         }
         Svc::Lambda(op, path, _) => {
-            let res = lambda::path_name(path).or_else(|| j["FunctionName"].as_str().map(lambda::name_of)).map_or("*".into(), |n| lambda::arn(&n));
+            let res = lambda::layer_resource(path).unwrap_or_else(|| lambda::path_name(path).or_else(|| j["FunctionName"].as_str().map(lambda::name_of)).map_or("*".into(), |n| lambda::arn(&n)));
             // IAM names the Invoke API "lambda:InvokeFunction".
             vec![(format!("lambda:{}", if *op == "Invoke" { "InvokeFunction" } else { op }), res)]
         }
@@ -361,7 +361,7 @@ async fn handle(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<std:
     let principal = app.iam.lock().unwrap().principal(&akid);
     let target = headers.get("x-amz-target").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     let is_form = headers.get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|c| c.starts_with("application/x-www-form-urlencoded"));
-    let lambda_path = ["/2015-03-31/", "/2014-11-13/", "/2019-09-25/"].iter().find_map(|v| uri.path().strip_prefix(v)).filter(|_| scope == "lambda" || scope.is_empty());
+    let lambda_path = ["/2015-03-31/", "/2014-11-13/", "/2019-09-25/", "/2018-10-31/"].iter().find_map(|v| uri.path().strip_prefix(v)).filter(|_| scope == "lambda" || scope.is_empty());
     let svc = if let Some(path) = uri.path().strip_prefix("/2013-04-01/").filter(|_| scope == "route53") {
         Svc::R53(method.to_string(), path.to_string())
     } else if let Some(path) = uri.path().strip_prefix("/v2/email/").filter(|_| scope == "ses") {

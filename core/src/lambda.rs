@@ -1,6 +1,9 @@
 // Lambda (REST-JSON). Functions run as local processes (python3 / node) per invocation.
 // Versions (PublishVersion snapshots config + code) and aliases resolve "fn:qualifier" / ?Qualifier= on Invoke and Get*.
-// ponytail: no warm containers, layers, or container images; the host interpreter is used
+// Layers (PublishLayerVersion …) unpack once per version; a function's layers go on PYTHONPATH / NODE_PATH, later layers first,
+// which matches AWS's "later layers overwrite earlier ones in /opt". ponytail: NODE_PATH only reaches require(), not ESM
+// import of bare specifiers; /opt itself is not emulated.
+// ponytail: no warm containers or container images; the host interpreter is used
 // regardless of the runtime's minor version. Add a container runner when isolation matters.
 use crate::{b64, err, now_ms, unb64, ApiErr, App, ACCOUNT, REGION};
 use axum::{body::Body, http::HeaderMap, response::Response};
@@ -44,6 +47,20 @@ pub struct Func {
     versions: Vec<Func>, // published snapshots; version n is versions[n - 1]
     aliases: BTreeMap<String, Alias>, // alias -> (version, description)
     icfg: InvokeConfig, // per-function (not per-qualifier) async invoke config: retries, age, destinations
+    layers: Vec<(String, PathBuf, usize)>, // (LayerVersionArn, unpacked dir, size), in configured order
+}
+// One published layer version. Deleted versions become None so numbering never repeats.
+#[derive(Clone)]
+struct LayerVer {
+    dir: PathBuf,
+    size: usize,
+    sha: String,
+    desc: String,
+    license: String,
+    runtimes: Vec<Value>,
+    archs: Vec<Value>,
+    created: String,
+    perms: Vec<Value>,
 }
 pub struct Mapping {
     source: String,
@@ -61,6 +78,34 @@ pub struct Mapping {
 pub struct Lambda {
     f: BTreeMap<String, Func>,
     maps: BTreeMap<String, Mapping>,
+    layers: BTreeMap<String, Vec<Option<LayerVer>>>,
+}
+
+pub fn layer_arn(name: &str) -> String {
+    format!("arn:aws:lambda:{}:{ACCOUNT}:layer:{name}", *REGION)
+}
+// IAM resource for a /layers/... path: the layer, or the layer version when the path names one.
+pub fn layer_resource(path: &str) -> Option<String> {
+    let p: Vec<&str> = path.trim_matches('/').split('/').collect();
+    match p.as_slice() {
+        ["layers"] => Some("*".into()),
+        ["layers", n, "versions", v, ..] => Some(format!("{}:{v}", layer_arn(n))),
+        ["layers", n, ..] => Some(layer_arn(n)),
+        _ => None,
+    }
+}
+// "arn:aws:lambda:region:acct:layer:name:version" → (name, version).
+fn parse_layer_arn(a: &str) -> Option<(String, usize)> {
+    let p: Vec<&str> = a.split(':').collect();
+    match p.as_slice() {
+        ["arn", "aws", "lambda", _, _, "layer", n, v] => Some((n.to_string(), v.parse().ok()?)),
+        _ => None,
+    }
+}
+fn layer_json(n: &str, v: usize, l: &LayerVer) -> Value {
+    json!({"Content": {"Location": format!("file://{}", l.dir.display()), "CodeSha256": l.sha, "CodeSize": l.size},
+        "LayerArn": layer_arn(n), "LayerVersionArn": format!("{}:{v}", layer_arn(n)), "Description": l.desc, "CreatedDate": l.created,
+        "Version": v, "CompatibleRuntimes": l.runtimes, "CompatibleArchitectures": l.archs, "LicenseInfo": l.license})
 }
 
 pub fn arn(name: &str) -> String {
@@ -105,7 +150,8 @@ fn config(n: &str, f: &Func) -> Value {
     json!({"FunctionName": n, "FunctionArn": f.arn, "Runtime": f.runtime, "Role": f.role, "Handler": f.handler,
         "CodeSize": f.size, "CodeSha256": f.sha, "Description": f.description, "Timeout": f.timeout, "MemorySize": f.memory,
         "LastModified": f.modified, "Version": f.version, "PackageType": "Zip", "State": "Active", "LastUpdateStatus": "Successful",
-        "Environment": {"Variables": f.env}, "Architectures": ["x86_64"], "TracingConfig": {"Mode": "PassThrough"}})
+        "Environment": {"Variables": f.env}, "Architectures": ["x86_64"], "TracingConfig": {"Mode": "PassThrough"},
+        "Layers": f.layers.iter().map(|(a, _, s)| json!({"Arn": a, "CodeSize": s})).collect::<Vec<_>>()})
 }
 
 // Unpack a base64 zip into a fresh directory named after its hash.
@@ -231,8 +277,14 @@ pub async fn invoke(app: &Arc<App>, id: &str, event: Value) -> Result<Invocation
 
     let _slot = SLOTS.acquire().await.expect("semaphore closed");
     let t0 = Instant::now();
+    // Later layers win, so they go first on the search path.
+    let layer_path = std::env::join_paths(f.layers.iter().rev().flat_map(|(_, d, _)| {
+        if f.runtime.starts_with("python") { vec![d.join("python"), d.join("python/lib").join(&f.runtime).join("site-packages")] } else { vec![d.join("nodejs/node_modules")] }
+    })).unwrap_or_default();
+    let path_var = if f.runtime.starts_with("python") { "PYTHONPATH" } else { "NODE_PATH" };
     let mut cmd = Command::new(&exe);
     cmd.arg(if f.runtime.starts_with("python") { "-c" } else { "-e" }).arg(boot).current_dir(&f.dir)
+        .env(path_var, &layer_path)
         .envs(f.env.iter().filter_map(|(k, v)| Some((k, v.as_str()?))))
         .env("_HANDLER", &f.handler).env("_RC_TIMEOUT", f.timeout.to_string()).env("_RC_ARN", &f.arn)
         .env("_RC_REQUEST_ID", &rid).env("_RC_RESULT", &result)
@@ -318,6 +370,14 @@ pub fn op_of(method: &str, path: &str) -> &'static str {
         ("GET", ["event-source-mappings"]) => "ListEventSourceMappings",
         ("GET", ["event-source-mappings", _]) => "GetEventSourceMapping",
         ("DELETE", ["event-source-mappings", _]) => "DeleteEventSourceMapping",
+        ("GET", ["layers"]) => "ListLayers", // also GetLayerVersionByArn (?find=LayerVersion&Arn=)
+        ("POST", ["layers", _, "versions"]) => "PublishLayerVersion",
+        ("GET", ["layers", _, "versions"]) => "ListLayerVersions",
+        ("GET", ["layers", _, "versions", _]) => "GetLayerVersion",
+        ("DELETE", ["layers", _, "versions", _]) => "DeleteLayerVersion",
+        ("POST", ["layers", _, "versions", _, "policy"]) => "AddLayerVersionPermission",
+        ("GET", ["layers", _, "versions", _, "policy"]) => "GetLayerVersionPolicy",
+        ("DELETE", ["layers", _, "versions", _, "policy", _]) => "RemoveLayerVersionPermission",
         _ => "Unsupported",
     }
 }
@@ -457,6 +517,7 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
                     env: j["Environment"]["Variables"].as_object().cloned().unwrap_or_default(),
                     description: j["Description"].as_str().unwrap_or("").into(), dir, size, sha, modified: modified_now(), perms: vec![],
                     version: "$LATEST".into(), versions: vec![], aliases: BTreeMap::new(), icfg: InvokeConfig::default(),
+                    layers: st.layer_refs(&j["Layers"])?,
                 };
                 let out = config(&n, &f);
                 st.f.insert(n, f);
@@ -558,7 +619,11 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
                 (200, config(&name, f))
             }
             "UpdateFunctionConfiguration" => {
+                let layers = if j.get("Layers").is_some() { Some(st.layer_refs(&j["Layers"])?) } else { None };
                 let f = st.f.get_mut(&name).ok_or_else(|| not_found(&name))?;
+                if let Some(l) = layers {
+                    f.layers = l;
+                }
                 for (k, v) in j.as_object().into_iter().flatten() {
                     match k.as_str() {
                         "Runtime" => f.runtime = v.as_str().unwrap_or(&f.runtime).into(),
@@ -568,6 +633,7 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
                         "MemorySize" => f.memory = v.as_u64().unwrap_or(f.memory),
                         "Description" => f.description = v.as_str().unwrap_or("").into(),
                         "Environment" => f.env = v["Variables"].as_object().cloned().unwrap_or_default(),
+                        "Layers" => {} // resolved below, outside this borrow
                         _ => {}
                     }
                 }
@@ -716,6 +782,97 @@ pub async fn api(app: &Arc<App>, op: &str, path: &str, q: &std::collections::Has
                     let mut v = mapping_json(&id, &m);
                     v["State"] = "Deleting".into();
                     (202, v)
+                }
+            }
+            "PublishLayerVersion" => {
+                let n = seg(1);
+                if n.is_empty() || n.len() > 64 || !n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+                    return Err(err("ValidationException", format!("Layer name {n} is not valid ([a-zA-Z0-9-_]{{1,64}})")));
+                }
+                let zip = j["Content"]["ZipFile"].as_str().ok_or_else(|| err("InvalidParameterValueException", "Content.ZipFile is required (S3 layer content is not supported locally)"))?;
+                let (dir, size, sha) = unpack(&format!("layer-{n}"), zip)?;
+                let arr = |k: &str| j[k].as_array().cloned().unwrap_or_default();
+                let l = LayerVer { dir, size, sha, desc: j["Description"].as_str().unwrap_or("").into(), license: j["LicenseInfo"].as_str().unwrap_or("").into(),
+                                   runtimes: arr("CompatibleRuntimes"), archs: arr("CompatibleArchitectures"), created: modified_now(), perms: vec![] };
+                let vs = st.layers.entry(n.clone()).or_default();
+                vs.push(Some(l));
+                (201, layer_json(&n, vs.len(), vs.last().unwrap().as_ref().unwrap()))
+            }
+            "ListLayers" if q.get("find").is_some_and(|f| f == "LayerVersion") => {
+                let a = q.get("Arn").cloned().unwrap_or_default();
+                let (n, v) = parse_layer_arn(&a).ok_or_else(|| err("ValidationException", format!("{a} is not a layer version ARN")))?;
+                (200, layer_json(&n, v, st.layer_ver(&n, v)?))
+            }
+            "ListLayers" | "ListLayerVersions" => {
+                let rt = q.get("CompatibleRuntime");
+                let fits = |l: &LayerVer| rt.is_none_or(|r| l.runtimes.iter().any(|x| x == r.as_str()));
+                // Newest first, like AWS.
+                if op == "ListLayers" {
+                    let list: Vec<Value> = st.layers.iter().filter_map(|(n, vs)| {
+                        let (v, l) = vs.iter().enumerate().rev().find_map(|(i, l)| l.as_ref().filter(|l| fits(l)).map(|l| (i + 1, l)))?;
+                        Some(json!({"LayerName": n, "LayerArn": layer_arn(n), "LatestMatchingVersion": layer_json(n, v, l)}))
+                    }).collect();
+                    (200, json!({"Layers": list}))
+                } else {
+                    let n = seg(1);
+                    let vs = st.layers.get(&n).cloned().unwrap_or_default();
+                    let list: Vec<Value> = vs.iter().enumerate().rev().filter_map(|(i, l)| l.as_ref().filter(|l| fits(l)).map(|l| layer_json(&n, i + 1, l))).collect();
+                    (200, json!({"LayerVersions": list}))
+                }
+            }
+            "GetLayerVersion" => {
+                let (n, v) = (seg(1), seg(3).parse().unwrap_or(0));
+                (200, layer_json(&n, v, st.layer_ver(&n, v)?))
+            }
+            "DeleteLayerVersion" => {
+                // Idempotent like AWS; functions already using the version keep their unpacked copy.
+                let (n, v) = (seg(1), seg(3).parse::<usize>().unwrap_or(0));
+                if let Some(slot) = st.layers.get_mut(&n).and_then(|vs| vs.get_mut(v.wrapping_sub(1))) {
+                    *slot = None;
+                }
+                (204, Value::Null)
+            }
+            "AddLayerVersionPermission" | "GetLayerVersionPolicy" | "RemoveLayerVersionPermission" => {
+                let (n, v) = (seg(1), seg(3).parse::<usize>().unwrap_or(0));
+                st.layer_ver(&n, v)?;
+                let l = st.layers.get_mut(&n).and_then(|vs| vs.get_mut(v - 1)).and_then(|s| s.as_mut()).unwrap();
+                let varn = format!("{}:{v}", layer_arn(&n));
+                match op {
+                    "AddLayerVersionPermission" => {
+                        let sid = crate::need(&j, "StatementId")?.to_string();
+                        let action = crate::need(&j, "Action")?;
+                        let who = crate::need(&j, "Principal")?;
+                        if !matches!(action, "lambda:GetLayerVersion" | "lambda:ListLayerVersions") {
+                            return Err(err("InvalidParameterValueException", "Action must be lambda:GetLayerVersion or lambda:ListLayerVersions"));
+                        }
+                        // ponytail: one local account, so only this account or "*" can be granted.
+                        let principal = match who {
+                            "*" => json!("*"),
+                            w if w == ACCOUNT || w == format!("arn:aws:iam::{ACCOUNT}:root") => json!({"AWS": format!("arn:aws:iam::{ACCOUNT}:root")}),
+                            w => return Err(err("InvalidParameterValueException", format!("Principal {w} is not this account (only {ACCOUNT} or * locally)"))),
+                        };
+                        if l.perms.iter().any(|s| s["Sid"] == sid.as_str()) {
+                            return Err(ApiErr { status: 409, ..err("ResourceConflictException", format!("The statement id ({sid}) provided already exists.")) });
+                        }
+                        let s = json!({"Sid": sid, "Effect": "Allow", "Principal": principal, "Action": action, "Resource": varn});
+                        l.perms.push(s.clone());
+                        (201, json!({"Statement": s.to_string(), "RevisionId": uuid::Uuid::new_v4().to_string()}))
+                    }
+                    "GetLayerVersionPolicy" => {
+                        if l.perms.is_empty() {
+                            return Err(ApiErr { status: 404, ..err("ResourceNotFoundException", "No policy is associated with the given resource.") });
+                        }
+                        (200, json!({"Policy": json!({"Version": "2012-10-17", "Id": "default", "Statement": l.perms}).to_string(), "RevisionId": uuid::Uuid::new_v4().to_string()}))
+                    }
+                    _ => {
+                        let sid = seg(5);
+                        let before = l.perms.len();
+                        l.perms.retain(|s| s["Sid"] != sid.as_str());
+                        if l.perms.len() == before {
+                            return Err(ApiErr { status: 404, ..err("ResourceNotFoundException", format!("Statement {sid} is not found in resource policy.")) });
+                        }
+                        (204, Value::Null)
+                    }
                 }
             }
             _ => return Err(ApiErr { status: 404, ..err("UnknownOperationException", format!("{op} is not supported yet")) }),
@@ -929,6 +1086,28 @@ async fn try_kinesis_batch(app: &Arc<App>, func: &str, shard: usize, src: &str, 
 }
 
 impl Lambda {
+    fn layer_ver(&self, n: &str, v: usize) -> Result<&LayerVer, ApiErr> {
+        self.layers.get(n).and_then(|vs| vs.get(v.wrapping_sub(1))).and_then(|l| l.as_ref())
+            .ok_or_else(|| ApiErr { status: 404, ..err("ResourceNotFoundException", format!("Layer version {}:{v} does not exist.", layer_arn(n))) })
+    }
+    // A function's Layers list → (arn, dir, size). At most 5, each an existing version, one version per layer.
+    fn layer_refs(&self, v: &Value) -> Result<Vec<(String, PathBuf, usize)>, ApiErr> {
+        let bad = |m: String| err("InvalidParameterValueException", m);
+        let arns: Vec<&str> = v.as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
+        if arns.len() > 5 {
+            return Err(bad("Cannot reference more than 5 layers.".into()));
+        }
+        let mut seen = std::collections::HashSet::new();
+        arns.iter().map(|a| {
+            let (n, ver) = parse_layer_arn(a).ok_or_else(|| bad(format!("{a} is not a layer version ARN")))?;
+            if !seen.insert(n.clone()) {
+                return Err(bad(format!("Two different versions of the same layer are not allowed: {n}")));
+            }
+            let l = self.layer_ver(&n, ver).map_err(|_| bad(format!("Layer version {a} does not exist.")))?;
+            Ok((a.to_string(), l.dir.clone(), l.size))
+        }).collect()
+    }
+
     pub fn exists(&self, name: &str) -> bool {
         self.f.contains_key(name)
     }
@@ -948,6 +1127,7 @@ impl Lambda {
                 if let Some(d) = &f.icfg.on_success {
                     rows.push(json!(["성공 대상", "OnSuccess", d]));
                 }
+                rows.extend(f.layers.iter().map(|(a, _, s)| json!(["레이어", a, format!("{s} B")])));
                 rows.extend(maps);
                 json!({"name": n, "count": rows.len() - 3, "sub": format!("{} · 로그 그룹 /aws/lambda/{n}", f.arn), "cols": ["항목", "값", ""], "rows": rows})
             })
@@ -958,6 +1138,24 @@ impl Lambda {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layer_arns_and_resources() {
+        assert_eq!(parse_layer_arn("arn:aws:lambda:us-east-1:000000000000:layer:libs:3"), Some(("libs".into(), 3)));
+        assert_eq!(parse_layer_arn("arn:aws:lambda:us-east-1:000000000000:layer:libs"), None);
+        assert_eq!(parse_layer_arn("arn:aws:lambda:us-east-1:000000000000:function:f:3"), None);
+        assert!(layer_resource("layers/libs/versions/2/policy").unwrap().ends_with(":layer:libs:2"));
+        assert!(layer_resource("layers/libs/versions").unwrap().ends_with(":layer:libs"));
+        assert_eq!(layer_resource("functions/f"), None);
+        let mut st = Lambda::default();
+        st.layers.insert("libs".into(), vec![None, Some(LayerVer { dir: "/tmp/x".into(), size: 1, sha: String::new(), desc: String::new(), license: String::new(),
+            runtimes: vec![], archs: vec![], created: String::new(), perms: vec![] })]);
+        let a = |v: u32| json!(format!("arn:aws:lambda:us-east-1:000000000000:layer:libs:{v}"));
+        assert_eq!(st.layer_refs(&json!([a(2)])).unwrap().len(), 1);
+        assert!(st.layer_refs(&json!([a(1)])).is_err(), "deleted version");
+        assert!(st.layer_refs(&json!([a(2), a(2)])).is_err(), "same layer twice");
+        assert!(st.layer_refs(&Value::Array(vec![a(2); 6])).is_err(), "more than five");
+    }
 
     #[test]
     fn invoke_config_round_trip() {

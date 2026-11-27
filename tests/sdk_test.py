@@ -3349,6 +3349,65 @@ def test_s3_checksums():
     s3.delete_bucket(Bucket=b)
 
 
+def test_lambda_layers():
+    lam = boto3.client("lambda", **kw)
+    role = "arn:aws:iam::000000000000:role/none"
+    base = f"lyr{run}"
+    # Two layers ship the same module; the later one in Layers must win (AWS: later layers overwrite /opt).
+    la = lam.publish_layer_version(LayerName=f"{base}-a", Content={"ZipFile": zipped({"python/shared.py": "WHO = 'a'\n", "python/only_a.py": "X = 1\n"})},
+                                   CompatibleRuntimes=["python3.12"], Description="first")
+    lb = lam.publish_layer_version(LayerName=f"{base}-b", Content={"ZipFile": zipped({"python/lib/python3.12/site-packages/shared.py": "WHO = 'b'\n"})},
+                                   CompatibleRuntimes=["python3.12"])
+    assert la["Version"] == 1 and la["LayerVersionArn"].endswith(f":layer:{base}-a:1"), la
+    a2 = lam.publish_layer_version(LayerName=f"{base}-a", Content={"ZipFile": zipped({"python/shared.py": "WHO = 'a2'\n", "python/only_a.py": "X = 2\n"})})
+    assert a2["Version"] == 2
+    vs = lam.list_layer_versions(LayerName=f"{base}-a")["LayerVersions"]
+    assert [v["Version"] for v in vs] == [2, 1], vs  # newest first
+    names = {l["LayerName"]: l for l in lam.list_layers()["Layers"]}
+    assert names[f"{base}-a"]["LatestMatchingVersion"]["Version"] == 2
+    # CompatibleRuntime filter: version 2 declared no runtimes, so the latest python3.12 match is 1.
+    names = {l["LayerName"]: l for l in lam.list_layers(CompatibleRuntime="python3.12")["Layers"]}
+    assert names[f"{base}-a"]["LatestMatchingVersion"]["Version"] == 1
+    assert lam.get_layer_version_by_arn(Arn=la["LayerVersionArn"])["Description"] == "first"
+
+    src = "import shared, only_a\ndef handler(e, c):\n    return {'who': shared.WHO, 'x': only_a.X}\n"
+    fn = f"{base}-fn"
+    lam.create_function(FunctionName=fn, Runtime="python3.12", Role=role, Handler="index.handler", Code={"ZipFile": zipped({"index.py": src})},
+                        Layers=[la["LayerVersionArn"], lb["LayerVersionArn"]])
+    cfg = lam.get_function_configuration(FunctionName=fn)
+    assert [l["Arn"] for l in cfg["Layers"]] == [la["LayerVersionArn"], lb["LayerVersionArn"]], cfg["Layers"]
+    out = json.loads(lam.invoke(FunctionName=fn, Payload="{}")["Payload"].read())
+    assert out == {"who": "b", "x": 1}, out
+    # Reversed order: layer a (v1) is now last and wins.
+    lam.update_function_configuration(FunctionName=fn, Layers=[lb["LayerVersionArn"], la["LayerVersionArn"]])
+    out = json.loads(lam.invoke(FunctionName=fn, Payload="{}")["Payload"].read())
+    assert out == {"who": "a", "x": 1}, out
+
+    # Errors: unknown layer, two versions of one layer, more than five, unsafe zip.
+    missing = la["LayerVersionArn"].rsplit(":", 1)[0] + ":99"
+    assert code(lam.update_function_configuration, FunctionName=fn, Layers=[missing]) == "InvalidParameterValueException"
+    assert code(lam.update_function_configuration, FunctionName=fn, Layers=[la["LayerVersionArn"], a2["LayerVersionArn"]]) == "InvalidParameterValueException"
+    assert code(lam.update_function_configuration, FunctionName=fn, Layers=[la["LayerVersionArn"]] * 6) == "InvalidParameterValueException"
+    assert code(lam.publish_layer_version, LayerName=f"{base}-evil", Content={"ZipFile": zipped({"../evil.py": "x = 1\n"})}) == "InvalidParameterValueException"
+    assert code(lam.get_layer_version, LayerName=f"{base}-a", VersionNumber=99) == "ResourceNotFoundException"
+
+    # Permissions: this account or *, not another account.
+    lam.add_layer_version_permission(LayerName=f"{base}-a", VersionNumber=1, StatementId="me", Action="lambda:GetLayerVersion", Principal="000000000000")
+    pol = json.loads(lam.get_layer_version_policy(LayerName=f"{base}-a", VersionNumber=1)["Policy"])
+    assert pol["Statement"][0]["Sid"] == "me"
+    assert code(lam.add_layer_version_permission, LayerName=f"{base}-a", VersionNumber=1, StatementId="me", Action="lambda:GetLayerVersion", Principal="*") == "ResourceConflictException"
+    assert code(lam.add_layer_version_permission, LayerName=f"{base}-a", VersionNumber=1, StatementId="other", Action="lambda:GetLayerVersion", Principal="111122223333") == "InvalidParameterValueException"
+    lam.remove_layer_version_permission(LayerName=f"{base}-a", VersionNumber=1, StatementId="me")
+    assert code(lam.get_layer_version_policy, LayerName=f"{base}-a", VersionNumber=1) == "ResourceNotFoundException"
+
+    # Deleting a version keeps functions that already use it working, but new references fail.
+    lam.delete_layer_version(LayerName=f"{base}-a", VersionNumber=1)
+    lam.delete_layer_version(LayerName=f"{base}-a", VersionNumber=1)  # idempotent
+    assert json.loads(lam.invoke(FunctionName=fn, Payload="{}")["Payload"].read())["who"] == "a"
+    assert code(lam.update_function_configuration, FunctionName=fn, Layers=[la["LayerVersionArn"]]) == "InvalidParameterValueException"
+    assert [v["Version"] for v in lam.list_layer_versions(LayerName=f"{base}-a")["LayerVersions"]] == [2]
+    lam.delete_function(FunctionName=fn)
+
 
 if __name__ == "__main__":
     for name, fn in list(globals().items()):

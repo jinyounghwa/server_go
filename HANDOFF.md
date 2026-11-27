@@ -422,7 +422,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
 - AGENTS.md 2절의 구조 설명과 8절의 한계를 실제 코드에 맞춘다.
 - **완료 기준:** 줄 수 변화(`wc -l core/src/*.rs` 전후)를 보고하고, 테스트 전부 통과.
 
-## 25일차 (2026-12-19): Lambda 레이어
+## 25일차 (2026-12-19): Lambda 레이어 — ✅ 완료: Publish/Get/GetByArn/List/ListVersions/Delete/Permission 연산, 함수 `Layers`(최대 5·한 레이어 한 버전·없는 버전 거부), 뒤 레이어 우선 PYTHONPATH/NODE_PATH, 경로 탈출 zip 거부, 단위 52·boto3 53(두 모드 통과, 우분투). Node는 require만 NODE_PATH를 따름(ESM bare import 미지원, 주석)
 - 연산: `PublishLayerVersion`(zip, CompatibleRuntimes), `GetLayerVersion`, `ListLayers`, `ListLayerVersions`, `DeleteLayerVersion`, `AddLayerVersionPermission`(같은 계정만)
 - 함수 `Layers`(최대 5개) 설정을 넣는다.
   - 실행할 때 레이어를 순서대로 풀어 놓는다. 위치는 `/opt` 대신 함수별 임시 디렉터리다.

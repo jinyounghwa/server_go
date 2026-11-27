@@ -37,6 +37,7 @@
 - 2026-11-27 추가26(20일차): API Gateway REST v1 — `/restapis` 컨트롤 플레인(CreateRestApi·GetResources·CreateResource(부모 id가 **경로**에 있음: POST /restapis/{api}/resources/{parent})·PutMethod·PutIntegration·Put/Method/IntegrationResponse·CreateDeployment·CreateStage·Get*/Delete*), 호출은 `/_restapi/{apiId}/{stage}/path` — 라우팅 없으면 v1 특유의 403 `Missing Authentication Token`. **배포는 실제 스냅샷**(스테이지는 배포 시점 리소스 트리를 서빙, 배포 후 편집은 재배포 전까지 안 보임 — HTTP API의 no-op 배포와 다름, 주석 참조). AWS_PROXY는 v1 이벤트 모양(`resource`·`httpMethod`·`requestContext.stage`·`pathParameters`), MOCK은 고정 200 빈 몸통. AWS·HTTP 통합과 requestTemplates(VTL)는 BadRequest로 거부. botocore 함정: REST-JSON 파서가 shape 직렬화 `name`을 따라감 — GetResources/GetDeployments 응답 키는 `items`가 아니라 `item`(GetStages도 `item`), `methodResponses`/`integrationResponses`는 리스트 아닌 맵. 단위 테스트 51개, boto3 테스트 50개.
 - 2026-11-27 추가27(21일차): REST v1 인가자·API 키·CFN — `CreateAuthorizer`(`COGNITO_USER_POOLS`는 로컬 풀 JWT·`TOKEN`/`REQUEST`는 람다가 돌려준 IAM 정책 문서 해석: 명시적 Deny 우선·`Resource` 글롭 `*`, 401/403 구분), `PutMethod`의 `authorizerId`·`apiKeyRequired`, `CreateApiKey`·`CreateUsagePlan`·`CreateUsagePlanKey`(`x-api-key` 없으면 403 Missing Authentication Token·모르는 키 403 Forbidden·토큰 버킷 초과 429 Too Many Requests — 쿼터는 미구현 ponytail), CFN `AWS::ApiGateway::RestApi/Resource/Method/Deployment/Stage`(Deployment는 Method에 DependsOn 필요 — 스냅샷이 생성 순서를 따르므로). 단위 테스트 51개, boto3 테스트 51개.
 - 2026-11-27 추가28(22일차): S3 체크섬·트레일러 재계산 — CRC32·CRC32C는 표 기반 직접 구현, SHA-1은 크레이트 없이 손으로 구현(주석에 선택 기록), SHA-256은 sha2. `x-amz-checksum-*` 헤더는 PutObject에서 검증(불일치 `BadDigest`)·저장, `x-amz-sdk-checksum-algorithm`·`x-amz-checksum-algorithm`은 재계산해 저장. HeadObject는 항상, GetObject는 `x-amz-checksum-mode: ENABLED`(헤더임, 쿼리 아님!)일 때 반환하되 206 Range 응답은 제외(전체 객체 체크섬이므로), `GetObjectAttributes`(`?attributes`+`x-amz-object-attributes`)로 ETag·Checksum·ObjectSize. VERIFY_SIGV4에서 트레일러 `x-amz-checksum-*` 값을 디코딩된 청크 합계로 재계산해 비교(불일치 `BadDigest`). 함정: 변조 헤더는 서명 대상이라 VERIFY 모드에선 서명 검증이 먼저 발화, 이 botocore는 기본(`when_supported`)으로 GetObject마다 checksum-mode 헤더를 붙이고 응답 체크섬을 검증함. 단위 테스트 51개, boto3 테스트 52개.
+- 2026-11-27 추가29(25일차): Lambda 레이어 — `PublishLayerVersion`(zip, `/2018-10-31/layers` 경로)·`GetLayerVersion`·`GetLayerVersionByArn`(`?find=LayerVersion`)·`ListLayers`·`ListLayerVersions`(최신 먼저, `CompatibleRuntime` 필터)·`DeleteLayerVersion`(멱등, 번호 재사용 안 함, 이미 쓰는 함수는 계속 동작)·`Add/Get/RemoveLayerVersionPermission`(이 계정 또는 `*`만). 함수 `Layers`(최대 5개, 레이어당 한 버전)는 실행 시 뒤 레이어가 먼저 오도록 `PYTHONPATH`(`python/`·`python/lib/<runtime>/site-packages`)·`NODE_PATH`(`nodejs/node_modules`, require만)로 연결. 경로 탈출 zip은 거부. 단위 테스트 52개, boto3 테스트 53개.
 - 2026-11-25 추가20: 검증 에이전트 시나리오 6개 추가(21→27: 보안 4종 `sec-clock-skew`·`sec-sts-expired`·`sec-strict-delivery`·`sec-jwt-bypass`, 사고 2종 `inc-lambda-dest`·`inc-events-dlq`, `poll_sqs_body`·`xml_tag` 리팩토링), JS v3(5→8)·Rust SDK(4→7) 스위트 확장(FIFO·고정밀 숫자 키·중첩 경로·IAM 조건/버킷 정책·S3 페이지네이션), 연대기 섬 숫자 동기화.
 - `v0.1.0` 릴리스 완료(2026-11-21): 바이너리 3종 + SHA256SUMS, Homebrew sha256 반영.
 - `v0.1.7` 릴리스 준비(2026-11-27, 23일차): 14~22일차 기능 포함 — Step Functions 작업 토큰·타임아웃, Lambda 가중치 별칭·한정자별 호출 설정, ECS 롤링 배포·헬스 체크, RDS 스냅샷·파라미터 그룹, Route53 헬스 체크·DNS TCP, DDB 정확 십진 산술·트랜잭션 멱등성·스트림, API Gateway REST v1(리소스·배포 스냅샷·인가자·API 키·CFN), S3 체크섬·트레일러 재계산. 태그 푸시(v0.1.5/v0.1.6/v0.1.7 정리 포함)는 사용자 승인 대기.
@@ -59,7 +60,7 @@ core/            Rust 단일 바이너리 (axum + tokio), 모든 서비스가 �
   src/<svc>.rs   서비스별 모듈. 상태 struct + handle() + admin()
   src/ui.html    관리 GUI (/_ui), town.html 캐릭터 마을 (/_town) — include_str!로 내장
 gui/             Tauri 2 창. /_ui를 여는 껍데기일 뿐
-tests/sdk_test.py  boto3 호환성 테스트 52개 (주 통합 테스트), tests/js·tests/rust는 JS v3(8개)·Rust SDK(7개) 스위트
+tests/sdk_test.py  boto3 호환성 테스트 53개 (주 통합 테스트), tests/js·tests/rust는 JS v3(8개)·Rust SDK(7개) 스위트
 netlify.toml     예전 Netlify 설정(지금은 GitHub Pages `pages.yml`로 배포)
 ```
 
@@ -146,10 +147,10 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
 최신 태그는 `v0.1.4`, `v0.1.7` 릴리스 준비 완료(v0.1.5·v0.1.6·v0.1.7 태그 푸시는 사용자 승인 대기). HANDOFF.md 1~24일차 완료, 25~53일차 계획이 이어진다. 남은 한계는 각 파일의 `ponytail:` 주석(`grep -rn ponytail core/src`)이 목록이다.
 
 1. **실기기 점검**(사용자 도움 필요): 실제 휴대폰·실제 Safari·GPU가 약한 노트북에서 Pages 마을을 연다.
-   연대기 섬 숫자(SDK 테스트 52/8/7개, 시나리오 27개, GPU 65°C)는 `town.html` 12절에 손으로 적은 값이니 바뀌면 같이 고친다.
+   연대기 섬 숫자(SDK 테스트 53/8/7개, 시나리오 27개, GPU 65°C)는 `town.html` 12절에 손으로 적은 값이니 바뀌면 같이 고친다.
 2. (선택) `?api=`로 IPv6 `[::1]`: CSP가 IPv6 리터럴을 못 받으므로 요청이 있을 때만.
 3. (선택) SigV4a: ECDSA P-256 크레이트 추가가 필요하므로 사용자 요청이 있을 때만.
-4. 25일차(2026-12-19)부터 HANDOFF.md의 Lambda 레이어·웜 실행·컨테이너 이미지·Cognito MFA 등 계획을 따른다.
+4. 26일차(2026-12-20)부터 HANDOFF.md의 Lambda 레이어·웜 실행·컨테이너 이미지·Cognito MFA 등 계획을 따른다.
 
 각 항목은 sdk_test.py에 정상·오류 경로 테스트를 같이 넣고, 끝나면 마을(`town.html`)·GUI·문서를 같이 갱신한다.
 큰 변경 뒤에는 4절 방법으로 우분투 전체 검증을 돌린다.
