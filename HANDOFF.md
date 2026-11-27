@@ -1,4 +1,4 @@
-# rocalcloud 작업 계획서 (2026-11-25 ~ 2027-01-16, 53일)
+# rocalcloud 작업 계획서 (2026-11-25 ~ 2027-02-07, 75일 — 75일차가 끝)
 
 이 문서는 일을 넘겨받는 작업자(모델)를 위한 날짜별 계획서다. **먼저 `AGENTS.md` 전체를 읽는다.** 구조, 요청 흐름, 서비스 추가 패턴은 거기 있다.
 이 문서와 AGENTS.md가 충돌하면 AGENTS.md가 맞다.
@@ -6,7 +6,8 @@
 **이 문서는 지우지 않는다. 계속 이어 쓰는 계획서다.**
 - 하루가 끝나면 그날 제목 옆에 `✅ 완료`, `⚠️ 일부`, `❌ 못 함` 중 하나와 커밋 해시를 적는다.
 - 못 끝낸 일은 다음 날 맨 앞으로 옮긴다. 다른 날 항목을 건너뛰어 먼저 하지 않는다.
-- 마지막 날(지금은 53일차)에는 그다음 계획을 이 문서 끝에 이어 쓴다.
+- **75일차가 마지막이다.** 그 뒤에는 새 계획을 쓰지 않고 유지보수 모드로 간다(75일차 참고). 새 서비스(Athena, Glue 등) 추가는 이 계획 범위 밖이며 사용자가 따로 요청할 때만 한다.
+- 범위: 지금 에뮬레이트하는 서비스의 `ponytail:` 한계를 75일차까지 모두 구현하거나 명확한 거부로 정리한다. 75일차에 `grep -rn ponytail core/src` 결과는 "의도적 거부" 주석만 남아야 한다.
 - **하루 분량은 넉넉히 잡았다.** 일찍 끝나도 다음 날 항목을 당겨 시작하지 말고 그날 항목의 점검·테스트·문서를 마무리한다. 그래도 시간이 남으면 그날 제목 옆 결과에 "다음 날 착수"라고 적고 다음 날 항목을 시작한다.
 - **새 크레이트가 필요한 항목**(TLS의 rustls, 진짜 암호의 aes-gcm, SigV4a의 p256 등)은 시작 전에 사용자에게 묻는다. 답이 없으면 대안 범위만 하고 건너뛴다.
 
@@ -402,7 +403,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - **태그 푸시는 사용자 승인을 받은 뒤에만 한다.**
   - 아직 승인을 기다리는 태그(v0.1.5, v0.1.6)가 남아 있으면, 순서대로 낼지 하나로 묶을지 사용자에게 묻는다.
 - AGENTS.md 1·7·8절을 갱신하고, `town.html` 12절 숫자를 고친다. Playwright 화면 점검도 한다.
-- 24~53일차 계획은 이미 아래에 있다(2026-11-27 추가). 지난 결과를 보고 순서나 범위를 고칠 곳이 있으면 고치고, 고친 이유를 한 줄로 적는다.
+- 24~75일차 계획은 이미 아래에 있다. 지난 결과를 보고 순서나 범위를 고칠 곳이 있으면 고치고, 고친 이유를 한 줄로 적는다.
 
 ---
 
@@ -721,13 +722,275 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - Playwright로 Pages 마을, `/_town`, `/_ui`를 확인한다. 콘솔 에러는 0개여야 한다.
 - **`ui.html`:** 늘어난 표가 화면을 넘치지 않는지 본다. 좁은 폭(휴대폰)도 확인한다.
 
-## 53일차 (2027-01-16): v0.2.0 릴리스 검토 + 다음 계획
+## 53일차 (2027-01-16): v0.2.0 릴리스 + 새 크레이트 승인 묻기
 - 우분투 전체 검증을 돌린다(두 모드, JS·Rust, `ubuntu_verify.sh`, 컨테이너·이미지 0개).
-- **버전 결정:** 기능이 크게 늘었으니 v0.2.0으로 올릴지 사용자에게 묻는다. 기본은 v0.1.10이다. **태그는 승인 후에만 푸시한다.** Homebrew sha256을 반영하고, 리눅스 바이너리로 확인한다.
-- **회고:** 계획 대비 완료·일부·못 함 개수, 사용자 승인을 기다린 항목(태그, 새 크레이트), 테스트하지 않은 경로 목록을 이 문서 끝에 적는다.
-- **이 문서 끝에 54~83일차(30일) 계획을 이어 쓴다.** 남은 `ponytail:` 주석, 7절, 회고에서 고른다.
-  - 후보: SigV4a(승인 시), TLS 리스너(승인 시), Aurora·클러스터, Cognito 외부 IdP 흉내 대신 명확한 거부, EventBridge Pipes, SES 템플릿·수신 규칙, Athena·Glue처럼 새 서비스를 붙일지 사용자에게 묻기
-  - 사흘·열흘마다 릴리스와 점검일을 넣는다.
+- **v0.2.0을 준비한다.** **태그는 승인 후에만 푸시한다.** Homebrew sha256을 반영하고, 리눅스 바이너리로 확인한다.
+- **회고:** 다음 세 가지를 이 문서 끝 "회고" 절에 적는다.
+  - 계획 대비 완료, 일부, 못 함 개수
+  - 사용자 승인을 기다리는 항목
+  - 테스트하지 않은 경로
+- **67~69일차를 위해 새 크레이트 세 개를 한 번에 묻는다.**
+  - `aes-gcm`: KMS 진짜 암호
+  - `p256`: SigV4a, DNSSEC 서명
+  - `rustls`(+`rcgen`): ALB·API TLS
+  - 각각 바이너리 크기 증가를 우분투에서 재서 함께 보여 준다.
+  - 답에 따라 67~69일차를 "구현"으로 할지 "대안과 명확한 거부"로 할지 정한다.
+
+---
+
+## 54일차 (2027-01-17): 작은 한계 묶음: cron L/W/#·Logs 필터·DynamoDB 크기
+- **`events.rs` cron:**
+  - `L`: 일 필드에서는 말일, 요일 필드에서는 `5L`(마지막 금요일)이다.
+  - `W`: `15W`는 가장 가까운 평일이다.
+  - `#`: `MON#2`는 둘째 월요일이다.
+  - `cron_next`를 확장하고, 각각 윤년과 월 경계 단위 테스트를 넣는다. 지금은 거부하니 거부 코드와 주석을 지운다.
+- **`logs.rs` 31행:** 필터 패턴 나머지를 지원한다.
+  - 공백 구분 필드 패턴 `[ip, user, ..., status=4*]`
+  - JSON 패턴의 `&&`, `||`, 괄호, `IS NULL`, `NOT EXISTS`
+  - 지원 범위를 주석에 정확히 적는다.
+- **`ddb.rs` 400 KB:** 항목 크기를 AWS 규칙으로 계산한다.
+  - 속성 이름 길이 + 값 크기다.
+  - N은 (유효 자릿수/2)+1바이트, B는 원래 바이트, 리스트와 맵은 원소당 1바이트를 더한다.
+  - 경계 테스트: 정확히 400 KB는 통과, 1바이트를 넘으면 실패다.
+
+## 55일차 (2027-01-18): S3 목록 토큰·XML 읽기·IPv6 마을 연결
+- **`s3.rs` 326행:** 이어받기 토큰이 "가장 큰 문자 붙이기" 방식이다.
+  - 마지막으로 돌려준 키(또는 공통 접두사)를 base64로 담는 정확한 토큰으로 바꾼다.
+  - `StartAfter`, `ContinuationToken`, delimiter를 섞은 경우를 10일차 경계 테스트에 더한다.
+- **`s3.rs` 116행:** 문자열 스캔 XML 리더를 점검한다.
+  - CDATA, 엔티티(`&amp;`, `&lt;`, `&#x..;`), 네임스페이스 접두사가 있는 DeleteObjects와 CompleteMultipartUpload 본문이 처리되는지 테스트한다.
+  - 틀리면 고친다. XML 크레이트는 넣지 않는다.
+- **IPv6 `?api=[::1]`(AGENTS 7절 8번):**
+  - CSP `connect-src`에 `http://[::1]:*`를 넣어 보고 Chrome·Firefox·Safari(우분투 Playwright webkit)에서 확인한다.
+  - 되면 허용한다. 안 되면 "CSP 한계로 미지원"을 확정하고 문서에 적는다.
+  - 어느 쪽이든 7절 8번을 닫는다.
+
+## 56일차 (2027-01-19): Step Functions JSONata (1/2): 식 평가기
+- `QueryLanguage: "JSONata"`(상태 기계 전체 또는 상태별)를 받는다.
+- 식은 `{% ... %}` 안에 쓴다. 손으로 짠 작은 JSONata 평가기를 둔다. 지원 범위는 다음이다.
+  - 경로: `$states.input.a.b`, 배열 인덱스, 필터 `[cond]`
+  - 연산자: 산술, 비교, `and`, `or`, `&`(문자열 연결), 삼항 `? :`
+  - 리터럴: 객체·배열 생성자
+- **범위 밖 문법(함수 정의, 정규식, 부모 연산자 등)은 `States.QueryEvaluationError`로 명확히 거부한다.**
+- 테스트: 평가기 단위 테스트 30개 이상. 공식 문서 예제를 그대로 옮긴다.
+
+## 57일차 (2027-01-20): Step Functions JSONata (2/2): Arguments·Output·Assign
+- JSONata 모드의 상태 필드를 넣는다.
+  - `Arguments`, `Output`, `Assign`(변수, `$name`으로 참조, 상태 사이 범위 규칙)
+  - Choice의 `Condition`
+  - `Items`(Map)
+- 내장 함수 `$partition`, `$range`, `$hash`, `$random`, `$uuid`, `$parse`와 기본 함수 `$string`, `$number`, `$count`, `$sum`, `$map`, `$filter`, `$keys`, `$merge`를 넣는다.
+- JSONPath 모드의 `Assign` 변수도 같이 지원한다(AWS가 2024년에 추가했다).
+- `sfn.rs` 5행의 "no JSONata" 주석을 고친다.
+- 테스트:
+  - JSONata 상태 기계로 Lambda를 호출하고 결과를 가공해야 한다.
+  - `Assign` 변수가 다음 상태에서 보여야 한다.
+  - 범위 밖 문법은 실패해야 한다.
+
+## 58일차 (2027-01-21): ECS (1/2): 볼륨·비밀·환경 파일 (Docker)
+- 태스크 정의 `volumes`(host `sourcePath`, Docker 볼륨)와 컨테이너 `mountPoints`를 넣는다.
+  - **host 경로는 설정한 허용 디렉터리 안만 받는다**(기본값은 rocalcloud 임시 디렉터리). 임의 경로 마운트는 위험하다.
+- 컨테이너 `secrets`(Secrets Manager ARN과 JSON 키, SSM 파라미터)를 실행할 때 환경 변수로 주입한다.
+  - **값은 이벤트와 `DescribeTasks`에 절대 나오지 않게 한다.**
+- `environmentFiles`(로컬 S3 객체)도 넣는다.
+- 테스트:
+  - 볼륨에 쓴 파일이 같은 태스크의 다른 컨테이너에서 보여야 한다.
+  - 비밀 값이 컨테이너 안 `env`에는 있고 이벤트 스트림에는 없어야 한다.
+  - 허용 밖 경로는 거부되어야 한다.
+
+## 59일차 (2027-01-22): ECS (2/2): 서킷 브레이커·서비스 검색·용량 공급자
+- **`deploymentCircuitBreaker`**(enable, rollback): 새 태스크가 계속 실패하면 배포를 FAILED로 표시하고, rollback이면 이전 태스크 정의로 되돌린다.
+- **서비스 검색:** Cloud Map 최소 기능을 넣는다.
+  - 연산: `CreatePrivateDnsNamespace`, `CreateService`, `DiscoverInstances`
+  - 서비스의 `serviceRegistries`로 태스크 IP를 등록한다.
+  - Route53 DNS 서버에서 `svc.namespace`가 풀리게 한다(18일차 DNS 재사용).
+- **용량 공급자:** `capacityProviderStrategy`는 저장하고 보여만 준다. Fargate와 EC2를 구분해 실행하지는 않는다는 사실을 주석에 적는다.
+- `ecs.rs` 3행 주석을 고친다.
+- 테스트:
+  - 항상 죽는 이미지로 배포하면 롤백되어야 한다.
+  - `DiscoverInstances`와 DNS 질의가 실행 중인 태스크를 돌려주어야 한다.
+
+## 60일차 (2027-01-23): Aurora (1/2): DB 클러스터 (Docker)
+- `CreateDBCluster`(aurora-postgresql, aurora-mysql), `CreateDBInstance(DBClusterIdentifier=…)`로 writer와 reader를 붙인다.
+- `DescribeDBClusters`의 `Endpoint`(writer)와 `ReaderEndpoint`를 넣는다. reader 엔드포인트는 reader 인스턴스로 순환한다(50일차 복제 재사용).
+- `DeleteDBCluster`(인스턴스가 남아 있으면 거부, `SkipFinalSnapshot`)도 넣는다.
+- **컨테이너는 최대 3개(writer 1 + reader 2), 각 `--memory 512m`이다.**
+- 테스트:
+  - writer에 쓴 값이 reader 엔드포인트로 읽혀야 한다.
+  - reader에 쓰면 실패해야 한다.
+  - 끝나면 남은 컨테이너가 0개여야 한다.
+
+## 61일차 (2027-01-24): Aurora (2/2): 장애 조치·클러스터 스냅샷·Data API
+- `FailoverDBCluster`: reader 하나를 승격하고 writer 엔드포인트가 바뀐다.
+- 클러스터 스냅샷 `CreateDBClusterSnapshot`과 `RestoreDBClusterFromSnapshot`을 넣는다. 17일차 `docker commit` 방식을 쓴다.
+- **RDS Data API**(`rds-data`): `ExecuteStatement`, `BatchExecuteStatement`, `BeginTransaction`, `CommitTransaction`, `RollbackTransaction`
+  - 인증은 Secrets Manager 비밀 ARN으로 한다.
+  - 클러스터의 `EnableHttpEndpoint`가 켜져 있어야 한다.
+  - 결과의 `records` 형식(`stringValue`, `longValue` 등)을 맞춘다.
+  - DB 연결은 이미 있는 테스트 도구가 아니라 코어 안에서 컨테이너의 `psql`·`mysql` CLI를 `docker exec`으로 부르는 가장 짧은 방법을 쓴다. 한계는 주석에 적는다.
+- `managed.rs` 3행 주석을 고친다.
+- 테스트:
+  - 장애 조치 뒤 새 writer에 쓸 수 있어야 한다.
+  - Data API로 INSERT, SELECT, 트랜잭션 롤백이 되어야 한다.
+
+## 62일차 (2027-01-25): v0.2.1 릴리스 + 중간 점검
+- 우분투 전체 검증, `mem_bench` 비교(35일차, 51일차 값과)를 한다.
+- v0.2.1을 준비한다(1일차 1-2 절차). **태그는 승인 후에만 푸시한다.**
+- AGENTS.md 1·7·8절과 `town.html` 숫자를 고치고, Playwright로 점검한다.
+- 63~75일차 순서를 다시 본다. 53일차 새 크레이트 답변에 맞춰 67~69일차를 확정한다.
+
+## 63일차 (2027-01-26): EventBridge Pipes
+- `CreatePipe`, `DescribePipe`, `ListPipes`, `UpdatePipe`, `StartPipe`, `StopPipe`, `DeletePipe`를 넣는다.
+- 구성:
+  - 소스: SQS, Kinesis, DynamoDB Streams. 기존 매핑 폴러 코드를 다시 쓴다.
+  - `FilterCriteria`: 36일차 코드
+  - 보강: Lambda, Step Functions Express(38일차)
+  - 대상: `send_to_target`이 지원하는 것 전부
+  - `InputTemplate`: 2일차 InputTransformer 코드
+- 실행 역할(`RoleArn`)로 소스를 읽고 대상에 쓸 권한을 `ENFORCE_IAM`일 때 판정한다.
+- 테스트:
+  - SQS → 필터 → Lambda 보강 → SNS→SQS 끝까지 메시지가 가공되어 도착해야 한다.
+  - 필터에 맞지 않는 메시지는 버려져야 한다.
+  - Stop하면 흐르지 않아야 한다.
+
+## 64일차 (2027-01-27): SES 템플릿·수신 규칙
+- **템플릿:** `CreateTemplate`, `GetTemplate`, `UpdateTemplate`, `DeleteTemplate`, `ListTemplates`, `SendTemplatedEmail`, `SendBulkTemplatedEmail`, `TestRenderTemplate`. v2 `SendEmail(Content.Template)`도 넣는다.
+  - `{{var}}`를 치환하고, 빠진 변수는 렌더링 실패로 처리한다.
+- **보낸 메일 확인:** 보낸 메일은 지금처럼 실제로 발송하지 않고 `/_ses/sent`(GET)로 보여 준다.
+  - 이미 비슷한 것이 있으면 그것을 쓴다.
+  - **이벤트 스트림 allowlist에 본문이 새지 않는지 확인한다.**
+- **수신 규칙:** `CreateReceiptRuleSet`, `CreateReceiptRule`, `SetActiveReceiptRuleSet`
+  - 수신은 `/_ses/inbound`에 POST한 RFC 822 메시지로 흉내 낸다. 관리 POST이므로 `x-rocalcloud` 헤더를 요구한다.
+  - 동작: S3 저장, SNS 알림, Lambda 호출
+- 테스트:
+  - 템플릿 메일이 `/_ses/sent`에서 치환된 상태로 보여야 한다.
+  - 수신 메일이 S3에 저장되고 Lambda가 호출되어야 한다.
+
+## 65일차 (2027-01-28): Route53 영역 전송·DNSSEC API
+- **AXFR 영역 전송:** 18일차 DNS TCP에 넣는다. **127.0.0.1에서 온 요청만 받는다.**
+- **DNSSEC API:** `EnableHostedZoneDNSSEC`, `DisableHostedZoneDNSSEC`, `GetDNSSEC`, `CreateKeySigningKey`(KMS 키 참조)
+  - 53일차에 `p256` 승인을 받았으면 실제 RRSIG·DNSKEY 서명을 넣는다(ECDSAP256SHA256).
+  - 승인이 없으면 API 상태만 관리하고, 응답에 서명하지 않는다는 사실을 `GetDNSSEC` 상태 메시지와 주석에 명확히 적는다.
+- `route53.rs` 4행 주석을 고친다.
+- 테스트:
+  - `dnspython` AXFR로 레코드 전체가 와야 한다.
+  - DNSSEC 켜기·끄기 상태가 바뀌어야 한다.
+  - 승인한 경우 `dig +dnssec`에 해당하는 질의에 RRSIG가 있어야 한다.
+
+## 66일차 (2027-01-29): CloudFormation 롤백 복원·남은 교체 속성
+- **`cfn.rs` 793행:** 업데이트가 실패하면 교체된 리소스를 이전 속성으로 되돌린다.
+  - 교체 업데이트는 "새로 만들기 → 성공하면 옛것 삭제" 순서로 바꾼다. AWS 방식이다.
+  - 그러면 롤백은 새것만 지우면 된다.
+- **`cfn.rs` 613행:** DynamoDB 빌링 모드와 GSI(40일차 UpdateTable 재사용), S3 속성(버전 관리, 수명 주기, CORS, 알림)을 제자리 변경으로 바꾼다.
+- 테스트:
+  - 일부러 실패하는 업데이트 뒤 원래 큐 URL과 속성이 그대로여야 한다.
+  - 버킷 버전 관리를 바꿔도 버킷 객체가 유지되어야 한다.
+
+## 67일차 (2027-01-30): KMS 진짜 암호 (aes-gcm 승인 시) / 비대칭 키 (승인 없어도)
+- **승인한 경우:** 대칭 키 암호문을 AES-256-GCM으로 바꾼다.
+  - 포맷은 `버전 바이트 | 키 ID | nonce | 암호문 | 태그`다.
+  - 옛 MD5-XOR 암호문도 복호화되게 한다(스냅샷 호환).
+  - `EncryptionContext`는 AAD로 쓴다.
+  - SSM SecureString(`ssm.rs` 28행)도 실제 KMS 암호문으로 바꾼다.
+- **승인이 없어도 하는 것:** 이미 있는 `rsa` 크레이트로 비대칭 키를 넣는다.
+  - `CreateKey(KeySpec=RSA_2048/3072/4096, KeyUsage=SIGN_VERIFY|ENCRYPT_DECRYPT)`
+  - `Sign`/`Verify`(RSASSA_PSS·PKCS1 SHA-256/384/512), `GetPublicKey`, RSA `Encrypt`/`Decrypt`(OAEP)
+- `kms.rs` 2행 주석을 결과에 맞게 고친다.
+- 테스트:
+  - `GetPublicKey`로 받은 공개 키로 Python `cryptography`가 서명을 검증해야 한다. 테스트 의존성 추가이므로 `uv --with`로만 쓴다.
+  - 컨텍스트가 다르면 Decrypt가 실패해야 한다(승인 시).
+
+## 68일차 (2027-01-31): SigV4a (p256 승인 시) / 명확한 거부
+- **승인한 경우:** `AWS4-ECDSA-P256-SHA256`을 넣는다.
+  - 접근 키에서 ECDSA 키를 유도한다(AWS의 KDF: HMAC-SHA256 카운터 모드, 키가 n-2보다 작을 때까지).
+  - `X-Amz-Region-Set`을 처리한다.
+  - 헤더 서명과 사전 서명 URL을 모두 지원한다.
+  - `VERIFY_SIGV4=1`일 때만 검증한다.
+- **승인이 없는 경우:** SigV4a 요청은 `VERIFY_SIGV4=1`일 때 `SignatureDoesNotMatch` 대신 "SigV4a is not supported locally"라는 분명한 오류로 답한다. 기본 모드에서는 지금처럼 서명을 읽지 않고 통과시킨다.
+- `sigv4.rs` 5행 주석을 고친다.
+- 테스트: Rust SDK나 botocore의 SigV4a 서명기로 S3 다중 리전 접근점처럼 서명한 요청을 보낸다. botocore는 `awscrt`가 있어야 한다. 승인한 경우에만 이 테스트를 넣는다.
+
+## 69일차 (2027-02-01): TLS 리스너 (rustls 승인 시) / 명확한 거부
+- **승인한 경우:**
+  - ALB `Protocol=HTTPS` 리스너를 넣는다. 인증서는 ACM 최소 기능(`ImportCertificate`)이나 `rcgen` 자체 서명 `RequestCertificate`를 쓴다.
+  - API Gateway와 에뮬레이터 자체의 `https://127.0.0.1:4567` 선택 포트도 넣는다(`RC_TLS=1`).
+  - HTTP_PROXY의 https 대상과 SNS https 구독도 연다. 둘 다 루프백만 허용한다.
+- **승인이 없는 경우:** HTTPS 리스너 생성은 `UnsupportedProtocol`로 명확히 거부한다. 문서에 "TLS는 리버스 프록시(caddy 등)로 앞단에서"라는 안내를 적는다.
+- `elb.rs` 6행과 `apigw.rs` 199행 주석을 고친다.
+- 테스트(승인 시): 자체 서명 인증서를 `verify=False`로 받아 HTTPS 리스너를 거쳐 대상에 도착해야 한다. 그렇지 않으면 거부 경로만 테스트한다.
+
+## 70일차 (2027-02-02): "하지 않는 것" 정리 + 미지원 연산 전수 점검
+- **명확한 거부로 확정할 것:** 각 항목에 `ponytail:`이 아닌 `// unsupported:` 주석과 문서 표를 남긴다.
+  - SNS email·sms 발송: 저장만 하고, 보낸 내용은 `/_ses/sent`처럼 확인 엔드포인트에서 본다.
+  - Cognito 외부 IdP
+  - EC2 인스턴스 실제 실행(`net.rs` 2행)
+  - Lambda 동시 실행 8개 한도(`lambda.rs` 17행은 장비 한도라 유지)
+  - 256 MiB 본문 한도(42일차 결과에 따라)
+- **전수 점검 스크립트:** `tools/op_coverage.py`
+  - botocore 서비스 모델에서 지원 서비스의 모든 연산 이름을 뽑는다.
+  - 각 연산을 빈 인자로 한 번씩 호출해 응답을 분류한다: 구현됨, 검증 오류, `UnknownOperation`, 500, 연결 끊김.
+  - **500과 연결 끊김은 0개여야 한다.** 나오면 고친다.
+  - 결과 표(서비스별 구현 연산 수/전체)를 README에 넣는다.
+- 테스트: 스크립트 자체가 테스트다. CI에는 넣지 않고 우분투에서만 돌린다(시간이 걸린다).
+
+## 71일차 (2027-02-03): ponytail 0 확인 + 군살 감사 2차
+- `grep -rn ponytail core/src`에는 장비 한도처럼 의도해 남기는 것만 있어야 한다. 남은 것은 각각 구현, `unsupported:` 전환, 유지 사유 중 하나로 정리한다.
+- **군살 감사 2차(24일차 방식):** 서비스마다 반복되는 다음 코드를 `main.rs`나 작은 공용 모듈로 모은다.
+  - 루프백 검사
+  - 시계 주입
+  - 폴러
+  - 배달 재시도
+- 동작은 바꾸지 않는다. 줄 수 변화를 보고한다.
+- 빌드 경고 0개, 전체 테스트 통과를 확인한다.
+
+## 72일차 (2027-02-04): 도구 호환성: Terraform·CDK·SAM CLI (설치는 승인 후)
+- 우분투에 `terraform`, `aws-cdk`(npm), `sam` CLI를 설치해도 되는지 사용자에게 묻는다. 새 패키지 설치이기 때문이다.
+- **승인한 경우:** 다음이 에뮬레이터에서 끝까지 되는지 확인한다.
+  - Terraform AWS provider(`endpoints` 블록): S3, SQS, Lambda, DynamoDB, IAM, API GW 예제의 `apply`·`destroy`
+  - CDK `cdk deploy`: CFN 경로. bootstrap 스택이 되는지 본다.
+  - `sam deploy`
+- 막히는 연산을 고친다. 하루에 못 끝나면 목록으로 남긴다.
+- **승인이 없는 경우:** CFN 템플릿 수준에서 CDK가 만드는 템플릿(`cdk synth` 출력 예시를 저장소에 넣는다)을 배포하는 테스트만 한다.
+
+## 73일차 (2027-02-05): 최종 성능·보안 점검
+- **성능:** 51일차 표를 다시 잰다. 최종 수치(처리량, 유휴·부하 메모리, 바이너리 크기, 시작 시간)를 README에 넣는다.
+- **장시간 실행:** 우분투에서 4시간 혼합 부하를 돌린다(동시 8, 작업당 8 GiB 한도). 메모리 누수, 파일 디스크립터 증가, 남은 컨테이너와 프로세스를 확인한다.
+- **보안 2차(44일차 표 갱신):** 45~72일차에 새로 생긴 표면을 점검한다.
+  - Pipes 역할 판정
+  - SES 수신 엔드포인트
+  - ECS 볼륨·비밀
+  - Data API
+  - AXFR 루프백
+  - TLS 키 파일 권한
+- 발견한 문제는 그날 고친다.
+
+## 74일차 (2027-02-06): 1.0 문서
+- **README:** 서비스별 지원 표(70일차 커버리지 수치), 의도적으로 하지 않는 것, 설치(Homebrew, Docker, 바이너리), 설정 변수 전체 목록, 보안 기본값 설명을 넣는다.
+- **`CHANGELOG.md`:** v0.1.0~v1.0.0 요약을 git 태그와 이 문서 결과 표시로 만든다.
+- **호환성 약속:**
+  - 1.x에서는 관리 엔드포인트 경로, 설정 변수 이름, 스냅샷·SQLite 형식을 깨지 않는다.
+  - 깨야 하면 옮겨 주는 코드를 넣는다.
+  - 이 약속을 AGENTS.md 5절에 규칙으로 추가한다.
+- **마을과 GUI:** 연대기 섬에 1.0 기념 오벨리스크를 넣고, 숫자를 최종값으로 고친다. Playwright로 점검한다.
+- `local-cloud-emulator-plan.md`에 최종 상태 절을 넣는다.
+
+## 75일차 (2027-02-07): v1.0.0 릴리스 + 유지보수 모드 전환 (마지막 날)
+- 우분투 최종 전체 검증을 돌린다(두 모드, JS·Rust, `ubuntu_verify.sh`, `op_coverage.py`, 컨테이너·이미지·프로세스 0개).
+- **v1.0.0을 준비한다.** **태그는 사용자 승인 후에만 푸시한다.**
+  - Homebrew sha256을 반영하고, 리눅스 바이너리로 확인한다.
+  - 맥 바이너리를 실행할 수 없었으면 그렇다고 적는다.
+- **최종 회고:** 이 문서 끝에 적는다.
+  - 75일 결과 표(완료, 일부, 못 함)
+  - 승인 대기로 대안 처리한 항목
+  - 끝내 테스트하지 않은 경로
+  - 실기기 점검 여부
+- **유지보수 모드 규칙을 AGENTS.md 7절에 쓰고 7절을 이것으로 바꾼다.**
+  - 새 기능은 사용자 요청이 있을 때만 한다.
+  - 버그는 재현 테스트를 먼저 넣고 고친다.
+  - boto3, JS, Rust SDK 새 버전이 나오면 한 달에 한 번 스위트를 돌려 깨진 것만 고친다(CI는 매주 실행으로 바꿔도 되는지 묻는다).
+  - 보안 문제가 생기면 즉시 패치 릴리스를 낸다(승인 후).
+- 이 문서 머리에 "**계획 종료(2027-02-07). 이후는 AGENTS.md 7절 유지보수 규칙을 따른다.**"를 적는다. 문서는 기록으로 남기고 지우지 않는다.
+- 우분투를 끈다.
 
 ---
 
@@ -736,4 +999,4 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
 - 한 일과 CI 결과
 - 테스트한 것과 **테스트하지 않은 것**을 구분해 적는다.
 - 우분투 상태: 프로세스 0개, 컨테이너 0개, 전원 끔
-- 다음 날 할 일과 막힌 점(사용자 결정이 필요한 것). 릴리스 태그 승인은 릴리스 날(1·13·23·35·44·53일차)에 꼭 묻는다.
+- 다음 날 할 일과 막힌 점(사용자 결정이 필요한 것). 릴리스 태그 승인은 릴리스 날(1·13·23·35·44·53·62·75일차)에 꼭 묻는다. 새 크레이트 승인은 53일차에, 도구 설치 승인은 72일차에 묻는다.
