@@ -359,7 +359,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - 트랜잭션 조건이 실패하면 `CancellationReasons`에 `ConditionalCheckFailed`가 제 위치에 있어야 한다.
   - 같은 토큰으로 다시 보내면 한 번만 적용되어야 한다.
 
-## 20일차 (2026-12-14): API Gateway REST v1 (1/2) — 리소스·메서드·배포
+## 20일차 (2026-12-14): API Gateway REST v1 (1/2) — 리소스·메서드·배포 — ✅ 완료 (`135c086`): `/restapis` CRUD·`/_restapi/{api}/{stage}/` 호출(v1 이벤트 모양·403 Missing Authentication Token), 배포 스냅샷(배포 후 편집 미반영 확인), MOCK 고정 200, AWS/HTTP·requestTemplates 거부, 단위/boto3 테스트(51/50)·두 모드 통과
 - **`apigw.rs` 4행:** REST API(`apigateway` 서비스, REST-JSON 프로토콜)를 시작한다.
   - 연산: `CreateRestApi`, `GetResources`, `CreateResource`, `PutMethod`, `PutIntegration`(AWS_PROXY Lambda, MOCK), `PutMethodResponse`, `PutIntegrationResponse`, `CreateDeployment`, `CreateStage`, `Get*`, `Delete*`
 - 호출 경로는 `/_restapi/{id}/{stage}/...`이다. HTTP API의 `/_api/`와 같은 처리 방식을 다시 쓴다.
