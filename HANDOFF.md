@@ -383,7 +383,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - TOKEN 인가자가 Deny를 돌려주면 403이어야 한다.
   - CFN 템플릿 하나로 REST API를 만들어 호출이 되어야 한다.
 
-## 22일차 (2026-12-16): S3 체크섬·트레일러 체크섬 재계산
+## 22일차 (2026-12-16): S3 체크섬·트레일러 체크섬 재계산 — ✅ 완료 (`bc9372d`): CRC32/CRC32C 표 기반·SHA-1 손구현(선택 주석)·SHA-256 sha2, PutObject 검증·저장(BadDigest), HeadObject/GetObject(ChecksumMode 헤더, 206 제외)·GetObjectAttributes, 트레일러 값 재계산(VERIFY 모드), 단위/boto3 테스트(51/52)·두 모드 통과
 - **`sigv4.rs` 5행:** aws-chunked 트레일러의 `x-amz-checksum-*` 값을 실제로 다시 계산해 비교한다. 다르면 `BadDigest`로 답한다.
   - CRC32와 CRC32C는 표 기반으로 짧게 직접 짠다(새 크레이트 없이). SHA-1은 크레이트가 없으니 거부하거나 직접 짠다. 고른 쪽을 주석에 적는다.
   - SHA-256은 이미 있는 sha2를 쓴다.
