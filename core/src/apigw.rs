@@ -113,6 +113,9 @@ struct Api {
 pub struct ApiGw {
     apis: BTreeMap<String, Api>,
     rests: BTreeMap<String, RestApi>,
+    keys: BTreeMap<String, ApiKey>,   // API keys (global, like AWS)
+    plans: BTreeMap<String, Plan>,    // usage plans with throttling
+    buckets: BTreeMap<String, (f64, f64)>, // api key id -> (tokens, last refill epoch secs)
 }
 
 // ---------- REST APIs (v1) ----------
@@ -125,7 +128,10 @@ struct Res1 {
 }
 #[derive(Clone)]
 struct Method1 {
-    auth: String,                       // NONE | AWS_IAM (authorization is day 21)
+    auth: String,                       // NONE | AWS_IAM
+    authorizer_id: Option<String>,      // TOKEN / REQUEST / COGNITO_USER_POOLS gate
+    api_key: bool,                      // apiKeyRequired: x-api-key must be present and enabled
+
     #[allow(dead_code)] // enforced from day 21 (authorizers)
     params: BTreeMap<String, bool>,     // requestParameters -> required
     integration: Option<Integ1>,
@@ -142,6 +148,27 @@ struct RestApi {
     resources: BTreeMap<String, Res1>,
     deployments: BTreeMap<String, BTreeMap<String, Res1>>, // deploymentId -> snapshot
     stages: BTreeMap<String, String>,                      // stage -> deploymentId
+    authorizers: BTreeMap<String, Auth1>,
+}
+#[derive(Clone)]
+struct Auth1 {
+    name: String,
+    ty: String,           // COGNITO_USER_POOLS | TOKEN | REQUEST
+    id_source: String,    // "method.request.header.X" (TOKEN/COGNITO) or a comma list (REQUEST)
+    provider_arns: Vec<String>,
+    uri: String,          // Lambda ARN for TOKEN/REQUEST
+}
+struct ApiKey {
+    name: String,
+    value: String,
+    enabled: bool,
+}
+struct Plan {
+    name: String,
+    rate: f64,        // tokens per second
+    burst: u64,       // bucket capacity
+    // ponytail: no quota enforcement (daily/monthly counters); only a per-key token bucket.
+    keys: Vec<String>, // API key ids
 }
 
 fn short_id() -> String {
@@ -185,12 +212,29 @@ fn res1_json(ra: &RestApi, r: &Res1) -> Value {
     out
 }
 fn method1_json(m: &str, md: &Method1) -> Value {
-    let mut out = json!({"httpMethod": m, "authorizationType": md.auth, "apiKeyRequired": false});
+    let mut out = json!({"httpMethod": m, "authorizationType": md.auth, "apiKeyRequired": md.api_key});
+    if let Some(a) = &md.authorizer_id {
+        out["authorizerId"] = a.clone().into();
+    }
     if let Some(i) = &md.integration {
         out["methodIntegration"] = integ1_json(i);
     }
     if !md.responses.is_empty() {
         out["methodResponses"] = md.responses.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Map<String, Value>>().into();
+    }
+    out
+}
+fn auth1_json(id: &str, a: &Auth1) -> Value {
+    json!({"id": id, "name": a.name, "type": a.ty, "identitySource": a.id_source,
+        "providerARNs": a.provider_arns, "authorizerUri": a.uri, "authorizerResultTtlInSeconds": 300})
+}
+fn key_json(id: &str, k: &ApiKey) -> Value {
+    json!({"id": id, "name": k.name, "value": k.value, "enabled": k.enabled})
+}
+fn plan_json(id: &str, p: &Plan) -> Value {
+    let mut out = json!({"id": id, "name": p.name, "apiStages": [], "throttle": {"rateLimit": p.rate, "burstLimit": p.burst}});
+    if p.rate <= 0.0 && p.burst == 0 {
+        out["throttle"] = Value::Null;
     }
     out
 }
@@ -677,9 +721,134 @@ impl ApiGw {
         })
     }
 
+    // API keys: POST/GET /apikeys, PATCH/DELETE /apikeys/{id}.
+    fn handle_keys(&mut self, method: &str, p: &[&str], b: &Value) -> Result<(u16, Value), ApiErr> {
+        let strv = |k: &str| b[k].as_str().map(String::from);
+        let bad = |m: &str| err("BadRequestException", m);
+        Ok(match (method, p) {
+            ("POST", []) => {
+                let name = strv("name").unwrap_or_default();
+                let value = strv("value").unwrap_or_else(|| {
+                    // AWS generates an API key value; ours is a uuid without dashes.
+                    uuid::Uuid::new_v4().simple().to_string()
+                });
+                let id = short_id();
+                let k = ApiKey { name, value, enabled: b["enabled"].as_bool().unwrap_or(true) };
+                let out = key_json(&id, &k);
+                self.keys.insert(id, k);
+                (201, out)
+            }
+            ("GET", []) => (200, json!({"item": self.keys.iter().map(|(id, k)| key_json(id, k)).collect::<Vec<_>>()})),
+            ("GET", [id]) => (200, key_json(id, self.keys.get(*id).ok_or_else(|| nf("api key"))?)),
+            ("DELETE", [id]) => {
+                self.keys.remove(*id).ok_or_else(|| nf("api key"))?;
+                for pl in self.plans.values_mut() {
+                    pl.keys.retain(|k| k != *id);
+                }
+                self.buckets.remove(*id);
+                (200, json!({"id": id}))
+            }
+            ("PATCH", [id]) => {
+                let k = self.keys.get_mut(*id).ok_or_else(|| nf("api key"))?;
+                for op in b["patchOperations"].as_array().into_iter().flatten() {
+                    let path = op["path"].as_str().unwrap_or("");
+                    let value = op["value"].as_str().unwrap_or("");
+                    if path.ends_with("enabled") {
+                        k.enabled = value == "true";
+                    } else if path.ends_with("name") {
+                        k.name = value.into();
+                    } else {
+                        return Err(bad("Only /enabled and /name patch operations are supported locally"));
+                    }
+                }
+                (200, key_json(id, k))
+            }
+            _ => return Err(err("NotFoundException", format!("{method} /apikeys/{} is not supported yet", p.join("/")))),
+        })
+    }
+
+    // Usage plans: throttle is a per-API-key token bucket; quota is not enforced (ponytail).
+    fn handle_plans(&mut self, method: &str, p: &[&str], b: &Value) -> Result<(u16, Value), ApiErr> {
+        let strv = |k: &str| b[k].as_str().map(String::from);
+        let bad = |m: &str| err("BadRequestException", m);
+        Ok(match (method, p) {
+            ("POST", []) => {
+                let name = strv("name").ok_or_else(|| bad("name is required"))?;
+                let rate = b["throttle"]["rateLimit"].as_f64().unwrap_or(0.0);
+                let burst = b["throttle"]["burstLimit"].as_u64().unwrap_or(0);
+                if rate < 0.0 {
+                    return Err(bad("rateLimit must be >= 0"));
+                }
+                let id = short_id();
+                let pl = Plan { name, rate, burst, keys: vec![] };
+                let out = plan_json(&id, &pl);
+                self.plans.insert(id, pl);
+                (201, out)
+            }
+            ("GET", []) => (200, json!({"item": self.plans.iter().map(|(id, pl)| plan_json(id, pl)).collect::<Vec<_>>()})),
+            ("GET", [id]) => (200, plan_json(id, self.plans.get(*id).ok_or_else(|| nf("usage plan"))?)),
+            ("DELETE", [id]) => {
+                self.plans.remove(*id).ok_or_else(|| nf("usage plan"))?;
+                (200, json!({"id": id}))
+            }
+            ("POST", [id, "keys"]) => {
+                let key_id = strv("keyId").ok_or_else(|| bad("keyId is required"))?;
+                let ty = strv("keyType").unwrap_or_default();
+                if ty != "API_KEY" {
+                    return Err(bad("keyType must be API_KEY"));
+                }
+                if !self.keys.contains_key(&key_id) {
+                    return Err(nf("api key"));
+                }
+                let pl = self.plans.get_mut(*id).ok_or_else(|| nf("usage plan"))?;
+                if !pl.keys.contains(&key_id) {
+                    pl.keys.push(key_id.clone());
+                }
+                self.buckets.remove(&key_id);
+                (201, json!({"id": key_id, "type": "API_KEY"}))
+            }
+            ("DELETE", [id, "keys", key_id]) => {
+                let pl = self.plans.get_mut(*id).ok_or_else(|| nf("usage plan"))?;
+                pl.keys.retain(|k| k != *key_id);
+                (200, json!({"id": key_id}))
+            }
+            _ => return Err(err("NotFoundException", format!("{method} /usageplans/{} is not supported yet", p.join("/")))),
+        })
+    }
+
+    // Consume one token for an API key governed by a plan (token bucket, per key).
+    fn throttle_take(&mut self, key_id: &str) -> bool {
+        let (rate, burst) = match self.plans.values().find(|p| p.keys.iter().any(|k| k == key_id)) {
+            Some(p) if p.rate > 0.0 || p.burst > 0 => (p.rate, p.burst),
+            _ => return true, // no plan or no throttle configured
+        };
+        let now = chrono::Utc::now().timestamp() as f64;
+        let (tokens, last) = self.buckets.get(key_id).cloned().unwrap_or((burst as f64, now));
+        let refilled = (tokens + (now - last) * rate).min(burst as f64);
+        if refilled < 1.0 {
+            self.buckets.insert(key_id.into(), (refilled, now));
+            return false;
+        }
+        self.buckets.insert(key_id.into(), (refilled - 1.0, now));
+        true
+    }
+
     // REST v1 control plane. `path` is what follows /restapis.
     pub fn handle_rest(&mut self, method: &str, path: &str, b: &Value) -> Result<(u16, Value), ApiErr> {
-        let p: Vec<&str> = path.trim_matches('/').split('/').filter(|x| !x.is_empty()).collect();
+        // The path carries its root marker: restapis/{api}/..., apikeys... or usageplans...
+        let mut p: Vec<&str> = path.trim_matches('/').split('/').filter(|x| !x.is_empty()).collect();
+        if p.first() == Some(&"apikeys") {
+            let r = p[1..].to_vec();
+            return self.handle_keys(method, &r, b);
+        }
+        if p.first() == Some(&"usageplans") {
+            let r = p[1..].to_vec();
+            return self.handle_plans(method, &r, b);
+        }
+        if p.first() == Some(&"restapis") {
+            p.remove(0);
+        }
+        let p = p;
         let strv = |k: &str| b[k].as_str().map(String::from);
         let bad = |m: &str| err("BadRequestException", m);
         // POST /restapis creates an API; everything else needs an API id first.
@@ -689,7 +858,7 @@ impl ApiGw {
             let root = format!("r{}", short_id());
             let mut resources = BTreeMap::new();
             resources.insert(root.clone(), Res1 { id: root.clone(), parent: String::new(), part: String::new(), methods: BTreeMap::new() });
-            let r = RestApi { name, resources, deployments: BTreeMap::new(), stages: BTreeMap::new() };
+            let r = RestApi { name, resources, deployments: BTreeMap::new(), stages: BTreeMap::new(), authorizers: BTreeMap::new() };
             let out = json!({"id": id, "name": r.name, "createdDate": chrono::Utc::now().to_rfc3339(),
                 "endpointConfiguration": {"types": ["REGIONAL"]}, "rootResourceId": root, "tags": {}});
             self.rests.insert(id, r);
@@ -743,7 +912,14 @@ impl ApiGw {
                 }
                 let params: BTreeMap<String, bool> = b.get("requestParameters").and_then(Value::as_object)
                     .map(|m| m.iter().map(|(k, v)| (k.clone(), v.as_bool().unwrap_or(false))).collect()).unwrap_or_default();
-                let md = Method1 { auth, params, integration: None, responses: BTreeMap::new(), integ_responses: BTreeMap::new() };
+                let authorizer_id = strv("authorizerId");
+                if let Some(a) = &authorizer_id {
+                    if !ra.authorizers.contains_key(a) {
+                        return Err(bad("authorizerId does not reference an authorizer of this API"));
+                    }
+                }
+                let api_key = b["apiKeyRequired"].as_bool().unwrap_or(false);
+                let md = Method1 { auth, authorizer_id, api_key, params, integration: None, responses: BTreeMap::new(), integ_responses: BTreeMap::new() };
                 let out = method1_json(m, &md);
                 r.methods.insert(m.to_string(), md);
                 (200, out)
@@ -807,6 +983,33 @@ impl ApiGw {
                 md.integration.take().ok_or_else(|| nf("integration"))?;
                 (200, json!({"type": "AWS_PROXY"}))
             }
+            ("POST", ["authorizers"]) => {
+                let name = strv("name").ok_or_else(|| bad("name is required"))?;
+                let ty = strv("type").ok_or_else(|| bad("type is required"))?;
+                if !["COGNITO_USER_POOLS", "TOKEN", "REQUEST"].contains(&ty.as_str()) {
+                    return Err(bad("type must be COGNITO_USER_POOLS, TOKEN or REQUEST"));
+                }
+                let id_source = strv("identitySource").ok_or_else(|| bad("identitySource is required"))?;
+                let provider_arns: Vec<String> = b["providerARNs"].as_array().into_iter().flatten().filter_map(|a| a.as_str().map(String::from)).collect();
+                let uri = strv("authorizerUri").unwrap_or_default();
+                if (ty == "TOKEN" || ty == "REQUEST") && lambda_fn_of(&uri).is_empty() {
+                    return Err(bad("authorizerUri must address a local Lambda function"));
+                }
+                if ty == "COGNITO_USER_POOLS" && provider_arns.is_empty() {
+                    return Err(bad("providerARNs is required for COGNITO_USER_POOLS authorizers"));
+                }
+                let id = short_id();
+                let a = Auth1 { name, ty, id_source, provider_arns, uri };
+                let out = auth1_json(&id, &a);
+                ra.authorizers.insert(id, a);
+                (201, out)
+            }
+            ("GET", ["authorizers"]) => (200, json!({"item": ra.authorizers.iter().map(|(id, a)| auth1_json(id, a)).collect::<Vec<_>>()})),
+            ("GET", ["authorizers", aid]) => (200, auth1_json(aid, ra.authorizers.get(*aid).ok_or_else(|| nf("authorizer"))?)),
+            ("DELETE", ["authorizers", aid]) => {
+                ra.authorizers.remove(*aid).ok_or_else(|| nf("authorizer"))?;
+                (200, json!({"id": aid}))
+            }
             ("POST", ["deployments"]) => {
                 // The snapshot is the point: a stage serves this exact tree.
                 let id = short_id();
@@ -844,8 +1047,8 @@ impl ApiGw {
     }
 
     // Resolve a REST v1 request against the stage's deployment snapshot:
-    // (resource path, resource id, integration, path parameters).
-    fn rest_target(&self, api: &str, stage: &str, method: &str, path: &str) -> Option<(String, String, Integ1, Map<String, Value>)> {
+    // (resource path, resource id, integration, path parameters, authorizer, apiKeyRequired).
+    fn rest_target(&self, api: &str, stage: &str, method: &str, path: &str) -> Option<(String, String, Integ1, Map<String, Value>, Option<Auth1>, bool)> {
         let ra = self.rests.get(api)?;
         let dep = ra.stages.get(stage)?;
         let snap = ra.deployments.get(dep)?;
@@ -879,8 +1082,10 @@ impl ApiGw {
         }
         let (rid, params) = found?;
         let r = snap.get(&rid)?;
-        let i = r.methods.get(method)?.integration.clone()?;
-        Some((res1_path_snap(snap, &rid), r.id.clone(), i, params))
+        let md = r.methods.get(method)?;
+        let i = md.integration.clone()?;
+        let auth = md.authorizer_id.as_ref().and_then(|a| ra.authorizers.get(a)).cloned();
+        Some((res1_path_snap(snap, &rid), r.id.clone(), i, params, auth, md.api_key))
     }
 
     pub fn admin(&self) -> Value {
@@ -1069,10 +1274,43 @@ pub async fn rest_invoke(app: &Arc<App>, method: &str, api: &str, stage: &str, r
         let gw = app.apigw.lock().unwrap();
         if gw.rests.contains_key(api) { gw.rest_target(api, stage, method, &rest) } else { None }
     };
-    let Some((resource, rid, integ, params)) = t else {
+    let Some((resource, rid, integ, params, auth, api_key)) = t else {
         // v1's quirk: an unmatched route is a 403 "Missing Authentication Token".
         return json_err(403, "Missing Authentication Token");
     };
+    let hdrs: Map<String, Value> = headers.iter().filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.into()))).collect();
+    let qs: Map<String, Value> = query.split('&').filter(|p| !p.is_empty())
+        .map(|p| { let (k, v) = p.split_once('=').unwrap_or((p, "")); (crate::s3::pct_decode(k), crate::s3::pct_decode(v).into()) }).collect();
+    let text = std::str::from_utf8(body);
+    let mut event_ctx: Option<Value> = None;
+    // API key gate: x-api-key must exist, be enabled and pass its plan's token bucket.
+    if api_key {
+        let kv = headers.get("x-api-key").and_then(|v| v.to_str().ok()).unwrap_or("");
+        if kv.is_empty() {
+            return json_err(403, "Missing Authentication Token");
+        }
+        let (known, allowed) = {
+            let mut gw = app.apigw.lock().unwrap();
+            match gw.keys.iter().find(|(_, k)| k.value == kv && k.enabled).map(|(i, _)| i.clone()) {
+                Some(id) => (true, gw.throttle_take(&id)),
+                None => (false, false),
+            }
+        };
+        if !known {
+            return json_err(403, "Forbidden");
+        }
+        if !allowed {
+            return json_err(429, "Too Many Requests");
+        }
+    }
+    // Authorizer gate (COGNITO_USER_POOLS / TOKEN / REQUEST).
+    if let Some(a) = auth {
+        let arn = format!("arn:aws:execute-api:{}:{}:{}/{}/{}{}", *crate::REGION, crate::ACCOUNT, api, stage, method, resource);
+        match rest_authorize(app, &a, &arn, &hdrs, &qs, &params).await {
+            Ok(ctx) => event_ctx = Some(ctx),
+            Err((st, m)) => return json_err(st, m),
+        }
+    }
     if integ.ty == "MOCK" {
         return (200, vec![("content-type".into(), "application/json".into())], Vec::new(), resource);
     }
@@ -1080,10 +1318,6 @@ pub async fn rest_invoke(app: &Arc<App>, method: &str, api: &str, stage: &str, r
     if func.is_empty() {
         return json_err(500, "Internal Server Error");
     }
-    let hdrs: Map<String, Value> = headers.iter().filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.into()))).collect();
-    let qs: Map<String, Value> = query.split('&').filter(|p| !p.is_empty())
-        .map(|p| { let (k, v) = p.split_once('=').unwrap_or((p, "")); (crate::s3::pct_decode(k), crate::s3::pct_decode(v).into()) }).collect();
-    let text = std::str::from_utf8(body);
     let now = chrono::Utc::now();
     let mut event = json!({
         "resource": resource, "path": rest, "httpMethod": method,
@@ -1102,6 +1336,9 @@ pub async fn rest_invoke(app: &Arc<App>, method: &str, api: &str, stage: &str, r
     }
     if !body.is_empty() {
         event["body"] = text.map_or_else(|_| crate::b64(body), String::from).into();
+    }
+    if let Some(ctx) = event_ctx {
+        event["requestContext"]["authorizer"] = ctx;
     }
     match crate::lambda::invoke(app, &func, event).await {
         Ok(inv) if inv.error.is_none() => {
@@ -1122,6 +1359,108 @@ pub async fn rest_invoke(app: &Arc<App>, method: &str, api: &str, stage: &str, r
         }
         _ => json_err(500, "Internal Server Error"),
     }
+}
+
+// v1 authorizer: verify a token / invoke a Lambda authorizer and read its IAM policy document.
+// Returns the requestContext.authorizer payload, or (status, message).
+async fn rest_authorize(app: &Arc<App>, a: &Auth1, arn: &str, hdrs: &Map<String, Value>, qs: &Map<String, Value>, params: &Map<String, Value>) -> Result<Value, (u16, &'static str)> {
+    let ident = |src: &str| -> Option<String> {
+        let src = src.split(',').next()?.trim();
+        if let Some(h) = src.strip_prefix("method.request.header.") {
+            return hdrs.keys().find(|k| k.eq_ignore_ascii_case(h)).and_then(|k| hdrs[k].as_str().map(String::from));
+        }
+        if let Some(q) = src.strip_prefix("method.request.querystring.") {
+            return qs.get(q).and_then(|v| v.as_str().map(String::from));
+        }
+        None
+    };
+    match a.ty.as_str() {
+        "COGNITO_USER_POOLS" => {
+            let raw = ident(&a.id_source).unwrap_or_default();
+            let tok = raw.get(..7).filter(|p| p.eq_ignore_ascii_case("bearer ")).map_or(raw.as_str(), |_| raw[7..].trim());
+            if tok.is_empty() {
+                return Err((401, "Unauthorized"));
+            }
+            // The pool must exist locally and the signature must verify (day-7 code path).
+            let pool = a.provider_arns.first().and_then(|arn| arn.rsplit('/').next().map(String::from)).unwrap_or_default();
+            if pool.is_empty() || !app.cognito.lock().unwrap().pool_exists(&pool) {
+                return Err((500, "Internal Server Error"));
+            }
+            match crate::cognito::verify(tok) {
+                Some(claims) => Ok(json!({"claims": claims})),
+                None => Err((401, "Unauthorized")),
+            }
+        }
+        "TOKEN" => {
+            let raw = ident(&a.id_source).unwrap_or_default();
+            if raw.is_empty() {
+                return Err((401, "Unauthorized"));
+            }
+            let ev = json!({"type": "TOKEN", "methodArn": arn, "authorizationToken": raw});
+            lambda_policy(app, &a.uri, arn, ev).await
+        }
+        _ => {
+            let ev = json!({"type": "REQUEST", "methodArn": arn, "headers": hdrs, "queryStringParameters": qs, "pathParameters": params});
+            lambda_policy(app, &a.uri, arn, ev).await
+        }
+    }
+}
+
+async fn lambda_policy(app: &Arc<App>, uri: &str, arn: &str, ev: Value) -> Result<Value, (u16, &'static str)> {
+    let f = lambda_fn_of(uri);
+    if f.is_empty() {
+        return Err((500, "Internal Server Error"));
+    }
+    match crate::lambda::invoke(app, &f, ev).await {
+        Ok(inv) if inv.error.is_none() => {
+            let ctx = inv.payload.get("context").cloned().unwrap_or(json!({}));
+            match policy_allows(&inv.payload, arn) {
+                Some(true) => Ok(ctx),
+                _ => Err((403, "Access Denied")),
+            }
+        }
+        _ => Err((500, "Internal Server Error")),
+    }
+}
+
+// Explicit Deny beats Allow; anything else is a default deny. Resources may be a string or a list
+// and may use trailing/inner '*' globs.
+fn policy_allows(policy: &Value, arn: &str) -> Option<bool> {
+    let stmts = policy["policyDocument"]["Statement"].as_array()?;
+    let mut allow = false;
+    for s in stmts {
+        let res: Vec<&str> = s["Resource"].as_str().into_iter()
+            .chain(s["Resource"].as_array().into_iter().flatten().filter_map(Value::as_str)).collect();
+        let hit = res.iter().any(|r| glob_match(r, arn));
+        if !hit {
+            continue;
+        }
+        match s["Effect"].as_str() {
+            Some("Deny") => return Some(false),
+            Some("Allow") => allow = true,
+            _ => {}
+        }
+    }
+    allow.then_some(true)
+}
+
+fn glob_match(g: &str, s: &str) -> bool {
+    let parts: Vec<&str> = g.split('*').collect();
+    if parts.len() == 1 {
+        return g == s;
+    }
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if !s.starts_with(first) || !s.ends_with(last) || s.len() < first.len() + last.len() {
+        return false;
+    }
+    let mut at = first.len();
+    for mid in &parts[1..parts.len() - 1] {
+        match s[at..s.len() - last.len()].find(mid) {
+            Some(i) => at += i + mid.len(),
+            None => return false,
+        }
+    }
+    true
 }
 
 #[cfg(test)]

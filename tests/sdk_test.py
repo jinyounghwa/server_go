@@ -3151,6 +3151,149 @@ def test_apigateway_rest_v1():
 
 
 
+REST_AUTH_FN = """
+import json
+def h(event, ctx):
+    tok = event.get("authorizationToken", "")
+    good = tok.endswith("allow")
+    return {"policyDocument": {"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow" if good else "Deny", "Action": "execute-api:Invoke",
+         "Resource": event["methodArn"]}]},
+        "context": {"who": tok or "anon"}}
+"""
+
+
+def test_apigateway_rest_auth_keys_cfn():
+    import urllib.request, urllib.error
+    ag, lam = (boto3.client(n, **kw) for n in ("apigateway", "lambda"))
+    fn, afn = f"rfn{run}", f"rauth{run}"
+    lam.create_function(FunctionName=fn, Runtime="python3.12", Role="arn:aws:iam::000000000000:role/x", Handler="app.h",
+                        Code={"ZipFile": zipped({"app.py": REST_FN})})
+    lam.create_function(FunctionName=afn, Runtime="python3.12", Role="arn:aws:iam::000000000000:role/x", Handler="app.h",
+                        Code={"ZipFile": zipped({"app.py": REST_AUTH_FN})})
+    for f in (fn, afn):
+        lam.get_waiter("function_active_v2").wait(FunctionName=f)
+
+    def call(m, path, data=None, headers=None):
+        req = urllib.request.Request(f"http://127.0.0.1:4566{path}", data=data, method=m, headers=headers or {})
+        try:
+            r = urllib.request.urlopen(req, timeout=30)
+            return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    api = ag.create_rest_api(name=f"ra{run}")["id"]
+    root = ag.get_rest_api(restApiId=api)["rootResourceId"]
+    sec = ag.create_resource(restApiId=api, parentId=root, pathPart="sec")["id"]
+    uri = f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:{fn}/invocations"
+    auth_uri = f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:{afn}/invocations"
+
+    # --- TOKEN authorizer: Allow / Deny / missing token ---
+    aid = ag.create_authorizer(restApiId=api, name="tok", type="TOKEN",
+                               identitySource="method.request.header.Authorization", authorizerUri=auth_uri)["id"]
+    ag.put_method(restApiId=api, resourceId=sec, httpMethod="GET", authorizationType="NONE", authorizerId=aid)
+    ag.put_integration(restApiId=api, resourceId=sec, httpMethod="GET", type="AWS_PROXY", uri=uri)
+    dep = ag.create_deployment(restApiId=api)["id"]
+    ag.create_stage(restApiId=api, stageName="prod", deploymentId=dep)
+    st, out = call("GET", f"/_restapi/{api}/prod/sec", headers={"Authorization": "Bearer token-allow"})
+    assert st == 200 and b"token-allow" not in out, (st, out)
+    st, out = call("GET", f"/_restapi/{api}/prod/sec", headers={"Authorization": "Bearer token-deny"})
+    assert st == 403 and b"Access Denied" in out, (st, out)
+    st, out = call("GET", f"/_restapi/{api}/prod/sec")
+    assert st == 401 and b"Unauthorized" in out, (st, out)
+
+    # --- API keys + usage plan throttle (rate 1/s, burst 1) ---
+    res2 = ag.create_resource(restApiId=api, parentId=root, pathPart="pub")["id"]
+    ag.put_method(restApiId=api, resourceId=res2, httpMethod="GET", authorizationType="NONE", apiKeyRequired=True)
+    ag.put_integration(restApiId=api, resourceId=res2, httpMethod="GET", type="MOCK")
+    created_key = ag.create_api_key(name=f"k{run}")
+    key, key_id = created_key["value"], created_key["id"]
+    plan = ag.create_usage_plan(name=f"p{run}", throttle={"rateLimit": 1, "burstLimit": 1})["id"]
+    ag.create_usage_plan_key(usagePlanId=plan, keyId=key_id, keyType="API_KEY")
+    dep = ag.create_deployment(restApiId=api)["id"]
+    ag.create_stage(restApiId=api, stageName="k", deploymentId=dep)
+    st, out = call("GET", f"/_restapi/{api}/k/pub")  # no key
+    assert st == 403, (st, out)
+    st, out = call("GET", f"/_restapi/{api}/k/pub", headers={"x-api-key": "wrong"})
+    assert st == 403 and b"Forbidden" in out, (st, out)
+    st, out = call("GET", f"/_restapi/{api}/k/pub", headers={"x-api-key": key})
+    assert st == 200, (st, out)
+    st, out = call("GET", f"/_restapi/{api}/k/pub", headers={"x-api-key": key})  # bucket empty -> 429
+    assert st == 429 and b"Too Many Requests" in out, (st, out)
+    ag.delete_api_key(apiKey=key_id)
+
+    # --- COGNITO_USER_POOLS authorizer: a local pool's JWT unlocks the method ---
+    idp = boto3.client("cognito-idp", **kw)
+    pool = idp.create_user_pool(PoolName=f"apipool{run}", UsernameAttributes=["email"])["UserPool"]["Id"]
+    cid = idp.create_user_pool_client(UserPoolId=pool, ClientName="web", ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"])["UserPoolClient"]["ClientId"]
+    email = f"apirest{run}@example.com"
+    idp.sign_up(ClientId=cid, Username=email, Password="Str0ng!pass", UserAttributes=[{"Name": "name", "Value": "Kim"}])
+    st = json.load(urllib.request.urlopen(f"{EP}/_admin/state"))
+    sent = next(p for p in st["cognito"] if p["name"] == f"apipool{run}")["rows"][0][3]
+    idp.confirm_sign_up(ClientId=cid, Username=email, ConfirmationCode=sent)
+    tok = idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH", AuthParameters={"USERNAME": email, "PASSWORD": "Str0ng!pass"})["AuthenticationResult"]["IdToken"]
+    cog = ag.create_authorizer(restApiId=api, name="cog", type="COGNITO_USER_POOLS", identitySource="method.request.header.Authorization",
+                               providerARNs=[f"arn:aws:cognito-idp:us-east-1:000000000000:userpool/{pool}"])["id"]
+    cogres = ag.create_resource(restApiId=api, parentId=root, pathPart="cog")["id"]
+    ag.put_method(restApiId=api, resourceId=cogres, httpMethod="GET", authorizationType="NONE", authorizerId=cog)
+    ag.put_integration(restApiId=api, resourceId=cogres, httpMethod="GET", type="AWS_PROXY", uri=uri)
+    dep = ag.create_deployment(restApiId=api)["id"]
+    ag.create_stage(restApiId=api, stageName="cogs", deploymentId=dep)
+    st, out = call("GET", f"/_restapi/{api}/cogs/cog", headers={"Authorization": tok})
+    assert st == 200, (st, out)
+    st, out = call("GET", f"/_restapi/{api}/cogs/cog", headers={"Authorization": "garbage"})
+    assert st == 401, (st, out)
+
+    # --- CFN builds a callable REST API ---
+    cf = boto3.client("cloudformation", **kw)
+    stack = f"apirest{run}"
+    tmpl = """
+Resources:
+  Api:
+    Type: AWS::ApiGateway::RestApi
+    Properties: {Name: cfn-rest}
+  Root:
+    Type: AWS::ApiGateway::Resource
+    Properties: {RestApiId: !Ref Api, ParentId: !GetAtt Api.RootResourceId, PathPart: hello}
+  Method:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref Root
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration: {Type: AWS_PROXY, Uri: "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:%s/invocations"}
+  Dep:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [Method]
+    Properties: {RestApiId: !Ref Api}
+  Stage:
+    Type: AWS::ApiGateway::Stage
+    Properties: {RestApiId: !Ref Api, DeploymentId: !Ref Dep, StageName: cfn}
+""" % fn
+    cf.create_stack(StackName=stack, TemplateBody=tmpl)
+    for _ in range(200):
+        stt = cf.describe_stacks(StackName=stack)["Stacks"][0]["StackStatus"]
+        if not stt.endswith("_IN_PROGRESS"):
+            assert stt == "CREATE_COMPLETE", stt
+            break
+        time.sleep(0.1)
+    api_id = next(r["PhysicalResourceId"] for r in cf.describe_stack_resources(StackName=stack)["StackResources"] if r["LogicalResourceId"] == "Api")
+    st, out = call("GET", f"/_restapi/{api_id}/cfn/hello")
+    assert st == 200 and json.loads(out)["resource"] == "/hello", (st, out)
+    cf.delete_stack(StackName=stack)
+    for _ in range(100):
+        try:
+            cf.describe_stacks(StackName=stack)
+        except ClientError:
+            break
+        time.sleep(0.1)
+
+    for f in (fn, afn):
+        lam.delete_function(FunctionName=f)
+
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

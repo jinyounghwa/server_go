@@ -279,8 +279,14 @@ fn checks(app: &App, svc: &Svc, body: &[u8]) -> Vec<(String, String)> {
         // API Gateway's IAM model: action = HTTP verb, resource = API path.
         Svc::ApiGw(m, path) => vec![(format!("apigateway:{m}"), format!("arn:aws:apigateway:{}::/{path}", *REGION))],
         Svc::RestGw(m, path) => {
-            let id = path.trim_matches('/').split('/').next().unwrap_or("");
-            vec![(format!("apigateway:{m}"), if id.is_empty() { "*".into() } else { format!("arn:aws:apigateway:{}::/restapis/{id}", *REGION) })]
+            let segs: Vec<&str> = path.trim_matches('/').split('/').filter(|x| !x.is_empty()).collect();
+            let arn = match segs.first() {
+                Some(&"restapis") => segs.get(1).map_or("*".to_string(), |id| format!("arn:aws:apigateway:{}::/restapis/{id}", *REGION)),
+                Some(&"apikeys") => segs.get(1).map_or("*".to_string(), |id| format!("arn:aws:apigateway:{}::/apikeys/{id}", *REGION)),
+                Some(&"usageplans") => segs.get(1).map_or("*".to_string(), |id| format!("arn:aws:apigateway:{}::/usageplans/{id}", *REGION)),
+                _ => "*".to_string(),
+            };
+            vec![(format!("apigateway:{m}"), arn)]
         }
         Svc::Lambda(op, path, _) => {
             let res = lambda::path_name(path).or_else(|| j["FunctionName"].as_str().map(lambda::name_of)).map_or("*".into(), |n| lambda::arn(&n));
@@ -363,7 +369,11 @@ async fn handle(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<std:
     } else if let Some(path) = uri.path().strip_prefix("/v2/").filter(|_| scope == "apigateway") {
         Svc::ApiGw(method.to_string(), path.to_string())
     } else if let Some(path) = uri.path().strip_prefix("/restapis").filter(|_| scope == "apigateway") {
-        Svc::RestGw(method.to_string(), path.to_string())
+        Svc::RestGw(method.to_string(), format!("restapis{path}"))
+    } else if let Some(path) = uri.path().strip_prefix("/apikeys").filter(|_| scope == "apigateway") {
+        Svc::RestGw(method.to_string(), format!("apikeys{path}"))
+    } else if let Some(path) = uri.path().strip_prefix("/usageplans").filter(|_| scope == "apigateway") {
+        Svc::RestGw(method.to_string(), format!("usageplans{path}"))
     } else if let Some(path) = lambda_path {
         Svc::Lambda(lambda::op_of(method.as_str(), path), path.to_string(), form(uri.query().unwrap_or("")).collect())
     } else if let Some(op) = target.strip_prefix("DynamoDB_20120810.") {

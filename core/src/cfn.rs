@@ -306,6 +306,15 @@ async fn s3_call(app: &App, method: Method, path: &str) -> Result<(), String> {
         Err(crate::s3::tags(&String::from_utf8_lossy(&b), "Message").concat())
     }
 }
+// Call the REST v1 control plane in-process (no HTTP round-trip).
+async fn apigw_call(app: &Arc<App>, method: &str, path: &str, body: Value) -> Result<Value, String> {
+    let r = app.apigw.lock().unwrap().handle_rest(method, path, &body);
+    match r {
+        Ok((_, v)) => Ok(v),
+        Err(e) => Err(e.msg),
+    }
+}
+
 async fn lambda_call(app: &Arc<App>, op: &str, path: &str, body: Value) -> Result<Value, String> {
     let r = crate::lambda::api(app, op, path, &HashMap::new(), &HeaderMap::new(), body.to_string().as_bytes()).await;
     let ok = r.status().is_success();
@@ -460,6 +469,51 @@ async fn create(app: &Arc<App>, stack: &str, logical: &str, ty: &str, p: &Value)
             let r = lambda_call(app, "CreateFunction", "/functions", req).await?;
             (n, attrs(vec![("Arn", r["FunctionArn"].clone())]))
         }
+        // REST v1 (Day 21): the CFN types call the /restapis control plane directly.
+        "AWS::ApiGateway::RestApi" => {
+            let n = name("Name", 64, false);
+            let r = apigw_call(app, "POST", "/restapis", json!({"name": n})).await?;
+            let id = s(&r["id"]);
+            (id.clone(), attrs(vec![("RootResourceId", r["rootResourceId"].clone()), ("RestApiId", id.into())]))
+        }
+        "AWS::ApiGateway::Resource" => {
+            let api = s(&p["RestApiId"]);
+            let parent = s(&p["ParentId"]);
+            let part = s(&p["PathPart"]);
+            let r = apigw_call(app, "POST", &format!("/restapis/{api}/resources/{parent}"), json!({"pathPart": part})).await?;
+            (s(&r["id"]), Map::new())
+        }
+        "AWS::ApiGateway::Method" => {
+            let api = s(&p["RestApiId"]);
+            let res = s(&p["ResourceId"]);
+            let m = s(&p["HttpMethod"]);
+            let mut body = json!({"authorizationType": p["AuthorizationType"].as_str().unwrap_or("NONE"), "apiKeyRequired": p["ApiKeyRequired"].as_bool().unwrap_or(false)});
+            if let Some(a) = p["AuthorizerId"].as_str() {
+                body["authorizerId"] = a.into();
+            }
+            apigw_call(app, "PUT", &format!("/restapis/{api}/resources/{res}/methods/{m}"), body).await?;
+            // The Method resource carries its integration inline.
+            if let Some(i) = p["Integration"].as_object() {
+                let mut ib = json!({"type": i["Type"].as_str().unwrap_or("AWS_PROXY")});
+                if let Some(u) = i["Uri"].as_str() {
+                    ib["uri"] = u.into();
+                }
+                apigw_call(app, "PUT", &format!("/restapis/{api}/resources/{res}/methods/{m}/integration"), ib).await?;
+            }
+            (uuid::Uuid::new_v4().to_string(), Map::new())
+        }
+        "AWS::ApiGateway::Deployment" => {
+            let api = s(&p["RestApiId"]);
+            let r = apigw_call(app, "POST", &format!("/restapis/{api}/deployments"), json!({})).await?;
+            (s(&r["id"]), Map::new())
+        }
+        "AWS::ApiGateway::Stage" => {
+            let api = s(&p["RestApiId"]);
+            let stage = s(&p["StageName"]);
+            let dep = s(&p["DeploymentId"]);
+            apigw_call(app, "POST", &format!("/restapis/{api}/stages"), json!({"stageName": stage, "deploymentId": dep})).await?;
+            (stage, Map::new())
+        }
         "AWS::Lambda::Permission" => (uuid::Uuid::new_v4().to_string(), Map::new()),
         "AWS::Lambda::EventSourceMapping" => {
             let r = lambda_call(app, "CreateEventSourceMapping", "/event-source-mappings", p.clone()).await?;
@@ -572,6 +626,8 @@ async fn delete(app: &Arc<App>, r: &Res) -> Result<(), String> {
         }
         "AWS::Lambda::Function" => lambda_call(app, "DeleteFunction", &format!("/functions/{p}"), json!({})).await.map(drop),
         "AWS::Lambda::EventSourceMapping" => lambda_call(app, "DeleteEventSourceMapping", &format!("/event-source-mappings/{p}"), json!({})).await.map(drop),
+        "AWS::ApiGateway::RestApi" => apigw_call(app, "DELETE", &format!("/restapis/{p}"), json!({})).await.map(drop),
+        "AWS::ApiGateway::Resource" | "AWS::ApiGateway::Method" | "AWS::ApiGateway::Deployment" | "AWS::ApiGateway::Stage" => Ok(()),
         "AWS::Logs::LogGroup" => api(app.logs.lock().unwrap().handle("DeleteLogGroup", &json!({"logGroupName": p}))).map(drop),
         "AWS::SSM::Parameter" => api(app.ssm.lock().unwrap().handle("DeleteParameter", &json!({"Name": p}))).map(drop),
         "AWS::SecretsManager::Secret" => api(app.secrets.lock().unwrap().handle("DeleteSecret", &json!({"SecretId": p, "ForceDeleteWithoutRecovery": true}))).map(drop),
