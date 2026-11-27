@@ -144,10 +144,10 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
 - 새 시나리오: `sc_x()` 함수 → `run_inner()`의 `plan` 목록과 `match id`에 추가 → `make_result()`로 결과.
 
 ## 7. 다음에 할 일 (2026-11-27 기준, 우선순위 순)
-최신 태그는 `v0.1.4`, `v0.1.7` 릴리스 준비 완료(v0.1.5·v0.1.6·v0.1.7 태그 푸시는 사용자 승인 대기). HANDOFF.md 1~24일차 완료, 25~53일차 계획이 이어진다. 남은 한계는 각 파일의 `ponytail:` 주석(`grep -rn ponytail core/src`)이 목록이다.
+최신 태그는 `v0.1.4`, `v0.1.7` 릴리스 준비 완료(v0.1.5·v0.1.6·v0.1.7 태그 푸시는 사용자 승인 대기). HANDOFF.md 1~23일차 완료, 24~53일차 계획이 이어진다. 남은 한계는 각 파일의 `ponytail:` 주석(`grep -rn ponytail core/src`)이 목록이다.
 
 1. **실기기 점검**(사용자 도움 필요): 실제 휴대폰·실제 Safari·GPU가 약한 노트북에서 Pages 마을을 연다.
-   연대기 섬 숫자(SDK 테스트 53/8/7개, 시나리오 27개, GPU 65°C)는 `town.html` 12절에 손으로 적은 값이니 바뀌면 같이 고친다.
+   연대기 섬 숫자(SDK 테스트 52/8/7개, 시나리오 27개, GPU 65°C)는 `town.html` 12절에 손으로 적은 값이니 바뀌면 같이 고친다.
 2. (선택) `?api=`로 IPv6 `[::1]`: CSP가 IPv6 리터럴을 못 받으므로 요청이 있을 때만.
 3. (선택) SigV4a: ECDSA P-256 크레이트 추가가 필요하므로 사용자 요청이 있을 때만.
 4. 26일차(2026-12-20)부터 HANDOFF.md의 Lambda 레이어·웜 실행·컨테이너 이미지·Cognito MFA 등 계획을 따른다.
