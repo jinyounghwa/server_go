@@ -396,7 +396,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - `GetObjectAttributes`의 Checksum이 맞아야 한다.
   - 두 모드에서 모두 통과해야 한다. VERIFY_SIGV4 모드에서는 트레일러 경로를 탄다.
 
-## 23일차 (2026-12-17): v0.1.7 릴리스 + 다음 10일 계획
+## 23일차 (2026-12-17): v0.1.7 릴리스 + 다음 10일 계획 — ✅ 완료·태그 대기 (`893506b`): Cargo 0.1.7·`town.html` 동기화(v0.1.0~v0.1.7, boto3 52)·AGENTS 1/2/7/8절 갱신, 우분투 전체 검증(단위 51·boto3 52 두 모드·JS 8·Rust 7·컨테이너/스냅샷 0개), Playwright 라이브 Pages 점검(HTTP 200·에러 0건). **태그 푸시(v0.1.5/v0.1.6/v0.1.7 정리 포함)는 사용자 승인 대기**
 - 우분투 전체 검증을 돌린다(두 모드, JS·Rust 스위트, `ubuntu_verify.sh`, 컨테이너 0개, 스냅샷 이미지 0개).
 - v0.1.7을 준비한다. 절차는 1일차 1-2와 같다.
   - **태그 푸시는 사용자 승인을 받은 뒤에만 한다.**
@@ -406,7 +406,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
 
 ---
 
-## 24일차 (2026-12-18): ponytail 주석·문서 사실 맞추기 + 군살 감사
+## 24일차 (2026-12-18): ponytail 주석·문서 사실 맞추기 + 군살 감사 — ✅ 완료 (`893506b`): 오래된 `ponytail:` 3건 정리(`managed.rs`·`cfn.rs`·`lambda.rs`), 중복 `inspector::xml_tag` 제거→`s3::tag` 재사용(`wc -l core/src/*.rs`: 18,536→18,531줄, -5줄), AGENTS.md 2/7/8절 사실화, 우분투 전체 검증(경고 0·단위 51·boto3 52 두 모드·JS 8·Rust 7) 통과
 - **오래된 ponytail 주석을 고친다.** 이미 구현했는데 주석에는 아직 "없음"으로 남은 것들이 있다(2026-11-27 기준).
   - `managed.rs` 3행: 스냅샷·파라미터 그룹(17일차)
   - `cfn.rs` 4행: exports/imports(11일차)
