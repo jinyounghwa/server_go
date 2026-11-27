@@ -1,10 +1,99 @@
 // SigV4 signing and (optional, VERIFY_SIGV4=1) verification. HMAC-SHA256 is built on sha2.
 // Signed aws-chunked bodies (STREAMING-AWS4-HMAC-SHA256-PAYLOAD) have every chunk signature checked, and a hex
 // x-amz-content-sha256 must match the body. With ...-PAYLOAD-TRAILER the x-amz-trailer-signature over the trailing headers is
-// checked too. Header-signed requests are rejected when x-amz-date is more than 15 minutes off (RequestTimeTooSkewed);
-// presigned URLs keep their X-Amz-Expires rule instead. ponytail: SigV4a is not checked; trailer checksum values are not recomputed.
+// checked too - and x-amz-checksum-* trailer values are recomputed (BadDigest on mismatch). Header-signed requests are
+// rejected when x-amz-date is more than 15 minutes off (RequestTimeTooSkewed);
+// presigned URLs keep their X-Amz-Expires rule instead. ponytail: SigV4a is not checked.
 use axum::http::{HeaderMap, Method, Uri};
 use sha2::{Digest, Sha256};
+
+// ---------- object checksums (CRC32/CRC32C tables, SHA-1 hand-rolled; no new crates) ----------
+// CRC32 (IEEE 0xEDB88320, reflected) and CRC32C (Castagnoli 0x82F63B78, reflected), table-based.
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut t = [0u32; 256];
+    for (i, x) in t.iter_mut().enumerate() {
+        let mut c = i as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 { 0xEDB88320 ^ (c >> 1) } else { c >> 1 };
+        }
+        *x = c;
+    }
+    let mut c = 0xFFFF_FFFFu32;
+    for b in data {
+        c = t[((c ^ *b as u32) & 0xFF) as usize] ^ (c >> 8);
+    }
+    c ^ 0xFFFF_FFFF
+}
+pub fn crc32c(data: &[u8]) -> u32 {
+    let mut t = [0u32; 256];
+    for (i, x) in t.iter_mut().enumerate() {
+        let mut c = i as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 { 0x82F63B78 ^ (c >> 1) } else { c >> 1 };
+        }
+        *x = c;
+    }
+    let mut c = 0xFFFF_FFFFu32;
+    for b in data {
+        c = t[((c ^ *b as u32) & 0xFF) as usize] ^ (c >> 8);
+    }
+    c ^ 0xFFFF_FFFF
+}
+// SHA-1 written by hand (the repo has no sha1 crate; chosen over rejecting the algorithm).
+pub fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    let mut msg = data.to_vec();
+    let bitlen = (data.len() as u64) * 8;
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bitlen.to_be_bytes());
+    for block in msg.chunks(64) {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes(block[i * 4..i * 4 + 4].try_into().unwrap());
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+        for (i, wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | (!b & d), 0x5A827999u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1u32),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32),
+                _ => (b ^ c ^ d, 0xCA62C1D6u32),
+            };
+            let t = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(*wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = t;
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+    h.iter().flat_map(|x| x.to_be_bytes()).collect::<Vec<u8>>().try_into().unwrap()
+}
+
+// Base64 digest of an object checksum algorithm (CRC32 | CRC32C | SHA1 | SHA256).
+pub fn checksum_of(algo: &str, data: &[u8]) -> Option<String> {
+    match algo {
+        "CRC32" => Some(crate::b64(&crc32(data).to_be_bytes())),
+        "CRC32C" => Some(crate::b64(&crc32c(data).to_be_bytes())),
+        "SHA1" => Some(crate::b64(&sha1(data))),
+        "SHA256" => Some(crate::b64(&Sha256::digest(data))),
+        _ => None,
+    }
+}
+pub fn is_checksum_algo(a: &str) -> bool {
+    ["CRC32", "CRC32C", "SHA1", "SHA256"].contains(&a)
+}
 
 fn hmac(key: &[u8], msg: &[u8]) -> [u8; 32] {
     let mut k = [0u8; 64];
@@ -65,26 +154,29 @@ fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8>
 // Walks "size;chunk-signature=sig\r\ndata\r\n" chunks, each signed over the previous signature, up to the final 0-size chunk.
 fn verify_chunks(body: &[u8], seed: &str, key: &[u8], amz_date: &str, scope: &str, trailer: bool) -> Result<(), String> {
     let (mut rest, mut prev, empty) = (body, seed.to_string(), sha256_hex(b""));
+    let mut data: Vec<u8> = Vec::new();
     loop {
         let nl = rest.windows(2).position(|w| w == b"\r\n").ok_or("chunk header is missing")?;
         let line = std::str::from_utf8(&rest[..nl]).map_err(|_| "chunk header is not text")?;
         let (size, sig) = line.split_once(";chunk-signature=").ok_or("chunk signature is missing")?;
         let n = usize::from_str_radix(size.trim(), 16).map_err(|_| "chunk size is invalid")?;
-        let data = rest.get(nl + 2..nl + 2 + n).ok_or("chunk is shorter than its declared size")?;
-        let sts = format!("AWS4-HMAC-SHA256-PAYLOAD\n{amz_date}\n{scope}\n{prev}\n{empty}\n{}", sha256_hex(data));
+        let data_chunk = rest.get(nl + 2..nl + 2 + n).ok_or("chunk is shorter than its declared size")?;
+        let sts = format!("AWS4-HMAC-SHA256-PAYLOAD\n{amz_date}\n{scope}\n{prev}\n{empty}\n{}", sha256_hex(data_chunk));
         if hex(&hmac(key, sts.as_bytes())) != sig.trim() {
             return Err("chunk signature does not match".into());
         }
         if n == 0 {
-            return if trailer { verify_trailer(&rest[nl + 2..], sig.trim(), key, amz_date, scope) } else { Ok(()) };
+            return if trailer { verify_trailer(&rest[nl + 2..], sig.trim(), key, amz_date, scope, &data) } else { Ok(()) };
         }
+        data.extend_from_slice(data_chunk);
         prev = sig.trim().to_string();
         rest = rest.get(nl + 2 + n + 2..).ok_or("chunk is not terminated")?;
     }
 }
 
 // Trailing headers ("name:value\r\n" ... "x-amz-trailer-signature:sig\r\n\r\n") signed over the final chunk signature.
-fn verify_trailer(rest: &[u8], prev: &str, key: &[u8], amz_date: &str, scope: &str) -> Result<(), String> {
+// x-amz-checksum-* values are recomputed over the decoded body and must match (BadDigest on mismatch).
+fn verify_trailer(rest: &[u8], prev: &str, key: &[u8], amz_date: &str, scope: &str, data: &[u8]) -> Result<(), String> {
     let text = std::str::from_utf8(rest).map_err(|_| "trailer is not text")?;
     let mut hs = vec![];
     let mut sig = None;
@@ -94,6 +186,25 @@ fn verify_trailer(rest: &[u8], prev: &str, key: &[u8], amz_date: &str, scope: &s
         if k == "x-amz-trailer-signature" { sig = Some(v.trim().to_string()) } else { hs.push(format!("{k}:{}\n", v.trim())) }
     }
     let sig = sig.ok_or("trailer signature is missing")?;
+    // Checksum values ride along in the trailer; recompute them over the decoded chunks.
+    let mut sums: Vec<(String, String)> = vec![];
+    for l in text.split('\n').map(|l| l.trim_end_matches('\r')).take_while(|l| !l.is_empty()) {
+        let (k, v) = l.split_once(':').ok_or("trailer header is malformed")?;
+        let k = k.trim().to_ascii_lowercase();
+        if let Some(algo) = k.strip_prefix("x-amz-checksum-") {
+            let algo = algo.to_ascii_uppercase();
+            if !is_checksum_algo(&algo) {
+                return Err(format!("checksum: {algo} is not a supported checksum algorithm"));
+            }
+            sums.push((algo, v.trim().to_string()));
+        }
+    }
+    for (algo, want) in &sums {
+        match checksum_of(algo, data) {
+            Some(got) if got == *want => {}
+            _ => return Err(format!("checksum: the {algo} you specified did not match the calculated checksum")),
+        }
+    }
     hs.sort();
     let sts = format!("AWS4-HMAC-SHA256-TRAILER\n{amz_date}\n{scope}\n{prev}\n{}", sha256_hex(hs.concat().as_bytes()));
     if hex(&hmac(key, sts.as_bytes())) != sig { Err("trailer signature does not match".into()) } else { Ok(()) }
@@ -165,7 +276,11 @@ pub fn verify(method: &Method, uri: &Uri, h: &HeaderMap, body: &[u8], secret_of:
     if payload.starts_with("STREAMING-AWS4-HMAC-SHA256-PAYLOAD") {
         let scope = format!("{}/{}/{}/aws4_request", parts[1], parts[2], parts[3]);
         verify_chunks(body, &sig, &signing_key(&secret, parts[1], parts[2], parts[3]), &amz_date, &scope, payload.ends_with("-TRAILER"))
-            .map_err(|m| ("SignatureDoesNotMatch", format!("aws-chunked body rejected: {m}")))?;
+            .map_err(|m| if m.starts_with("checksum") {
+                ("BadDigest", format!("aws-chunked body rejected: {}", m.trim_start_matches("checksum: ")))
+            } else {
+                ("SignatureDoesNotMatch", format!("aws-chunked body rejected: {m}"))
+            })?;
     } else if payload.len() == 64 && payload.bytes().all(|b| b.is_ascii_hexdigit()) && !payload.eq_ignore_ascii_case(&sha256_hex(body)) {
         return Err(("XAmzContentSHA256Mismatch", "The provided 'x-amz-content-sha256' header does not match what was computed.".into()));
     }
@@ -215,13 +330,15 @@ mod tests {
         assert!(verify_chunks(&bad, seed, &key, d, sc, false).is_err());
         assert!(verify_chunks(&body[..body.len() - 120], seed, &key, d, sc, false).is_err(), "truncated body");
         // Signed trailer after the final chunk (format of the AWS SDK for Java's AwsS3V4ChunkSigner.signChecksumChunk).
+        // The checksum value must match the decoded chunks, and the trailer signature covers it.
         let last = "b6c6ea8a5354eaf15b3cb7646744f4275b71ea724fed81ceb9323e279d449df9";
-        let sts = format!("AWS4-HMAC-SHA256-TRAILER\n{d}\n{sc}\n{last}\n{}", sha256_hex(b"x-amz-checksum-crc32:sOO8/Q==\n"));
+        let ck = crate::b64(&crc32(&vec![b'a'; 65536 + 1024]).to_be_bytes());
+        let sts = format!("AWS4-HMAC-SHA256-TRAILER\n{d}\n{sc}\n{last}\n{}", sha256_hex(format!("x-amz-checksum-crc32:{ck}\n").as_bytes()));
         let tsig = hex(&hmac(&key, sts.as_bytes()));
         let mut tb = body[..body.len() - 2].to_vec();
-        tb.extend(format!("X-Amz-Checksum-Crc32: sOO8/Q==\r\nx-amz-trailer-signature:{tsig}\r\n\r\n").into_bytes());
+        tb.extend(format!("X-Amz-Checksum-Crc32: {ck}\r\nx-amz-trailer-signature:{tsig}\r\n\r\n").into_bytes());
         assert!(verify_chunks(&tb, seed, &key, d, sc, true).is_ok());
-        let forged = String::from_utf8(tb.clone()).unwrap().replace("sOO8/Q==", "AAAAAA==");
+        let forged = String::from_utf8(tb.clone()).unwrap().replace(&ck, "AAAAAA==");
         assert!(verify_chunks(forged.as_bytes(), seed, &key, d, sc, true).is_err(), "changed trailer value");
         assert!(verify_chunks(&body, seed, &key, d, sc, true).is_err(), "trailer signature missing");
     }

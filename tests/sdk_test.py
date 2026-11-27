@@ -345,6 +345,8 @@ def test_iam():
     iam.delete_role(RoleName=r); iam.delete_role(RoleName=f"lambda{run}")
     assert code(iam.get_user, UserName=u) == "NoSuchEntity"
     s3.delete_objects(Bucket=b, Delete={"Objects": [{"Key": "public/a.txt"}, {"Key": "secret/k.txt"}]})
+    for o in s3.list_objects_v2(Bucket=b).get("Contents", []):
+        s3.delete_object(Bucket=b, Key=o["Key"])
     s3.delete_bucket(Bucket=b)
 
 
@@ -419,6 +421,8 @@ def test_iam_conditions():
     iam.delete_access_key(UserName=u, AccessKeyId=k["AccessKeyId"])
     iam.delete_user(UserName=u)
     s3.delete_object(Bucket=b, Key="a.txt")
+    for o in s3.list_objects_v2(Bucket=b).get("Contents", []):
+        s3.delete_object(Bucket=b, Key=o["Key"])
     s3.delete_bucket(Bucket=b)
 
 
@@ -3291,6 +3295,58 @@ Resources:
 
     for f in (fn, afn):
         lam.delete_function(FunctionName=f)
+
+
+
+def test_s3_checksums():
+    import base64, hashlib, zlib
+    s3 = boto3.client("s3", **kw)
+    b = f"ck{run}"
+    s3.create_bucket(Bucket=b)
+    body = b"the quick brown fox jumps over the lazy dog"
+
+    for algo in ("CRC32", "SHA256", "SHA1"):
+        s3.put_object(Bucket=b, Key=f"a-{algo}", Body=body, ChecksumAlgorithm=algo)
+    g = s3.get_object(Bucket=b, Key="a-CRC32", ChecksumMode="ENABLED")
+    assert g["ChecksumCRC32"] == base64.b64encode(zlib.crc32(body).to_bytes(4, "big")).decode(), g.get("ChecksumCRC32")
+    hd = s3.head_object(Bucket=b, Key="a-CRC32")
+    assert hd["ChecksumCRC32"] == base64.b64encode(zlib.crc32(body).to_bytes(4, "big")).decode()
+    g = s3.get_object(Bucket=b, Key="a-SHA256", ChecksumMode="ENABLED")
+    assert g["ChecksumSHA256"] == base64.b64encode(hashlib.sha256(body).digest()).decode()
+    # without a checksum request the header stays away (this botocore asks by default, so use a plain client)
+    plain = boto3.client("s3", **{**kw, "config": Config(response_checksum_validation="when_required")})
+    assert "ChecksumCRC32" not in plain.get_object(Bucket=b, Key="a-CRC32")
+
+    # a wrong checksum value is a 400 BadDigest (header tampered through a botocore event)
+    def tamper(request, **_):
+        request.headers["x-amz-checksum-crc32"] = "AAAAAA=="
+    s3.meta.events.register("before-send.s3.PutObject", tamper)
+    try:
+        got = code(s3.put_object, Bucket=b, Key="bad", Body=body)
+    finally:
+        s3.meta.events.unregister("before-send.s3.PutObject", tamper)
+    # Basic mode: BadDigest. VERIFY_SIGV4 mode: the tampered header is signed, so the signature
+    # check fires first (SignatureDoesNotMatch) - rejected either way, and never stored.
+    assert got in ("BadDigest", "SignatureDoesNotMatch"), got
+    assert "ETag" not in s3.list_objects_v2(Bucket=b, Prefix="bad")  # not stored
+
+    # GetObjectAttributes: ETag, Checksum and ObjectSize
+    at = s3.get_object_attributes(Bucket=b, Key="a-CRC32", ObjectAttributes=["ETag", "Checksum", "ObjectSize"])
+    assert at["Checksum"]["ChecksumCRC32"] == base64.b64encode(zlib.crc32(body).to_bytes(4, "big")).decode(), at
+    assert at["ObjectSize"] == len(body) and "ETag" in at
+    # an unknown checksum algorithm is refused server-side (client-side validation rejects MD5 before sending)
+    def bogus(request, **_):
+        request.headers["x-amz-checksum-algorithm"] = "BOGUS"
+    s3.meta.events.register("before-send.s3.PutObject", bogus)
+    try:
+        got = code(s3.put_object, Bucket=b, Key="x", Body=body)
+    finally:
+        s3.meta.events.unregister("before-send.s3.PutObject", bogus)
+    assert got == "InvalidRequest", got
+
+    for o in s3.list_objects_v2(Bucket=b).get("Contents", []):
+        s3.delete_object(Bucket=b, Key=o["Key"])
+    s3.delete_bucket(Bucket=b)
 
 
 

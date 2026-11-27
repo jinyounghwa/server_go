@@ -16,6 +16,7 @@ pub struct Obj {
     ctype: String,
     modified: DateTime<Utc>,
     meta: Vec<(String, String)>,
+    sums: Vec<(String, String)>, // (CRC32|CRC32C|SHA1|SHA256, base64 digest) from PutObject
 }
 pub struct Bucket {
     created: DateTime<Utc>,
@@ -58,7 +59,7 @@ const NS: &str = r#" xmlns="http://s3.amazonaws.com/doc/2006-03-01/""#;
 const UNSUPPORTED: &[&str] = &[
     "acl", "tagging", "versioning", "versions", "cors", "lifecycle", "website",
     "encryption", "logging", "replication", "location", "ownershipControls", "publicAccessBlock",
-    "object-lock", "legal-hold", "retention", "attributes", "accelerate", "requestPayment", "torrent",
+    "object-lock", "legal-hold", "retention", "accelerate", "requestPayment", "torrent",
 ];
 
 fn resp(status: u16) -> Builder {
@@ -177,7 +178,7 @@ impl Req {
         let action = match self.op {
             "ListBuckets" => "s3:ListAllMyBuckets",
             "HeadBucket" | "ListObjects" | "ListObjectsV2" => "s3:ListBucket",
-            "HeadObject" | "GetObject" => "s3:GetObject",
+            "HeadObject" | "GetObject" | "GetObjectAttributes" => "s3:GetObject",
             "DeleteObjects" | "DeleteObject" => "s3:DeleteObject",
             "CopyObject" | "CreateMultipartUpload" | "UploadPart" | "CompleteMultipartUpload" | "PutObject" => "s3:PutObject",
             "AbortMultipartUpload" => "s3:AbortMultipartUpload",
@@ -242,6 +243,7 @@ pub fn classify(m: &Method, uri: &Uri, h: &HeaderMap) -> Req {
         ("DELETE", _, false) if has("uploadId") => "AbortMultipartUpload",
         ("PUT", _, false) if h.contains_key("x-amz-copy-source") => "CopyObject",
         ("PUT", _, false) => "PutObject",
+        ("GET", _, false) if q.keys().any(|k| k.eq_ignore_ascii_case("attributes")) => "GetObjectAttributes",
         ("GET", _, false) => "GetObject",
         ("HEAD", _, false) => "HeadObject",
         ("DELETE", _, false) => "DeleteObject",
@@ -364,8 +366,32 @@ fn exec(app: &App,
             xml(200, format!("<DeleteResult{NS}>{out}</DeleteResult>"))
         }
         "PutObject" => {
+            // x-amz-checksum-* values are verified against the body (BadDigest on mismatch);
+            // x-amz-sdk-checksum-algorithm / x-amz-checksum-algorithm name the algorithm without a value.
+            let mut sums: Vec<(String, String)> = vec![];
+            for algo in ["CRC32", "CRC32C", "SHA1", "SHA256"] {
+                if let Some(v) = hdr(h, &format!("x-amz-checksum-{}", algo.to_ascii_lowercase())) {
+                    let want = v.to_string();
+                    if crate::sigv4::checksum_of(algo, &body).as_deref() != Some(want.as_str()) {
+                        return Err(fail(400, "BadDigest", &format!("The {algo} you specified did not match the calculated checksum")));
+                    }
+                    sums.push((algo.into(), want));
+                }
+            }
+            for a in ["x-amz-sdk-checksum-algorithm", "x-amz-checksum-algorithm"] {
+                if let Some(algo) = hdr(h, a) {
+                    let algo = algo.to_ascii_uppercase();
+                    if !crate::sigv4::is_checksum_algo(&algo) {
+                        return Err(fail(400, "InvalidRequest", &format!("Checksum algorithm {algo} is not supported")));
+                    }
+                    if !sums.iter().any(|(x, _)| *x == algo) {
+                        // aws-chunked trailer values were verified in sigv4 (VERIFY_SIGV4=1); compute here for storage.
+                        sums.push((algo.clone(), crate::sigv4::checksum_of(&algo, &body).unwrap_or_default()));
+                    }
+                }
+            }
             let bk = st.buckets.get_mut(b).ok_or_else(no_bucket)?;
-            let o = Obj { etag: etag_of(&body), data: body, ctype: ctype(), modified: Utc::now(), meta: meta_from(h) };
+            let o = Obj { etag: etag_of(&body), data: body, ctype: ctype(), modified: Utc::now(), meta: meta_from(h), sums };
             let (etag, size) = (o.etag.clone(), o.data.len());
             bk.objs.insert(k.into(), o);
             notify(st, b, "ObjectCreated:Put", k, size, &etag);
@@ -409,8 +435,36 @@ fn exec(app: &App,
             if status == 206 {
                 r = r.header("content-range", format!("bytes {s}-{}/{len}", e - 1));
             }
+            // HeadObject returns stored checksums; GetObject needs ?checksumMode=ENABLED.
+            // ChecksumMode=ENABLED arrives as the x-amz-checksum-mode header; checksums describe the
+            // whole object, so range (206) responses leave them out.
+            let mode_on = hdr(h, "x-amz-checksum-mode").is_some_and(|v| v.eq_ignore_ascii_case("ENABLED"));
+            if (op == "HeadObject" || mode_on) && status == 200 {
+                for (algo, v) in &o.sums {
+                    r = r.header(format!("x-amz-checksum-{}", algo.to_ascii_lowercase()), v);
+                }
+            }
             let data = if op == "HeadObject" { Body::empty() } else { Body::from(o.data.slice(s..e)) };
             r.body(data).unwrap()
+        }
+        "GetObjectAttributes" => {
+            // ?attributes with x-amz-object-attributes listing ETag/Checksum/ObjectSize (all supported here).
+            let o = st.buckets.get(b).ok_or_else(no_bucket)?.objs.get(k).ok_or_else(no_key)?;
+            let want = hdr(h, "x-amz-object-attributes").unwrap_or("").split(',').map(|x| x.trim().to_ascii_lowercase()).collect::<Vec<_>>();
+            let mut inner = String::new();
+            if want.iter().any(|x| x == "etag") {
+                inner += &format!("<ETag>{}</ETag>", esc(&o.etag));
+            }
+            if want.iter().any(|x| x == "checksum") {
+                let cs: String = o.sums.iter()
+                    .map(|(a, v)| format!("<Checksum{a}>{}</Checksum{a}>", esc(v)))
+                    .collect();
+                inner += &format!("<Checksum>{cs}</Checksum>");
+            }
+            if want.iter().any(|x| x == "objectsize") {
+                inner += &format!("<ObjectSize>{}</ObjectSize>", o.data.len());
+            }
+            xml(200, format!("<GetObjectAttributesOutput{NS}>{inner}</GetObjectAttributesOutput>"))
         }
         "DeleteObject" => {
             st.buckets.get_mut(b).ok_or_else(no_bucket)?.objs.remove(k);
@@ -447,7 +501,7 @@ fn exec(app: &App,
             let etag = format!("\"{:x}-{}\"", Md5::digest(&digests), nums.len());
             let bk = st.buckets.get_mut(&up.bucket).ok_or_else(no_bucket)?;
             let size = data.len();
-            bk.objs.insert(up.key.clone(), Obj { data: data.into(), etag: etag.clone(), ctype: up.ctype, modified: Utc::now(), meta: up.meta });
+            bk.objs.insert(up.key.clone(), Obj { data: data.into(), etag: etag.clone(), ctype: up.ctype, modified: Utc::now(), meta: up.meta, sums: vec![] });
             notify(st, &up.bucket, "ObjectCreated:CompleteMultipartUpload", &up.key, size, &etag);
             xml(200, format!("<CompleteMultipartUploadResult{NS}><Location>/{0}/{1}</Location><Bucket>{0}</Bucket><Key>{1}</Key><ETag>{2}</ETag></CompleteMultipartUploadResult>", esc(&up.bucket), esc(&up.key), esc(&etag)))
         }
@@ -577,7 +631,7 @@ impl Store {
         let buckets: Vec<serde_json::Value> = self.buckets.iter().map(|(n, b)| {
             let objs: Vec<serde_json::Value> = b.objs.iter().map(|(k, o)| serde_json::json!({
                 "key": k, "data": crate::b64(&o.data), "ctype": o.ctype,
-                "modified": o.modified.to_rfc3339(), "meta": o.meta,
+                "modified": o.modified.to_rfc3339(), "meta": o.meta, "sums": o.sums,
             })).collect();
             serde_json::json!({"name": n, "created": b.created.to_rfc3339(), "objects": objs, "policy": b.policy})
         }).collect();
@@ -600,7 +654,9 @@ impl Store {
                 let modified = o["modified"].as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map_or_else(Utc::now, |d| d.with_timezone(&Utc));
                 let meta: Vec<(String, String)> = o["meta"].as_array().into_iter().flatten()
                     .filter_map(|m| Some((m[0].as_str()?.into(), m[1].as_str()?.into()))).collect();
-                objs.insert(key.into(), Obj { data, etag, ctype, modified, meta });
+                let sums: Vec<(String, String)> = o["sums"].as_array().into_iter().flatten()
+                    .filter_map(|m| Some((m[0].as_str()?.into(), m[1].as_str()?.into()))).collect();
+                objs.insert(key.into(), Obj { data, etag, ctype, modified, meta, sums });
             }
             let policy = Some(b["policy"].clone()).filter(|p| crate::iam::validate_resource_policy(p).is_ok());
             self.buckets.insert(name.into(), Bucket { created, objs, notif: vec![], notif_xml: String::new(), policy });
