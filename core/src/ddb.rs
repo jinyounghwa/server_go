@@ -1,15 +1,15 @@
 use crate::{err, ApiErr, App, ACCOUNT, REGION};
 use serde_json::{json, Map, Value};
 use std::cmp::Ordering::{self, Equal, Greater, Less};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub type Item = Map<String, Value>;
 
 // Sortable key part. N keys keep their exact decimal string (no f64 rounding, so 17+ digit keys stay distinct);
 // comparison is sign, then integer width, then digit order, with exponents normalized (1e3 == 1000).
 // Numbers with more than 38 significant digits are refused (DynamoDB's precision limit) when used as keys.
-// ponytail: only key attributes are checked; non-key values may carry more digits, and ADD/SET arithmetic
-// still computes in f64.
+// DynamoDB Streams (StreamViewType record shapes) ride the same change log; iterators are "table|index"
+// strings (ponytail: not opaque, no retention/trimming).
 #[derive(Clone, Debug)]
 pub enum K {
     N(String),
@@ -141,11 +141,24 @@ pub struct Table {
     hash: String,
     range: Option<String>,
     items: BTreeMap<PK, Item>,
+    stream: Option<String>, // StreamViewType when the stream is enabled
+    seq: u64,
+    log: Vec<Rec>, // change log feeding GetRecords
+}
+#[derive(Clone)]
+struct Rec {
+    ev: String, // INSERT | MODIFY | REMOVE
+    key: Item,
+    old: Option<Item>,
+    new: Option<Item>,
+    at: f64,
+    seq: u64,
 }
 
 #[derive(Default)]
 pub struct Db {
     tables: BTreeMap<String, Table>,
+    tx_tokens: BTreeMap<String, (i64, String)>, // ClientRequestToken -> (expires epoch secs, canonical TransactItems)
 }
 
 fn verr(m: impl Into<String>) -> ApiErr {
@@ -499,13 +512,6 @@ fn resolve(o: &Opd, it: &Item) -> Option<Value> {
     }
 }
 
-fn num(av: &Value) -> Option<f64> {
-    av.get("N")?.as_str()?.parse().ok()
-}
-fn fmt_num(f: f64) -> String {
-    if f.fract() == 0.0 && f.abs() < 1e15 { format!("{}", f as i64) } else { f.to_string() }
-}
-
 fn cmp_av(a: &Value, b: &Value) -> Option<Ordering> {
     // Key conditions and BETWEEN compare numbers exactly (no f64 rounding), like the sort keys themselves.
     if let (Some(x), Some(y)) = (a.get("N").and_then(Value::as_str), b.get("N").and_then(Value::as_str)) {
@@ -648,8 +654,9 @@ fn apply(ups: &[Upd], old: &Item, new: &mut Item) -> Result<(), ApiErr> {
                 let v = match rest {
                     None => x,
                     Some((o, b)) => {
-                        let (x, y) = (num(&x).ok_or_else(bad)?, eval_t(b, old).as_ref().and_then(num).ok_or_else(bad)?);
-                        json!({"N": fmt_num(if *o == '+' { x + y } else { x - y })})
+                        let y = eval_t(b, old).ok_or_else(bad)?;
+                        let (x, y) = (x.get("N").and_then(Value::as_str).ok_or_else(bad)?, y.get("N").and_then(Value::as_str).ok_or_else(bad)?);
+                        json!({"N": dec_add(x, y, *o == '-')?})
                     }
                 };
                 set_path(new, p, v)?;
@@ -658,8 +665,8 @@ fn apply(ups: &[Upd], old: &Item, new: &mut Item) -> Result<(), ApiErr> {
             Upd::Add(p, v) => {
                 let nv = match get(old, p) {
                     None => v.clone(),
-                    Some(c) => match (num(c), num(v)) {
-                        (Some(x), Some(y)) => json!({"N": fmt_num(x + y)}),
+                    Some(c) => match (c.get("N").and_then(Value::as_str), v.get("N").and_then(Value::as_str)) {
+                        (Some(x), Some(y)) => json!({"N": dec_add(x, y, false)?}),
                         _ => set_op(c, v, true).ok_or_else(bad)?,
                     },
                 };
@@ -699,10 +706,161 @@ fn check(t: &Table, key: &PK, r: &Value) -> Result<(), ApiErr> {
 // DynamoDB's 400 KB item limit. ponytail: measured as the item's JSON length, which slightly overcounts
 // type tags and quotes compared with DynamoDB's name+value bytes.
 fn fits(item: &Item) -> Result<(), ApiErr> {
+    for v in item.values() {
+        check_numbers(v)?;
+    }
     if serde_json::to_string(item).map_or(0, |s| s.len()) > 400 * 1024 {
         return Err(verr("Item size has exceeded the maximum allowed size"));
     }
     Ok(())
+}
+
+// Every N (and NS member, nested in L/M) is limited to 38 significant digits, keys and values alike.
+fn check_numbers(v: &Value) -> Result<(), ApiErr> {
+    if let Some(n) = v.get("N").and_then(Value::as_str) {
+        normalize(n)?;
+    }
+    if let Some(ns) = v.get("NS").and_then(Value::as_array) {
+        for n in ns {
+            if let Some(x) = n.as_str() {
+                normalize(x)?;
+            }
+        }
+    }
+    for t in ["L", "M"] {
+        for x in v.get(t).and_then(Value::as_array).into_iter().flatten() {
+            check_numbers(x)?;
+        }
+    }
+    for x in v.get("M").and_then(Value::as_object).into_iter().flat_map(|m| m.values()) {
+        check_numbers(x)?;
+    }
+    Ok(())
+}
+
+// Exact decimal add/sub of two number strings; the result is canonical and length-checked (38 digits).
+fn dec_add(a: &str, b: &str, minus: bool) -> Result<String, ApiErr> {
+    let (mut nb, ib, fb) = dec_parts(b).ok_or_else(|| verr(format!("Invalid number: {b}")))?;
+    if minus {
+        nb = !nb;
+    }
+    let (na, ia, fa) = dec_parts(a).ok_or_else(|| verr(format!("Invalid number: {a}")))?;
+    let n = fa.len().max(fb.len());
+    let xa = format!("{ia}{}{}", fa, "0".repeat(n - fa.len()));
+    let xb = format!("{ib}{}{}", fb, "0".repeat(n - fb.len()));
+    let (neg, out) = if na == nb {
+        (na, add_digits(&xa, &xb))
+    } else {
+        // opposite signs: subtract the smaller magnitude from the larger, keep the larger's sign
+        if mag_cmp(&xa, &xb) == Greater {
+            (na, sub_digits(&xa, &xb).trim_start_matches('0').to_string())
+        } else {
+            (nb, sub_digits(&xb, &xa).trim_start_matches('0').to_string())
+        }
+    };
+    let (int, frac) = out.split_at(out.len().saturating_sub(n));
+    let int = int.trim_start_matches('0');
+    let int = if int.is_empty() && !frac.is_empty() { "0" } else { int };
+    let frac = frac.trim_end_matches('0');
+    if int.is_empty() && frac.is_empty() {
+        return Ok("0".into());
+    }
+    let res = format!("{}{}.{}", neg.then_some("-").unwrap_or(""), int, frac);
+    let res = res.trim_end_matches('.').to_string();
+    normalize(&res)?;
+    Ok(res)
+}
+// Digit-string helpers: right-aligned (i counts from the units digit), a >= b for sub_digits.
+fn add_digits(a: &str, b: &str) -> String {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut out = Vec::with_capacity(a.len().max(b.len()) + 1);
+    let mut c = 0u8;
+    for i in 0..a.len().max(b.len()) {
+        let x = if i < a.len() { a[a.len() - 1 - i] } else { b'0' };
+        let y = if i < b.len() { b[b.len() - 1 - i] } else { b'0' };
+        let s = x + y - 2 * b'0' + c;
+        out.push(s % 10 + b'0');
+        c = s / 10;
+    }
+    if c > 0 {
+        out.push(b'1');
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap()
+}
+fn sub_digits(a: &str, b: &str) -> String {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut out = Vec::with_capacity(a.len());
+    let mut borrow = 0i16;
+    for i in 0..a.len() {
+        let x = a[a.len() - 1 - i] as i16;
+        let y = if i < b.len() { b[b.len() - 1 - i] as i16 } else { b'0' as i16 };
+        let mut d = x - y - borrow;
+        if d < 0 {
+            d += 10;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        out.push(d as u8 + b'0');
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap()
+}
+fn mag_cmp(a: &str, b: &str) -> Ordering {
+    a.trim_start_matches('0').len().cmp(&b.trim_start_matches('0').len()).then_with(|| a.cmp(b))
+}
+
+// Stream ARN (label fixed; single shard per table).
+fn stream_arn(name: &str) -> String {
+    format!("arn:aws:dynamodb:{}:{ACCOUNT}:table/{name}/stream/2026-11-26T00:00:00.000", *REGION)
+}
+fn stream_of(arn: &str) -> Option<String> {
+    let t = arn.split("table/").nth(1)?;
+    t.split_once("/stream/").map(|(n, _)| n.to_string())
+}
+fn key_item(t: &Table, k: &PK) -> Item {
+    let mut m = Item::new();
+    let kv = |k: &K| match k {
+        K::S(s) => json!({"S": s}),
+        K::N(n) => json!({"N": n}),
+    };
+    m.insert(t.hash.clone(), kv(&k.0));
+    if let (Some(r), Some(v)) = (&t.range, &k.1) {
+        m.insert(r.clone(), kv(v));
+    }
+    m
+}
+fn note(t: &mut Table, ev: &str, key: Item, old: Option<Item>, new: Option<Item>) {
+    if t.stream.is_some() {
+        t.seq += 1;
+        let seq = t.seq;
+        t.log.push(Rec { ev: ev.into(), key, old, new, at: chrono::Utc::now().timestamp() as f64, seq });
+    }
+}
+fn rec_json(name: &str, t: &Table, rec: &Rec) -> Value {
+    let view = t.stream.clone().unwrap_or_default();
+    let mut d = json!({
+        "ApproximateCreationDateTime": rec.at,
+        "Keys": rec.key,
+        "SequenceNumber": format!("{:0>21}", rec.seq),
+        "SizeBytes": rec.new.as_ref().or(rec.old.as_ref()).map_or(0, |i| Value::Object(i.clone()).to_string().len()),
+        "StreamViewType": view,
+    });
+    match view.as_str() {
+        "KEYS_ONLY" => {}
+        "NEW_IMAGE" => d["NewImage"] = rec.new.clone().into(),
+        "OLD_IMAGE" => d["OldImage"] = rec.old.clone().into(),
+        _ => {
+            d["NewImage"] = rec.new.clone().into();
+            d["OldImage"] = rec.old.clone().into();
+        }
+    }
+    json!({
+        "eventID": uuid::Uuid::new_v4().to_string(),
+        "eventName": rec.ev, "eventVersion": "1.1", "eventSource": "aws:dynamodb",
+        "awsRegion": *REGION, "dynamodb": d, "eventSourceARN": stream_arn(name),
+    })
 }
 
 fn put(t: &mut Table, r: &Value) -> Result<Option<Item>, ApiErr> {
@@ -710,13 +868,17 @@ fn put(t: &mut Table, r: &Value) -> Result<Option<Item>, ApiErr> {
     fits(&item)?;
     let k = t.key_of(&item)?;
     check(t, &k, r)?;
-    Ok(t.items.insert(k, item))
+    let old = t.items.insert(k.clone(), item.clone());
+    note(t, if old.is_some() { "MODIFY" } else { "INSERT" }, key_item(t, &k), old.clone(), Some(item));
+    Ok(old)
 }
 
 fn delete(t: &mut Table, r: &Value) -> Result<Option<Item>, ApiErr> {
     let k = t.exact_key(obj(r, "Key")?)?;
     check(t, &k, r)?;
-    Ok(t.items.remove(&k))
+    let old = t.items.remove(&k);
+    note(t, "REMOVE", key_item(t, &k), old.clone(), None);
+    Ok(old)
 }
 
 fn update(t: &mut Table, r: &Value) -> Result<(Option<Item>, Item), ApiErr> {
@@ -732,7 +894,8 @@ fn update(t: &mut Table, r: &Value) -> Result<(Option<Item>, Item), ApiErr> {
         return Err(verr("Cannot update attribute that is part of the key"));
     }
     fits(&new)?;
-    t.items.insert(k, new.clone());
+    t.items.insert(k.clone(), new.clone());
+    note(t, if old.is_some() { "MODIFY" } else { "INSERT" }, key_item(t, &k), old.clone(), Some(new.clone()));
     Ok((old, new))
 }
 
@@ -834,6 +997,16 @@ fn query(t: &Table, r: &Value, scan: bool) -> Result<Value, ApiErr> {
     Ok(out)
 }
 
+// StreamSpecification {StreamEnabled, StreamViewType}: None when absent or disabled; 4 valid views.
+fn stream_spec(r: &Value) -> Option<String> {
+    let sp = r.get("StreamSpecification")?;
+    if sp["StreamEnabled"].as_bool() != Some(true) {
+        return None;
+    }
+    let v = sp["StreamViewType"].as_str()?;
+    ["NEW_IMAGE", "OLD_IMAGE", "NEW_AND_OLD_IMAGES", "KEYS_ONLY"].contains(&v).then(|| v.to_string())
+}
+
 fn tbl<'a>(db: &'a mut Db, r: &Value) -> Result<&'a mut Table, ApiErr> {
     db.tables.get_mut(s(r, "TableName")?).ok_or_else(not_found)
 }
@@ -878,7 +1051,13 @@ pub fn handle(app: &App, op: &str, body: &[u8]) -> Result<Value, ApiErr> {
                         .collect();
                 }
             }
-            let t = Table { desc, hash, range, items: BTreeMap::new() };
+            let stream = stream_spec(&r);
+            if let Some(v) = &stream {
+                desc["LatestStreamArn"] = stream_arn(name).into();
+                desc["LatestStreamLabel"] = "2026-11-26T00:00:00.000".into();
+                desc["StreamSpecification"] = json!({"StreamEnabled": true, "StreamViewType": v});
+            }
+            let t = Table { desc, hash, range, items: BTreeMap::new(), stream, seq: 0, log: vec![] };
             let out = json!({"TableDescription": describe(&t)});
             db.tables.insert(name.into(), t);
             Ok(out)
@@ -890,6 +1069,24 @@ pub fn handle(app: &App, op: &str, body: &[u8]) -> Result<Value, ApiErr> {
             let t = db.tables.get_mut(n).ok_or_else(not_found)?;
             if let Some(pt) = r.get("ProvisionedThroughput") {
                 t.desc["ProvisionedThroughput"] = pt.clone();
+            }
+            if r.get("StreamSpecification").is_some() {
+                let v = stream_spec(&r);
+                match &v {
+                    Some(view) => {
+                        t.desc["LatestStreamArn"] = stream_arn(n).into();
+                        t.desc["LatestStreamLabel"] = "2026-11-26T00:00:00.000".into();
+                        t.desc["StreamSpecification"] = json!({"StreamEnabled": true, "StreamViewType": view});
+                    }
+                    None => {
+                        t.desc.as_object_mut().map(|d| {
+                            d.remove("LatestStreamArn");
+                            d.remove("LatestStreamLabel");
+                            d.remove("StreamSpecification");
+                        });
+                    }
+                }
+                t.stream = v;
             }
             Ok(json!({"TableDescription": describe(t)}))
         }
@@ -961,6 +1158,33 @@ pub fn handle(app: &App, op: &str, body: &[u8]) -> Result<Value, ApiErr> {
                 let n = op.as_object().and_then(|m| m.values().next()).map(|v| s(v, "TableName")).transpose()?.unwrap_or("");
                 backup.insert(n.into(), db.tables.get(n).cloned().ok_or_else(not_found)?);
             }
+            // One operation per item: every (table, key) may appear at most once.
+            let mut seen: BTreeSet<(String, PK)> = BTreeSet::new();
+            for op in ops {
+                let (kind, inner) = op.as_object().and_then(|m| m.iter().next()).ok_or_else(|| verr("Empty transact item"))?;
+                let n = s(inner, "TableName")?.to_string();
+                let t = backup.get(&n).ok_or_else(not_found)?;
+                let k = match kind.as_str() {
+                    "Put" => t.key_of(obj(inner, "Item")?)?,
+                    _ => t.exact_key(obj(inner, "Key")?)?,
+                };
+                if !seen.insert((n, k)) {
+                    return Err(verr("Transaction request cannot include multiple operations on one item"));
+                }
+            }
+            // ClientRequestToken: 10-minute idempotency (same params replay as no-op).
+            let token = r["ClientRequestToken"].as_str().unwrap_or("").to_string();
+            let canon = serde_json::to_string(&ops).unwrap_or_default();
+            if !token.is_empty() {
+                let now = chrono::Utc::now().timestamp();
+                db.tx_tokens.retain(|_, (exp, _)| *exp > now);
+                if let Some((_, prev)) = db.tx_tokens.get(&token) {
+                    if *prev != canon {
+                        return Err(err("ValidationException", format!("The ClientRequestToken {token} cannot be used with the given parameters")));
+                    }
+                    return Ok(json!({}));
+                }
+            }
             let mut reasons = vec![json!({"Code": "None"}); ops.len()];
             for (i, op) in ops.iter().enumerate() {
                 let (kind, inner) = op.as_object().and_then(|m| m.iter().next()).ok_or_else(|| verr("Empty transact item"))?;
@@ -984,6 +1208,9 @@ pub fn handle(app: &App, op: &str, body: &[u8]) -> Result<Value, ApiErr> {
                     return Err(e);
                 }
             }
+            if !token.is_empty() {
+                db.tx_tokens.insert(token, (chrono::Utc::now().timestamp() + 600, canon));
+            }
             Ok(json!({}))
         }
         "TransactGetItems" => {
@@ -997,6 +1224,62 @@ pub fn handle(app: &App, op: &str, body: &[u8]) -> Result<Value, ApiErr> {
                 });
             }
             Ok(json!({ "Responses": out }))
+        }
+        "ListStreams" => {
+            let ss: Vec<Value> = db.tables.iter()
+                .filter(|(_, t)| t.stream.is_some())
+                .map(|(n, t)| json!({"StreamArn": stream_arn(n), "TableName": n, "StreamLabel": "2026-11-26T00:00:00.000", "StreamStatus": "ENABLED", "StreamViewType": t.stream}))
+                .collect();
+            Ok(json!({"Streams": ss}))
+        }
+        "DescribeStream" => {
+            let arn = s(&r, "StreamArn")?;
+            let name = stream_of(arn).ok_or_else(|| err("ResourceNotFoundException", format!("Stream {arn} not found")))?;
+            let t = db.tables.get(name.as_str()).ok_or_else(|| err("ResourceNotFoundException", format!("Stream {arn} not found")))?;
+            Ok(json!({"StreamDescription": {
+                "StreamArn": arn, "StreamStatus": "ENABLED", "StreamViewType": t.stream,
+                "TableName": name, "CreationRequestDateTime": t.desc["CreationDateTime"].clone(),
+                "Shards": [{"ShardId": "shardId-00000000000000000000000000", "SequenceNumberRange": {"StartingSequenceNumber": "1"}}],
+            }}))
+        }
+        "GetShardIterator" => {
+            let arn = s(&r, "StreamArn")?;
+            let name = stream_of(arn).ok_or_else(|| err("ResourceNotFoundException", format!("Stream {arn} not found")))?;
+            let t = db.tables.get(name.as_str()).ok_or_else(|| err("ResourceNotFoundException", format!("Stream {arn} not found")))?;
+            if t.stream.is_none() {
+                return Err(err("ValidationException", format!("Stream {arn} is not enabled")));
+            }
+            let pos = match s(&r, "ShardIteratorType")? {
+                "LATEST" => t.log.len(),
+                "TRIM_HORIZON" => 0,
+                "AT_SEQUENCE_NUMBER" => {
+                    let sn = r["SequenceNumber"].as_str().unwrap_or("").trim_start_matches('0');
+                    let sn = if sn.is_empty() { "0" } else { sn };
+                    let n: u64 = sn.parse().map_err(|_| verr("Invalid SequenceNumber"))?;
+                    t.log.iter().position(|x| x.seq == n).ok_or_else(|| verr("Invalid SequenceNumber"))?
+                }
+                "AFTER_SEQUENCE_NUMBER" => {
+                    let sn = r["SequenceNumber"].as_str().unwrap_or("").trim_start_matches('0');
+                    let sn = if sn.is_empty() { "0" } else { sn };
+                    let n: u64 = sn.parse().map_err(|_| verr("Invalid SequenceNumber"))?;
+                    t.log.iter().position(|x| x.seq == n).map(|i| i + 1).unwrap_or(t.log.len())
+                }
+                x => return Err(verr(format!("Invalid ShardIteratorType {x}"))),
+            };
+            Ok(json!({"ShardIterator": format!("{name}|{pos}")}))
+        }
+        "GetRecords" => {
+            let it = s(&r, "ShardIterator")?;
+            let (name, pos) = it.split_once('|').ok_or_else(|| verr("Invalid ShardIterator"))?;
+            let t = db.tables.get(name).ok_or_else(not_found)?;
+            if t.stream.is_none() {
+                return Err(err("ValidationException", format!("Stream on table {name} is not enabled")));
+            }
+            let pos: usize = pos.parse().map_err(|_| verr("Invalid ShardIterator"))?;
+            let take = r["Limit"].as_u64().unwrap_or(100).clamp(1, 1000) as usize;
+            let end = (pos + take).min(t.log.len());
+            let recs: Vec<Value> = t.log[pos..end].iter().map(|x| rec_json(name, t, x)).collect();
+            Ok(json!({"Records": recs, "NextShardIterator": format!("{name}|{end}")}))
         }
         _ => Err(err("UnknownOperationException", format!("{op} is not supported yet"))),
     }
@@ -1036,6 +1319,8 @@ impl Db {
         let tables: Vec<Value> = self.tables.iter().map(|(n, t)| json!({
             "name": n, "desc": t.desc, "hash": t.hash, "range": t.range,
             "items": t.items.values().cloned().collect::<Vec<_>>(),
+            "stream": t.stream, "seq": t.seq,
+            "log": t.log.iter().map(|x| json!({"ev": x.ev, "key": x.key, "old": x.old, "new": x.new, "at": x.at, "seq": x.seq})).collect::<Vec<_>>(),
         })).collect();
         json!(tables)
     }
@@ -1055,7 +1340,19 @@ impl Db {
                     }
                 }
             }
-            self.tables.insert(name.into(), Table { desc: t["desc"].clone(), hash: hash.into(), range, items });
+            let stream = t["stream"].as_str().map(String::from);
+            let seq = t["seq"].as_u64().unwrap_or(0);
+            let log = t["log"].as_array().map(|a| a.iter().filter_map(|x| {
+                Some(Rec {
+                    ev: x["ev"].as_str()?.to_string(),
+                    key: x["key"].as_object()?.clone(),
+                    old: x["old"].as_object().cloned(),
+                    new: x["new"].as_object().cloned(),
+                    at: x["at"].as_f64()?,
+                    seq: x["seq"].as_u64()?,
+                })
+            }).collect()).unwrap_or_default();
+            self.tables.insert(name.into(), Table { desc: t["desc"].clone(), hash: hash.into(), range, items, stream, seq, log });
         }
     }
 }
@@ -1078,6 +1375,18 @@ mod tests {
         let p = project(&item, &json!({"ProjectionExpression": "tags[2], m.rows[1].n"})).unwrap();
         assert_eq!(Value::Object(p), json!({"tags": {"L": [{"S": "c"}]}, "m": {"M": {"rows": {"L": [{"M": {"n": {"N": "2"}}}]}}}}));
         assert!(parse_cond("tags[x] = :b", &req).is_err() && parse_cond("[0] = :b", &req).is_err());
+    }
+
+    #[test]
+    fn decimal_arithmetic_exact() {
+        assert_eq!(dec_add("9007199254740993", "1", false).unwrap(), "9007199254740994");
+        assert_eq!(dec_add("1.5", "2.25", false).unwrap(), "3.75");
+        assert_eq!(dec_add("10", "3.5", true).unwrap(), "6.5");
+        assert_eq!(dec_add("3.5", "10", true).unwrap(), "-6.5");
+        assert_eq!(dec_add("-3.5", "3.5", false).unwrap(), "0");
+        assert_eq!(dec_add("-2", "-3", false).unwrap(), "-5");
+        assert_eq!(dec_add("0.1", "0.2", false).unwrap(), "0.3");
+        assert!(dec_add("1e38", "9e37", false).is_err(), "39 digits must be refused");
     }
 
     #[test]

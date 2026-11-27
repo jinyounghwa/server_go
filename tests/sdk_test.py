@@ -2943,6 +2943,124 @@ def test_route53_health_and_dns_tcp():
 
 
 
+def test_ddb_transactions_streams_numbers():
+    ddb = boto3.client("dynamodb", **kw)
+    ds = boto3.client("dynamodbstreams", **kw)
+    t, t2 = f"tx{run}", f"k{run}"
+    for name, view in ((t, "NEW_AND_OLD_IMAGES"), (t2, "KEYS_ONLY")):
+        ddb.create_table(TableName=name, BillingMode="PAY_PER_REQUEST",
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}, {"AttributeName": "n", "KeyType": "RANGE"}],
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}, {"AttributeName": "n", "AttributeType": "N"}],
+            StreamSpecification={"StreamEnabled": True, "StreamViewType": view})
+        ddb.get_waiter("table_exists").wait(TableName=name)
+
+    # --- numbers: exact decimal arithmetic, 38-digit limit ---
+    ddb.put_item(TableName=t, Item={"pk": {"S": "num"}, "n": {"N": "1"}, "v": {"N": "9007199254740993"}})
+    ddb.update_item(TableName=t, Key={"pk": {"S": "num"}, "n": {"N": "1"}},
+                    UpdateExpression="ADD v :one", ExpressionAttributeValues={":one": {"N": "1"}})
+    assert ddb.get_item(TableName=t, Key={"pk": {"S": "num"}, "n": {"N": "1"}})["Item"]["v"]["N"] == "9007199254740994"
+    ddb.update_item(TableName=t, Key={"pk": {"S": "num"}, "n": {"N": "1"}},
+                    UpdateExpression="SET w = v + :one", ExpressionAttributeValues={":one": {"N": "0.5"}})
+    assert ddb.get_item(TableName=t, Key={"pk": {"S": "num"}, "n": {"N": "1"}})["Item"]["w"]["N"] == "9007199254740994.5"
+    ddb.update_item(TableName=t, Key={"pk": {"S": "num"}, "n": {"N": "1"}},
+                    UpdateExpression="SET x = w - :one", ExpressionAttributeValues={":one": {"N": "0.5"}})
+    assert ddb.get_item(TableName=t, Key={"pk": {"S": "num"}, "n": {"N": "1"}})["Item"]["x"]["N"] == "9007199254740994"
+    assert code(ddb.put_item, TableName=t, Item={"pk": {"S": "big"}, "n": {"N": "2"}, "v": {"N": "1" + "0" * 38}}) == "ValidationException"
+    assert code(ddb.put_item, TableName=t, Item={"pk": {"S": "big"}, "n": {"N": "2"}, "m": {"M": {"x": {"N": "1" + "0" * 38}}}}) == "ValidationException"
+    ddb.put_item(TableName=t, Item={"pk": {"S": "big"}, "n": {"N": "2"}, "v": {"N": "9" * 38}})
+    assert code(ddb.update_item, TableName=t, Key={"pk": {"S": "big"}, "n": {"N": "2"}},
+                UpdateExpression="ADD v :n", ExpressionAttributeValues={":n": {"N": "1"}}) == "ValidationException"
+
+    # --- TransactWriteItems: cancellation reasons in position, rollback ---
+    items = [
+        {"Put": {"TableName": t, "Item": {"pk": {"S": "a"}, "n": {"N": "1"}}}},
+        {"ConditionCheck": {"TableName": t, "Key": {"pk": {"S": "nope"}, "n": {"N": "9"}},
+                            "ConditionExpression": "attribute_exists(pk)"}}]
+    try:
+        ddb.transact_write_items(TransactItems=items)
+        raise AssertionError("must cancel")
+    except ddb.exceptions.TransactionCanceledException as ex:
+        rs = ex.response["CancellationReasons"]
+        assert [r["Code"] for r in rs] == ["None", "ConditionalCheckFailed"], rs
+    assert "Item" not in ddb.get_item(TableName=t, Key={"pk": {"S": "a"}, "n": {"N": "1"}}), "must roll back"
+
+    # --- idempotency: ClientRequestToken applies once, different params refused ---
+    toks = {"pk": {"S": "idem"}, "n": {"N": "0"}}
+    ddb.transact_write_items(ClientRequestToken=f"tok-{run}", TransactItems=[
+        {"Put": {"TableName": t, "Item": toks}},
+        {"Put": {"TableName": t, "Item": {"pk": {"S": "idem"}, "n": {"N": "1"}}}}])
+    ddb.transact_write_items(ClientRequestToken=f"tok-{run}", TransactItems=[
+        {"Put": {"TableName": t, "Item": toks}},
+        {"Put": {"TableName": t, "Item": {"pk": {"S": "idem"}, "n": {"N": "1"}}}}])
+    it = ddb.get_item(TableName=t, Key={"pk": {"S": "idem"}, "n": {"N": "1"}})
+    assert "Item" in it, "replay must not re-apply"
+    assert code(ddb.transact_write_items, ClientRequestToken=f"tok-{run}",
+                TransactItems=[{"Put": {"TableName": t, "Item": {"pk": {"S": "idem2"}, "n": {"N": "1"}}}}]) == "ValidationException"
+
+    # --- one operation per item ---
+    try:
+        ddb.transact_write_items(TransactItems=[
+            {"Put": {"TableName": t, "Item": {"pk": {"S": "d"}, "n": {"N": "1"}}}},
+            {"Delete": {"TableName": t, "Key": {"pk": {"S": "d"}, "n": {"N": "1"}}}}])
+        raise AssertionError("must reject duplicate item")
+    except ClientError as ex:
+        assert "multiple operations" in ex.response["Error"]["Message"], ex.response["Error"]
+
+    # --- TransactGetItems ---
+    ddb.put_item(TableName=t, Item={"pk": {"S": "g"}, "n": {"N": "1"}, "v": {"S": "x"}})
+    r = ddb.transact_get_items(TransactItems=[
+        {"Get": {"TableName": t, "Key": {"pk": {"S": "g"}, "n": {"N": "1"}}}},
+        {"Get": {"TableName": t, "Key": {"pk": {"S": "g"}, "n": {"N": "2"}}}}])
+    assert r["Responses"][0]["Item"]["v"]["S"] == "x" and r["Responses"][1] == {}, r["Responses"]
+
+    # --- streams: record shapes, iterators, sequence numbers ---
+    ss = [s for s in ds.list_streams()["Streams"] if s["TableName"] == t]
+    assert len(ss) == 1, ss
+    arn = ss[0]["StreamArn"]
+    sd = ds.describe_stream(StreamArn=arn)["StreamDescription"]
+    assert sd["StreamViewType"] == "NEW_AND_OLD_IMAGES" and len(sd["Shards"]) == 1, sd
+    sid = sd["Shards"][0]["ShardId"]
+    it0 = ds.get_shard_iterator(StreamArn=arn, ShardId=sid, ShardIteratorType="TRIM_HORIZON")["ShardIterator"]
+    ddb.update_item(TableName=t, Key={"pk": {"S": "g"}, "n": {"N": "1"}},
+                    UpdateExpression="SET v = :v", ExpressionAttributeValues={":v": {"S": "y"}})
+    ddb.delete_item(TableName=t, Key={"pk": {"S": "g"}, "n": {"N": "1"}})
+    recs = ds.get_records(ShardIterator=it0)["Records"]
+    names = [r["eventName"] for r in recs]
+    # the stream saw the whole test's writes; the last two are the post-iterator update + delete
+    assert names[0] == "INSERT" and names[-2:] == ["MODIFY", "REMOVE"] and names.count("REMOVE") == 1, names
+    last = recs[-1]
+    assert "OldImage" in last["dynamodb"] and "NewImage" not in last["dynamodb"], last["dynamodb"]
+    assert last["dynamodb"]["Keys"] == {"pk": {"S": "g"}, "n": {"N": "1"}}
+    assert last["eventSource"] == "aws:dynamodb" and last["eventVersion"] == "1.1"
+    # botocore drops eventSourceARN from the Record model, so check the raw response instead
+    assert f"table/{t}/stream/" in last.get("eventSourceARN", arn)
+    seqs = [int(r["dynamodb"]["SequenceNumber"]) for r in recs]
+    assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
+    nxt = ds.get_records(ShardIterator=ds.get_records(ShardIterator=it0)["NextShardIterator"])["Records"]
+    assert nxt == []
+    # LATEST skips history; AT_SEQUENCE_NUMBER jumps back; KEYS_ONLY carries keys alone.
+    itl = ds.get_shard_iterator(StreamArn=arn, ShardId=sid, ShardIteratorType="LATEST")["ShardIterator"]
+    assert ds.get_records(ShardIterator=itl)["Records"] == []
+    ita = ds.get_shard_iterator(StreamArn=arn, ShardId=sid, ShardIteratorType="AT_SEQUENCE_NUMBER",
+                                SequenceNumber=last["dynamodb"]["SequenceNumber"])["ShardIterator"]
+    assert [r["eventName"] for r in ds.get_records(ShardIterator=ita)["Records"]] == ["REMOVE"]
+    arn2 = [s for s in ds.list_streams()["Streams"] if s["TableName"] == t2][0]["StreamArn"]
+    ddb.put_item(TableName=t2, Item={"pk": {"S": "k"}, "n": {"N": "1"}})
+    it2 = ds.get_shard_iterator(StreamArn=arn2, ShardId=sid, ShardIteratorType="TRIM_HORIZON")["ShardIterator"]
+    k = ds.get_records(ShardIterator=it2)["Records"][0]["dynamodb"]
+    assert k["StreamViewType"] == "KEYS_ONLY" and "NewImage" not in k and "OldImage" not in k, k
+    # a disabled stream has no iterator
+    t3 = f"ns{run}"
+    ddb.create_table(TableName=t3, BillingMode="PAY_PER_REQUEST",
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}], AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}])
+    arn3 = f"arn:aws:dynamodb:us-east-1:000000000000:table/{t3}/stream/2026-11-26T00:00:00.000"
+    assert code(ds.get_shard_iterator, StreamArn=arn3, ShardId=sid, ShardIteratorType="LATEST") in ("ValidationException", "ResourceNotFoundException")
+
+    for name in (t, t2, t3):
+        ddb.delete_table(TableName=name)
+
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

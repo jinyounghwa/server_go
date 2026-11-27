@@ -361,6 +361,9 @@ async fn handle(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<std:
         Svc::Lambda(lambda::op_of(method.as_str(), path), path.to_string(), form(uri.query().unwrap_or("")).collect())
     } else if let Some(op) = target.strip_prefix("DynamoDB_20120810.") {
         Svc::Ddb(op.into())
+    } else if let Some(op) = target.strip_prefix("DynamoDBStreams_20120810.") {
+        // dynamodbstreams shares the DynamoDB service scope; its ops hit the same tables (IAM: dynamodb:ListStreams etc.)
+        Svc::Ddb(op.into())
     } else if let Some(op) = target.strip_prefix("AmazonSQS.") {
         Svc::Sqs(op.into())
     } else if let Some((pre, name)) = JSON_TARGETS.iter().find(|(p, _)| target.starts_with(p)) {
