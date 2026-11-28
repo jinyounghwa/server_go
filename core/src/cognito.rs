@@ -1,11 +1,12 @@
 // Cognito user pools (JSON 1.1): users, app clients, groups, password auth, RS256 JWTs (JWKS endpoint) and
 // Lambda triggers (PreSignUp before creation, PostConfirmation after, PreTokenGeneration at issue).
 // Issuer: {endpoint}/_cognito/{poolId}  (JWKS at /.well-known/jwks.json, discovery at /.well-known/openid-configuration)
-// ponytail: no SRP (29일차), hosted UI/OAuth flows or custom auth challenges; MFA is software-token TOTP only (no SMS).
+// USER_SRP_AUTH: PASSWORD_VERIFIER over the RFC 5054 3072-bit group, same math as amazon-cognito-identity-js (see srp_* below).
+// ponytail: no device SRP, hosted UI/OAuth flows or custom auth challenges; MFA is software-token TOTP only (no SMS).
 // Verification codes are published as events; trigger failures on PostConfirmation/PreToken are best-effort like AWS retries.
 use crate::{b64, epoch, err, need, ApiErr, ACCOUNT, REGION};
 use base64::Engine;
-use rsa::{pkcs1v15::{SigningKey, VerifyingKey}, signature::{SignatureEncoding, Signer, Verifier}, traits::PublicKeyParts, RsaPrivateKey};
+use rsa::{BigUint, pkcs1v15::{SigningKey, VerifyingKey}, signature::{SignatureEncoding, Signer, Verifier}, traits::PublicKeyParts, RsaPrivateKey};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -51,6 +52,71 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> Vec<u8> {
     Sha256::new().chain_update(pad(0x5c)).chain_update(inner).finalize().to_vec()
 }
 
+// --- SRP (USER_SRP_AUTH). Hex strings use the client libraries' "padHex": even length, "00" prefix when the top bit is set.
+// The RFC 3526/5054 3072-bit prime (checked against its pi formula), g = 2.
+const SRP_N: &str = "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200CBBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF";
+static N_G_K: LazyLock<(BigUint, BigUint, BigUint)> = LazyLock::new(|| {
+    let (n, g) = (BigUint::parse_bytes(SRP_N.as_bytes(), 16).unwrap(), BigUint::from(2u8));
+    let k = hex_hash(&format!("{}{}", pad_hex(&n), pad_hex(&g)));
+    (n, g, k)
+});
+fn pad_hex(n: &BigUint) -> String {
+    let h = n.to_str_radix(16);
+    let h = if h.len() % 2 == 1 { format!("0{h}") } else { h };
+    if h.as_bytes()[0] >= b'8' { format!("00{h}") } else { h }
+}
+fn unhex(h: &str) -> Vec<u8> {
+    (0..h.len() / 2).filter_map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).ok()).collect()
+}
+// SHA-256 of the bytes a hex string encodes, as a number.
+fn hex_hash(h: &str) -> BigUint {
+    BigUint::from_bytes_be(&Sha256::digest(unhex(h)))
+}
+fn pool_name(pool: &str) -> &str {
+    pool.split_once('_').map_or(pool, |(_, n)| n)
+}
+// x = H(salt | H(poolName | user ":" | password)); poolName is the pool id after the region underscore.
+fn srp_x(pool: &str, user: &str, pw: &str, salt: &BigUint) -> BigUint {
+    let inner: String = Sha256::digest(format!("{}{user}:{pw}", pool_name(pool))).iter().map(|b| format!("{b:02x}")).collect();
+    hex_hash(&format!("{}{inner}", pad_hex(salt)))
+}
+fn srp_verifier(pool: &str, user: &str, pw: &str, salt_hex: &str) -> BigUint {
+    let (n, g, _) = &*N_G_K;
+    g.modpow(&srp_x(pool, user, pw, &BigUint::parse_bytes(salt_hex.as_bytes(), 16).unwrap_or_default()), n)
+}
+// 16-byte HKDF-SHA256 key from the shared secret S and scrambler u ("Caldera Derived Key").
+fn srp_key(s: &BigUint, u: &BigUint) -> Vec<u8> {
+    let prk = hmac_sha256(&unhex(&pad_hex(u)), &unhex(&pad_hex(s)));
+    hmac_sha256(&prk, b"Caldera Derived Key\x01")[..16].to_vec()
+}
+// Base64 HMAC the client must send as PASSWORD_CLAIM_SIGNATURE.
+fn srp_signature(key: &[u8], pool: &str, user: &str, secret_block: &[u8], timestamp: &str) -> String {
+    b64(&hmac_sha256(key, &[pool_name(pool).as_bytes(), user.as_bytes(), secret_block, timestamp.as_bytes()].concat()))
+}
+// Server half of the handshake: B = k*v + g^b, u = H(A | B), S = (A * v^u)^b. None for a degenerate A or u.
+fn srp_server(a_hex: &str, v: &BigUint) -> Option<(BigUint, Vec<u8>)> {
+    let (n, g, k) = &*N_G_K;
+    let a = BigUint::parse_bytes(a_hex.as_bytes(), 16)?;
+    if (&a % n) == BigUint::default() {
+        return None;
+    }
+    let b = BigUint::from_bytes_be(&crate::rand_bytes(32));
+    let big_b = (k * v + g.modpow(&b, n)) % n;
+    let u = hex_hash(&format!("{}{}", pad_hex(&a), pad_hex(&big_b)));
+    if u == BigUint::default() {
+        return None;
+    }
+    let s = (a * v.modpow(&u, n)).modpow(&b, n);
+    Some((big_b, srp_key(&s, &u)))
+}
+struct SrpPending {
+    pool: String,
+    user: String,
+    client: String,
+    key: Vec<u8>,
+    expires: f64,
+}
+
 fn hash_pw(salt: &str, pw: &str) -> String {
     b64(&Sha256::new().chain_update(salt).chain_update(pw).finalize())
 }
@@ -59,6 +125,7 @@ struct User {
     sub: String,
     salt: String,
     pw: String,
+    srp_v: BigUint, // SRP verifier g^x for USER_SRP_AUTH, kept in step with pw
     attrs: BTreeMap<String, String>,
     status: &'static str, // UNCONFIRMED | CONFIRMED | FORCE_CHANGE_PASSWORD
     enabled: bool,
@@ -68,6 +135,12 @@ struct User {
 }
 
 // RFC 6238 TOTP over the stored raw secret (hex); verified users can answer the MFA challenge.
+impl User {
+    fn set_pw(&mut self, pool: &str, uname: &str, pw: &str) {
+        (self.pw, self.srp_v) = (hash_pw(&self.salt, pw), srp_verifier(pool, uname, pw, &self.salt));
+    }
+}
+
 struct Totp {
     secret: String, // 16 random bytes as hex
     verified: bool,
@@ -121,6 +194,7 @@ pub struct Cognito {
     clients: BTreeMap<String, Client>,
     refresh: HashMap<String, (String, String, String)>, // token -> (pool, username, client)
     sessions: HashMap<String, (String, String, String)>, // challenge session -> same
+    srp: HashMap<String, SrpPending>,                   // SECRET_BLOCK (base64) -> handshake awaiting PASSWORD_VERIFIER
     codes: Vec<(String, String)>,                       // (username, code) to publish as events
     pub triggers: Vec<Trigger>,                         // pending triggers for main.rs
 }
@@ -357,6 +431,13 @@ impl Cognito {
         if hash_pw(&u.salt, pw) != u.pw {
             return Err(bad_login());
         }
+        self.after_password(pool, client, uname)
+    }
+
+    // What follows a proven password (plain or SRP): status checks, NEW_PASSWORD_REQUIRED, MFA, then tokens.
+    fn after_password(&mut self, pool: &str, client: &str, uname: String) -> Result<Value, ApiErr> {
+        let p = &self.pools[pool];
+        let u = &p.users[&uname];
         if !u.enabled {
             return Err(e("NotAuthorizedException", "User is disabled."));
         }
@@ -416,7 +497,9 @@ impl Cognito {
             return Err(e("UsernameExistsException", "An account with the given username already exists."));
         }
         let salt = uuid::Uuid::new_v4().simple().to_string();
-        p.users.insert(uname.clone(), User { sub, pw: hash_pw(&salt, pw), salt, attrs, status, enabled: true, created: epoch(), code: None, totp: None });
+        let mut u = User { sub, pw: String::new(), srp_v: BigUint::default(), salt, attrs, status, enabled: true, created: epoch(), code: None, totp: None };
+        u.set_pw(pool, &uname, pw);
+        p.users.insert(uname.clone(), u);
         Ok(uname)
     }
 
@@ -531,7 +614,7 @@ impl Cognito {
                     let pw = need(r, "Password")?;
                     self.pools[&pool].check_policy(pw)?;
                     let u = self.pools.get_mut(&pool).unwrap().users.get_mut(&uname).unwrap();
-                    u.pw = hash_pw(&u.salt, pw);
+                    u.set_pw(&pool, &uname, pw);
                     u.code = None;
                 } else {
                     (u.status, u.code) = ("CONFIRMED", None);
@@ -575,7 +658,7 @@ impl Cognito {
                 let pw = need(r, "Password")?;
                 p.check_policy(pw)?;
                 let u = p.users.get_mut(&uname).unwrap();
-                u.pw = hash_pw(&u.salt, pw);
+                u.set_pw(&pool_id, &uname, pw);
                 u.status = if r["Permanent"] == true { "CONFIRMED" } else { "FORCE_CHANGE_PASSWORD" };
                 json!({})
             }
@@ -660,6 +743,21 @@ impl Cognito {
                         Self::check_secret(c, &cid, name, p["SECRET_HASH"].as_str())?;
                         self.password_auth(&pool, &cid, name, p["PASSWORD"].as_str().unwrap_or(""))?
                     }
+                    "USER_SRP_AUTH" if op == "InitiateAuth" => {
+                        let name = p["USERNAME"].as_str().ok_or_else(|| e("InvalidParameterException", "Missing required parameter USERNAME"))?;
+                        let a = p["SRP_A"].as_str().ok_or_else(|| e("InvalidParameterException", "Missing required parameter SRP_A"))?;
+                        Self::check_secret(c, &cid, name, p["SECRET_HASH"].as_str())?;
+                        let uname = self.pools[&pool].find(name).ok_or_else(|| e("UserNotFoundException", "User does not exist."))?;
+                        let u = &self.pools[&pool].users[&uname];
+                        let (b, key) = srp_server(a, &u.srp_v).ok_or_else(|| e("InvalidParameterException", "SRP_A is not a valid SRP public value"))?;
+                        let salt = u.salt.clone();
+                        let block = b64(&crate::rand_bytes(64));
+                        let now = epoch();
+                        self.srp.retain(|_, s| s.expires > now);
+                        self.srp.insert(block.clone(), SrpPending { pool: pool.clone(), user: uname.clone(), client: cid.clone(), key, expires: now + 300.0 });
+                        json!({"ChallengeName": "PASSWORD_VERIFIER", "ChallengeParameters": {"SALT": salt, "SRP_B": b.to_str_radix(16),
+                               "SECRET_BLOCK": block, "USER_ID_FOR_SRP": uname, "USERNAME": uname}})
+                    }
                     "REFRESH_TOKEN_AUTH" | "REFRESH_TOKEN" => {
                         let rt = p["REFRESH_TOKEN"].as_str().unwrap_or("");
                         let (pool, user, client) = self.refresh.get(rt).cloned().filter(|(_, _, c)| *c == cid)
@@ -669,8 +767,26 @@ impl Cognito {
                         }
                         self.tokens(&pool, &user, &client, false)
                     }
-                    f => return Err(e("InvalidParameterException", &format!("Auth flow {f} is not supported locally (no SRP)"))),
+                    f => return Err(e("InvalidParameterException", &format!("Auth flow {f} is not supported locally"))),
                 }
+            }
+            "RespondToAuthChallenge" if r["ChallengeName"] == "PASSWORD_VERIFIER" => {
+                // The SECRET_BLOCK identifies the handshake (clients send no Session here); one try per block.
+                let cr = &r["ChallengeResponses"];
+                let block = cr["PASSWORD_CLAIM_SECRET_BLOCK"].as_str().unwrap_or("");
+                let st = self.srp.remove(block).filter(|s| s.expires > epoch()).ok_or_else(|| e("NotAuthorizedException", "Invalid session for the user."))?;
+                let (cid, c) = self.client(r)?;
+                if cid != st.client {
+                    return Err(e("NotAuthorizedException", "Invalid session for the user."));
+                }
+                Self::check_secret(c, &cid, cr["USERNAME"].as_str().unwrap_or(&st.user), cr["SECRET_HASH"].as_str())?;
+                let raw = base64::engine::general_purpose::STANDARD.decode(block).unwrap_or_default();
+                let want = srp_signature(&st.key, &st.pool, &st.user, &raw, cr["TIMESTAMP"].as_str().unwrap_or(""));
+                if cr["PASSWORD_CLAIM_SIGNATURE"].as_str() != Some(want.as_str()) {
+                    return Err(bad_login());
+                }
+                // ponytail: TIMESTAMP is signed but its clock value is not checked; the 5-minute block expiry bounds replays.
+                self.after_password(&st.pool, &st.client, st.user)?
             }
             "RespondToAuthChallenge" | "AdminRespondToAuthChallenge" => {
                 let (pool, user, client) = self.sessions.remove(need(r, "Session")?).ok_or_else(|| e("NotAuthorizedException", "Invalid session for the user."))?;
@@ -691,7 +807,8 @@ impl Cognito {
                 let pw = r["ChallengeResponses"]["NEW_PASSWORD"].as_str().ok_or_else(|| e("InvalidParameterException", "NEW_PASSWORD is required"))?;
                 self.pools[&pool].check_policy(pw)?;
                 let u = self.pools.get_mut(&pool).unwrap().users.get_mut(&user).unwrap();
-                (u.pw, u.status) = (hash_pw(&u.salt, pw), "CONFIRMED");
+                u.set_pw(&pool, &user, pw);
+                u.status = "CONFIRMED";
                 self.tokens(&pool, &user, &client, true)
             }
             "AssociateSoftwareToken" | "AdminAssociateSoftwareToken" => {
@@ -778,7 +895,7 @@ impl Cognito {
                 if hash_pw(&u.salt, old) != u.pw {
                     return Err(bad_login());
                 }
-                u.pw = hash_pw(&u.salt, new);
+                u.set_pw(&pool, &user, new);
                 json!({})
             }
             "GlobalSignOut" => {
@@ -897,5 +1014,46 @@ mod tests {
 
         let pre = c.presignup_event(&json!({"ClientId": cid, "Username": "new", "UserAttributes": []})).unwrap();
         assert_eq!((pre.kind, pre.fn_name.as_str(), pre.event["triggerSource"].as_str().unwrap()), ("PreSignUp", "fn:pre", "PreSignUp_SignUp"));
+    }
+
+    // USER_SRP_AUTH end to end with a client-side SRP computed here (the amazon-cognito-identity-js formulas).
+    #[test]
+    fn srp_password_verifier() {
+        use super::*;
+        let mut c = Cognito::default();
+        let pool = c.handle("CreateUserPool", &json!({"PoolName": "p"})).unwrap()["UserPool"]["Id"].as_str().unwrap().to_string();
+        let cid = c.handle("CreateUserPoolClient", &json!({"UserPoolId": pool, "ClientName": "web"})).unwrap()["UserPoolClient"]["ClientId"].as_str().unwrap().to_string();
+        c.handle("AdminCreateUser", &json!({"UserPoolId": pool, "Username": "srp1"})).unwrap();
+        c.handle("AdminSetUserPassword", &json!({"UserPoolId": pool, "Username": "srp1", "Password": "Str0ng!pass", "Permanent": true})).unwrap();
+        let login = |c: &mut Cognito, pw: &str| {
+            let (n, g, k) = &*N_G_K;
+            let a = BigUint::from_bytes_be(&crate::rand_bytes(32));
+            let big_a = g.modpow(&a, n);
+            let ch = c.handle("InitiateAuth", &json!({"ClientId": cid, "AuthFlow": "USER_SRP_AUTH",
+                "AuthParameters": {"USERNAME": "srp1", "SRP_A": big_a.to_str_radix(16)}})).unwrap();
+            assert_eq!(ch["ChallengeName"], "PASSWORD_VERIFIER");
+            let p = &ch["ChallengeParameters"];
+            let b = BigUint::parse_bytes(p["SRP_B"].as_str().unwrap().as_bytes(), 16).unwrap();
+            let salt = BigUint::parse_bytes(p["SALT"].as_str().unwrap().as_bytes(), 16).unwrap();
+            let user = p["USER_ID_FOR_SRP"].as_str().unwrap();
+            let u = hex_hash(&format!("{}{}", pad_hex(&big_a), pad_hex(&b)));
+            let x = srp_x(&pool, user, pw, &salt);
+            let s = ((&b + n - (k * g.modpow(&x, n)) % n) % n).modpow(&(&a + &u * &x), n);
+            let block = p["SECRET_BLOCK"].as_str().unwrap().to_string();
+            let raw = base64::engine::general_purpose::STANDARD.decode(&block).unwrap();
+            let ts = "Mon Dec 1 09:05:07 UTC 2026";
+            let resp = json!({"ClientId": cid, "ChallengeName": "PASSWORD_VERIFIER", "ChallengeResponses": {"USERNAME": user,
+                "PASSWORD_CLAIM_SECRET_BLOCK": block, "TIMESTAMP": ts,
+                "PASSWORD_CLAIM_SIGNATURE": srp_signature(&srp_key(&s, &u), &pool, user, &raw, ts)}});
+            (c.handle("RespondToAuthChallenge", &resp), resp)
+        };
+        let (ok, resp) = login(&mut c, "Str0ng!pass");
+        assert!(verify(ok.unwrap()["AuthenticationResult"]["IdToken"].as_str().unwrap()).is_some());
+        // the secret block is single use, a wrong password fails the signature
+        assert_eq!(c.handle("RespondToAuthChallenge", &resp).unwrap_err().code, "NotAuthorizedException");
+        assert_eq!(login(&mut c, "wrong").0.unwrap_err().code, "NotAuthorizedException");
+        // A = 0 (mod N) is rejected before any handshake
+        let zero = c.handle("InitiateAuth", &json!({"ClientId": cid, "AuthFlow": "USER_SRP_AUTH", "AuthParameters": {"USERNAME": "srp1", "SRP_A": SRP_N}}));
+        assert_eq!(zero.unwrap_err().code, "InvalidParameterException");
     }
 }

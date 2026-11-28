@@ -3562,6 +3562,66 @@ def test_cognito_totp():
     assert "AuthenticationResult" in auth()
 
 
+def test_cognito_srp():
+    # Our own small SRP client, written from the amazon-cognito-identity-js / warrant formulas (boto3 has no SRP helper).
+    import base64, hashlib, hmac, os, time
+    N = int("FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200CBBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF", 16)
+    g = 2
+
+    def pad(n):
+        h = format(n, "x")
+        h = "0" + h if len(h) % 2 else h
+        return "00" + h if h[0] in "89abcdef" else h
+
+    def H(hexstr):
+        return int(hashlib.sha256(bytes.fromhex(hexstr)).hexdigest(), 16)
+
+    k = H(pad(N) + pad(g))
+    idp = boto3.client("cognito-idp", **kw)
+    pool = idp.create_user_pool(PoolName=f"srp{run}")["UserPool"]["Id"]
+    c = idp.create_user_pool_client(UserPoolId=pool, ClientName="srp", GenerateSecret=True, ExplicitAuthFlows=["ALLOW_USER_SRP_AUTH"])["UserPoolClient"]
+    cid, csec = c["ClientId"], c["ClientSecret"]
+    sh = lambda u: base64.b64encode(hmac.new(csec.encode(), (u + cid).encode(), hashlib.sha256).digest()).decode()
+    name = f"srp{run}"
+    idp.admin_create_user(UserPoolId=pool, Username=name)
+    idp.admin_set_user_password(UserPoolId=pool, Username=name, Password="Str0ng!pass", Permanent=True)
+
+    def login(pw, user=name):
+        a = int.from_bytes(os.urandom(32), "big")
+        A = pow(g, a, N)
+        ch = idp.initiate_auth(ClientId=cid, AuthFlow="USER_SRP_AUTH", AuthParameters={"USERNAME": user, "SRP_A": format(A, "x"), "SECRET_HASH": sh(user)})
+        assert ch["ChallengeName"] == "PASSWORD_VERIFIER", ch
+        p = ch["ChallengeParameters"]
+        B, salt, uid = int(p["SRP_B"], 16), int(p["SALT"], 16), p["USER_ID_FOR_SRP"]
+        u = H(pad(A) + pad(B))
+        x = H(pad(salt) + hashlib.sha256(f"{pool.split('_')[1]}{uid}:{pw}".encode()).hexdigest())
+        S = pow((B - k * pow(g, x, N)) % N, a + u * x, N)
+        prk = hmac.new(bytes.fromhex(pad(u)), bytes.fromhex(pad(S)), hashlib.sha256).digest()
+        key = hmac.new(prk, b"Caldera Derived Key\x01", hashlib.sha256).digest()[:16]
+        t = time.gmtime()
+        ts = time.strftime("%a %b ", t) + str(t.tm_mday) + time.strftime(" %H:%M:%S UTC %Y", t)
+        msg = pool.split("_")[1].encode() + uid.encode() + base64.b64decode(p["SECRET_BLOCK"]) + ts.encode()
+        resp = dict(ClientId=cid, ChallengeName="PASSWORD_VERIFIER", ChallengeResponses={
+            "USERNAME": uid, "TIMESTAMP": ts, "PASSWORD_CLAIM_SECRET_BLOCK": p["SECRET_BLOCK"], "SECRET_HASH": sh(uid),
+            "PASSWORD_CLAIM_SIGNATURE": base64.b64encode(hmac.new(key, msg, hashlib.sha256).digest()).decode()})
+        return resp
+
+    resp = login("Str0ng!pass")
+    tok = idp.respond_to_auth_challenge(**resp)["AuthenticationResult"]
+    assert idp.get_user(AccessToken=tok["AccessToken"])["Username"] == name
+    # the secret block is single use
+    assert code(idp.respond_to_auth_challenge, **resp) == "NotAuthorizedException"
+    # wrong password -> the signature does not match
+    assert code(idp.respond_to_auth_challenge, **login("Wr0ng!pass")) == "NotAuthorizedException"
+    # missing SECRET_HASH on a secret client, unknown user, bad SRP_A
+    assert code(idp.initiate_auth, ClientId=cid, AuthFlow="USER_SRP_AUTH", AuthParameters={"USERNAME": name, "SRP_A": "02"}) == "NotAuthorizedException"
+    assert code(idp.initiate_auth, ClientId=cid, AuthFlow="USER_SRP_AUTH", AuthParameters={"USERNAME": "nobody", "SRP_A": "02", "SECRET_HASH": sh("nobody")}) == "UserNotFoundException"
+    assert code(idp.initiate_auth, ClientId=cid, AuthFlow="USER_SRP_AUTH", AuthParameters={"USERNAME": name, "SRP_A": format(N, "x"), "SECRET_HASH": sh(name)}) == "InvalidParameterException"
+    # a password change updates the verifier
+    idp.change_password(AccessToken=tok["AccessToken"], PreviousPassword="Str0ng!pass", ProposedPassword="N3w!passw0rd")
+    assert "AuthenticationResult" in idp.respond_to_auth_challenge(**login("N3w!passw0rd"))
+    assert code(idp.respond_to_auth_challenge, **login("Str0ng!pass")) == "NotAuthorizedException"
+
 
 if __name__ == "__main__":
     for name, fn in list(globals().items()):

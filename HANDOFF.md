@@ -467,7 +467,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - TOTP를 등록한 뒤 `pyotp` 없이 테스트 안에서 직접 계산한 코드로 로그인이 되어야 한다.
   - 틀린 코드는 `CodeMismatchException`이어야 한다.
 
-## 29일차 (2026-12-23): Cognito SRP (1/2): USER_SRP_AUTH
+## 29일차 (2026-12-23): Cognito SRP (1/2): USER_SRP_AUTH — ✅ 완료: USER_SRP_AUTH→PASSWORD_VERIFIER(3072비트 그룹 π 공식 검증, `rsa::BigUint` 재수출로 새 크레이트 없음), HKDF·서명 손구현, `set_pw`로 모든 비밀번호 경로가 검증값 갱신(Cognito는 스냅샷 대상 아님), 비밀 블록 1회용·5분, 자체 Python SRP 클라이언트 + pycognito AWSSRP 상호 운용 확인, 단위/boto3(54/57)·두 모드 통과·컨테이너 0
 - `InitiateAuth(AuthFlow=USER_SRP_AUTH)`와 `PASSWORD_VERIFIER` 챌린지를 넣는다. AWS가 쓰는 3072비트 그룹, `k = H(N, g)`, 그리고 `SRP_B`, `SALT`, `SECRET_BLOCK`, `USER_ID_FOR_SRP`를 쓴다.
 - **큰 수 연산:** 이미 의존하는 `rsa` 크레이트가 `BigUint`를 다시 내보내는지 먼저 확인한다. 쓸 수 있으면 새 크레이트 없이 간다. 안 되면 사용자에게 묻는다.
 - HKDF(sha2 기반)는 짧게 직접 짠다.
