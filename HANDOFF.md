@@ -508,7 +508,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - 자식이 실패하면 부모가 롤백되어야 한다.
   - 외부 URL은 거부되어야 한다.
 
-## 33일차 (2026-12-27): CloudFormation SAM 변환
+## 33일차 (2026-12-27): CloudFormation SAM 변환 — ✅ 완료 (`e6c1fd9`): Serverless 5종 자원·Globals·이벤트 6종(Api·HttpApi·SQS·SNS·Schedule·Kinesis·DynamoDB) 확장, Policies→역할 합성, V2 CFN 타입 3종·LayerVersion 신규, StreamArn·ANY 라우팅, 모르는 속성 ValidationError, GetTemplate(Processed) 열람, 단위/boto3(59/61)·두 모드 통과·컨테이너 0
 - `Transform: AWS::Serverless-2016-10-31`을 받는다. 지원 타입은 다음이다.
   - `AWS::Serverless::Function`: 이벤트 소스 SQS·SNS·Schedule·Api·HttpApi·Kinesis·DynamoDB
   - `::Api`, `::HttpApi`, `::SimpleTable`, `::LayerVersion`
