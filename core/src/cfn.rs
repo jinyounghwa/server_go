@@ -6,7 +6,7 @@
 use crate::{err, ApiErr, App, ACCOUNT, REGION};
 use axum::http::{HeaderMap, Method, Uri};
 use serde_json::{json, Map, Value};
-use std::{collections::{BTreeMap, HashMap, HashSet}, future::Future, pin::Pin, sync::Arc};
+use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet}, future::Future, pin::Pin, sync::Arc};
 
 const NOVALUE: &str = "__rocalcloud_novalue__";
 
@@ -147,6 +147,422 @@ struct Ctx<'a> {
     res: HashMap<String, (String, Map<String, Value>)>,
     conds: HashMap<String, bool>,
     imports: HashMap<String, String>, // exported name -> value, from already deployed stacks
+}
+
+// ---------- AWS SAM (Transform: AWS::Serverless-2016-10-31) ----------
+// The expansion mirrors what `sam package && sam deploy` uploads: Serverless resources become plain
+// CFN types and implicit APIs/deployments/stages/permissions are synthesized. Only the properties each
+// arm lists are understood; anything else fails the stack (no silent mimicry).
+// ponytail: the implicit ServerlessRestApi serves stage "Prod" and an explicit AWS::Serverless::Api defaults to
+// "Stage" (SAM's own defaults are undocumented); CodeUri/ContentUri must already be local-S3 objects,
+// which is `sam package`'s job. GetTemplate(TemplateStage=Processed) shows the expanded template.
+
+const SAM_TRANSFORM: &str = "AWS::Serverless-2016-10-31";
+
+fn is_sam(t: &Value) -> bool {
+    match &t["Transform"] {
+        Value::String(s) => s == SAM_TRANSFORM,
+        Value::Array(a) => a.iter().any(|x| x.as_str() == Some(SAM_TRANSFORM)),
+        _ => false,
+    }
+}
+
+// parse() + SAM expansion: what every deploy/validate/get-template path uses.
+fn parse_sam(body: &str) -> Result<Value, ApiErr> {
+    let mut t = parse(body)?;
+    if is_sam(&t) {
+        sam_transform(&mut t).map_err(|e| err("ValidationError", format!("Transform {SAM_TRANSFORM}: {e}")))?;
+    } else if !t["Transform"].is_null() {
+        return Err(err("ValidationError", format!("Transform {} is not supported locally", text(&t["Transform"]))));
+    }
+    Ok(t)
+}
+
+fn unknown_props(props: &Value, ty: &str, known: &[&str]) -> Result<(), String> {
+    for k in props.as_object().into_iter().flat_map(|m| m.keys()) {
+        if !known.contains(&k.as_str()) {
+            return Err(format!("Property {k} of {ty} is not supported locally"));
+        }
+    }
+    Ok(())
+}
+
+// Globals merge: resource properties win; object values (Environment.Variables) merge one level.
+fn merge_globals(mut props: Value, g: &Value) -> Result<Value, String> {
+    if !props.is_object() {
+        return Ok(props);
+    }
+    let pm = props.as_object_mut().unwrap();
+    for (k, v) in g.as_object().cloned().unwrap_or_default() {
+        match pm.get(&k).cloned() {
+            None | Some(Value::Null) => {
+                pm.insert(k, v);
+            }
+            Some(cur) if cur.is_object() && v.is_object() => {
+                let mut merged = cur.as_object().cloned().unwrap();
+                for (vk, vv) in v.as_object().unwrap() {
+                    merged.entry(vk.clone()).or_insert(vv.clone());
+                }
+                pm.insert(k, Value::Object(merged));
+            }
+            Some(_) => {} // resource-level value wins
+        }
+    }
+    Ok(props)
+}
+
+// CodeUri/ContentUri: "s3://bucket/key", "{endpoint}/bucket/key" or {Bucket, Key}.
+fn sam_code(v: &Value, what: &str) -> Result<Value, String> {
+    match v {
+        Value::String(u) => {
+            let (b, k) = template_location(u, &crate::endpoint()).map_err(|e| format!("{what}: {e}"))?;
+            Ok(json!({"S3Bucket": b, "S3Key": k}))
+        }
+        Value::Object(m) => {
+            let b = m.get("Bucket").and_then(Value::as_str).ok_or(format!("{what} needs a Bucket"))?;
+            let k = m.get("Key").and_then(Value::as_str).ok_or(format!("{what} needs a Key"))?;
+            if m.get("Version").is_some_and(|x| !x.is_null()) {
+                return Err(format!("{what} object versioning is not supported locally"));
+            }
+            Ok(json!({"S3Bucket": b, "S3Key": k}))
+        }
+        _ => Err(format!("{what} must be an s3:// URI or a bucket/key object")),
+    }
+}
+
+// Extra keys (Condition, DependsOn, …) carried over from the Serverless resource.
+fn carry(def: &Value) -> Map<String, Value> {
+    def.as_object().unwrap().iter()
+        .filter(|(k, _)| ["Condition", "DependsOn", "DeletionPolicy", "UpdateReplacePolicy", "Metadata"].contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
+fn sam_transform(t: &mut Value) -> Result<(), String> {
+    if let Value::Array(a) = &t["Transform"] {
+        if a.len() != 1 {
+            return Err("Only the single Transform AWS::Serverless-2016-10-31 is supported".into());
+        }
+    }
+    let obj = t.as_object_mut().unwrap();
+    let globals = obj.remove("Globals").unwrap_or(Value::Null);
+    obj.remove("Transform");
+    for k in globals.as_object().into_iter().flat_map(|m| m.keys().cloned().collect::<Vec<_>>()) {
+        if !["Function", "Api", "HttpApi", "SimpleTable"].contains(&k.as_str()) {
+            return Err(format!("Globals section {k} is not supported locally"));
+        }
+    }
+    let (gf, ga, gh, gt) = (globals["Function"].clone(), globals["Api"].clone(), globals["HttpApi"].clone(), globals["SimpleTable"].clone());
+    let resources = t["Resources"].as_object().cloned().ok_or("Resources must be an object")?;
+
+    let mut out: Map<String, Value> = Map::new();
+    let mut fn_events: Vec<(String, Value)> = vec![];                 // function logical -> Events
+    let mut api_stages: BTreeMap<String, String> = BTreeMap::new();   // REST api logical -> stage name
+    let mut methods: BTreeMap<String, Vec<String>> = BTreeMap::new(); // REST api logical -> method logical ids
+    let mut http_apis: BTreeSet<String> = BTreeSet::new();            // HTTP API logicals referenced by events
+
+    for (logical, def) in resources {
+        let ty = def["Type"].as_str().unwrap_or("").to_string();
+        let mut props = def["Properties"].clone();
+        if !props.is_object() {
+            props = json!({});
+        }
+        let insert = |out: &mut Map<String, Value>, logical: String, ty: &str, props: Value, def: &Value| {
+            let mut d = json!({"Type": ty, "Properties": props});
+            for (k, v) in carry(def) {
+                d[k] = v;
+            }
+            out.insert(logical, d);
+        };
+        match ty.as_str() {
+            "AWS::Serverless::Function" => {
+                props = merge_globals(props, &gf)?;
+                unknown_props(&props, &ty, &["CodeUri", "InlineCode", "Handler", "Runtime", "Timeout", "MemorySize", "Description",
+                    "FunctionName", "Environment", "Layers", "Role", "Policies", "Architectures", "Events"])?;
+                let mut f = Map::new();
+                for k in ["Handler", "Runtime", "Timeout", "MemorySize", "Description", "FunctionName", "Environment", "Layers"] {
+                    if !props[k].is_null() {
+                        f.insert(k.into(), props[k].clone());
+                    }
+                }
+                if let Some(ic) = props["InlineCode"].as_str() {
+                    f.insert("Code".into(), json!({"ZipFile": ic}));
+                } else {
+                    let cu = props.get("CodeUri").ok_or("AWS::Serverless::Function needs CodeUri or InlineCode")?;
+                    f.insert("Code".into(), sam_code(cu, "CodeUri")?);
+                }
+                if !props["Role"].is_null() && !props["Policies"].is_null() {
+                    return Err("AWS::Serverless::Function: Role and Policies are mutually exclusive".into());
+                }
+                if !props["Policies"].is_null() {
+                    let mut role = json!({"Type": "AWS::IAM::Role", "Properties": {
+                        "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": [
+                            {"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": ["sts:AssumeRole"]}]}}});
+                    match props["Policies"].clone() {
+                        // A JSON string is an inline document; any other string is a managed policy
+                        // (ARN or AWS-managed name, as SAM accepts both).
+                        Value::String(doc) if doc.starts_with('{') => {
+                            role["Properties"]["Policies"] = json!([{"PolicyName": format!("{logical}Policy"), "PolicyDocument": props["Policies"]}]);
+                        }
+                        Value::String(_) => {
+                            role["Properties"]["ManagedPolicyArns"] = json!([props["Policies"]]);
+                        }
+                        Value::Object(_) => {
+                            role["Properties"]["Policies"] = json!([{"PolicyName": format!("{logical}Policy"), "PolicyDocument": props["Policies"]}]);
+                        }
+                        Value::Array(a) => {
+                            let (arns, docs): (Vec<Value>, Vec<Value>) = a.into_iter().partition(|x| x.is_string());
+                            if !docs.is_empty() {
+                                role["Properties"]["Policies"] = Value::Array(docs.into_iter().enumerate()
+                                    .map(|(i, d)| json!({"PolicyName": format!("{logical}Policy{i}"), "PolicyDocument": d})).collect());
+                            }
+                            if !arns.is_empty() {
+                                role["Properties"]["ManagedPolicyArns"] = Value::Array(arns);
+                            }
+                        }
+                        _ => return Err("Policies must be a policy document, a managed policy ARN, or a list of them".into()),
+                    }
+                    out.insert(format!("{logical}Role"), role);
+                    f.insert("Role".into(), json!({"Fn::GetAtt": [format!("{logical}Role"), "Arn"]}));
+                } else if !props["Role"].is_null() {
+                    f.insert("Role".into(), props["Role"].clone());
+                } // no Role and no Policies: the function stays roleless (the emulator does not require one)
+                if let Some(ev) = props.get("Events").cloned().filter(|e| e.is_object()) {
+                    fn_events.push((logical.clone(), ev));
+                } else if !props["Events"].is_null() {
+                    return Err("Events must be a map of event names".into());
+                }
+                insert(&mut out, logical, "AWS::Lambda::Function", Value::Object(f), &def);
+            }
+            "AWS::Serverless::Api" => {
+                props = merge_globals(props, &ga)?;
+                unknown_props(&props, &ty, &["Name", "StageName"])?;
+                let stage = props["StageName"].as_str().unwrap_or("Stage").to_string();
+                let mut ap = Map::new();
+                if let Some(n) = props["Name"].as_str() {
+                    ap.insert("Name".into(), n.into());
+                }
+                api_stages.insert(logical.clone(), stage);
+                insert(&mut out, logical, "AWS::ApiGateway::RestApi", Value::Object(ap), &def);
+            }
+            "AWS::Serverless::HttpApi" => {
+                props = merge_globals(props, &gh)?;
+                unknown_props(&props, &ty, &["Name", "StageName", "Cors"])?;
+                let mut hp = Map::new();
+                if let Some(n) = props["Name"].as_str() {
+                    hp.insert("Name".into(), n.into());
+                }
+                hp.insert("StageName".into(), props["StageName"].as_str().unwrap_or("$default").into());
+                if !props["Cors"].is_null() {
+                    // SAM's Cors: "'*'" or {AllowOrigin (string!), AllowMethods, AllowHeaders, AllowCredentials, MaxAge}
+                    let list = |v: &Value| v.as_str().map(|s| json!([s])).unwrap_or_else(|| v.clone());
+                    let cors = match props["Cors"].clone() {
+                        Value::String(s) => json!({"allowOrigins": [s.trim_matches('\"').trim_matches('\'')]}),
+                        Value::Object(c) => json!({
+                            "allowOrigins": list(&c["AllowOrigin"]),
+                            "allowMethods": list(&c["AllowMethods"]),
+                            "allowHeaders": list(&c["AllowHeaders"]),
+                            "allowCredentials": c["AllowCredentials"],
+                            "maxAge": c["MaxAge"],
+                        }),
+                        _ => return Err("Cors must be a quoted wildcard or a Cors rule object".into()),
+                    };
+                    hp.insert("CorsConfiguration".into(), cors);
+                }
+                insert(&mut out, logical, "AWS::ApiGatewayV2::Api", Value::Object(hp), &def);
+            }
+            "AWS::Serverless::SimpleTable" => {
+                props = merge_globals(props, &gt)?;
+                unknown_props(&props, &ty, &["PrimaryKey", "TableName", "SSE", "ProvisionedThroughput"])?;
+                let (pn, pt) = (props["PrimaryKey"]["Name"].clone(), props["PrimaryKey"]["Type"].clone());
+                let (pn, pt) = if props["PrimaryKey"].is_null() {
+                    ("id".into(), "String".into()) // SAM's default primary key
+                } else if pn.is_string() && pt.is_string() {
+                    (pn, pt)
+                } else {
+                    return Err("SimpleTable PrimaryKey needs Name and Type".into());
+                };
+                if !matches!(pt.as_str().unwrap_or(""), "String" | "Number" | "Binary") {
+                    return Err(format!("SimpleTable PrimaryKey Type must be String, Number or Binary, got {}", text(&pt)));
+                }
+                let mut tp = json!({"KeySchema": [{"KeyType": "HASH", "AttributeName": pn}],
+                    "AttributeDefinitions": [{"AttributeName": pn, "AttributeType": pt}]});
+                if props["ProvisionedThroughput"].is_null() {
+                    tp["BillingMode"] = "PAY_PER_REQUEST".into();
+                } else {
+                    tp["ProvisionedThroughput"] = props["ProvisionedThroughput"].clone();
+                }
+                if let Some(n) = props["TableName"].as_str() {
+                    tp["TableName"] = n.into();
+                }
+                if props["SSE"] == true {
+                    tp["SSESpecification"] = json!({"SSEEnabled": true});
+                }
+                insert(&mut out, logical, "AWS::DynamoDB::Table", tp, &def);
+            }
+            "AWS::Serverless::LayerVersion" => {
+                unknown_props(&props, &ty, &["LayerName", "Description", "ContentUri", "CompatibleRuntimes", "LicenseInfo"])?;
+                let cu = props.get("ContentUri").ok_or("AWS::Serverless::LayerVersion needs ContentUri")?;
+                let mut lp = Map::new();
+                lp.insert("Content".into(), sam_code(cu, "ContentUri")?);
+                for k in ["LayerName", "Description", "CompatibleRuntimes", "LicenseInfo"] {
+                    if !props[k].is_null() {
+                        lp.insert(k.into(), props[k].clone());
+                    }
+                }
+                insert(&mut out, logical, "AWS::Lambda::LayerVersion", Value::Object(lp), &def);
+            }
+            _ => {
+                out.insert(logical, def); // a plain CFN type: carried over unchanged
+            }
+        }
+    }
+
+    // Pass 2: the function events become mappings/subscriptions/routes/methods/rules.
+    for (f, events) in fn_events {
+        for (ev, spec) in events.as_object().cloned().unwrap_or_default() {
+            let ety = spec["Type"].as_str().ok_or("an event needs a Type")?.to_string();
+            let ep = if spec["Properties"].is_null() { json!({}) } else { spec["Properties"].clone() };
+            let id = |suffix: &str| format!("{f}{ev}{suffix}");
+            match ety.as_str() {
+                "Api" => {
+                    unknown_props(&ep, "Api event", &["Path", "Method", "RestApiId"])?;
+                    let path = ep["Path"].as_str().ok_or("Api event needs a Path")?.to_string();
+                    let method = ep["Method"].as_str().unwrap_or("GET").to_uppercase();
+                    if !matches!(method.as_str(), "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD" | "OPTIONS" | "ANY") {
+                        return Err(format!("Api event Method {method} is not a valid HTTP method"));
+                    }
+                    let api_ref = match ep.get("RestApiId") {
+                        Some(v @ Value::Object(_)) => v.clone(),
+                        Some(Value::String(s)) => json!(s),
+                        None => json!({"Ref": "ServerlessRestApi"}),
+                        _ => return Err("RestApiId must be a Ref or an api id".into()),
+                    };
+                    let api_logical = match api_ref.as_object().and_then(|m| m.get("Ref")).and_then(Value::as_str) {
+                        Some(r) => r.to_string(),
+                        None => "ServerlessRestApi".to_string(),
+                    };
+                    let mut parent = json!({"Fn::GetAtt": [api_logical, "RootResourceId"]});
+                    let mut last: Option<String> = None;
+                    for (i, seg) in path.trim_matches('/').split('/').filter(|s| !s.is_empty()).enumerate() {
+                        let rid = id(&format!("Path{i}"));
+                        out.insert(rid.clone(), json!({"Type": "AWS::ApiGateway::Resource", "Properties": {
+                            "RestApiId": api_ref, "ParentId": parent, "PathPart": seg}}));
+                        parent = json!({"Ref": rid});
+                        last = Some(rid);
+                    }
+                    let resource = last.map(|r| json!({"Ref": r})).unwrap_or(parent);
+                    let mid = id("Method");
+                    out.insert(mid.clone(), json!({"Type": "AWS::ApiGateway::Method", "Properties": {
+                        "RestApiId": api_ref, "ResourceId": resource, "HttpMethod": method, "AuthorizationType": "NONE",
+                        "Integration": {"Type": "AWS_PROXY",
+                            "Uri": {"Fn::Sub": format!("arn:aws:apigw:{}:{}::lambda:path/2015-03-31/functions/${{{f}.Arn}}/invocations", *REGION, ACCOUNT)}}}}));
+                    methods.entry(api_logical).or_default().push(mid);
+                    out.insert(id("Permission"), json!({"Type": "AWS::Lambda::Permission", "Properties": {
+                        "Action": "lambda:InvokeFunction", "FunctionName": {"Ref": f}, "Principal": "apigateway.amazonaws.com"}}));
+                }
+                "HttpApi" => {
+                    unknown_props(&ep, "HttpApi event", &["Path", "Method", "ApiId"])?;
+                    let api_ref = match ep.get("ApiId") {
+                        Some(v @ Value::Object(_)) => v.clone(),
+                        Some(Value::String(s)) => json!(s),
+                        None => json!({"Ref": "ServerlessHttpApi"}),
+                        _ => return Err("ApiId must be a Ref or an api id".into()),
+                    };
+                    let api_logical = match api_ref.as_object().and_then(|m| m.get("Ref")).and_then(Value::as_str) {
+                        Some(r) => r.to_string(),
+                        None => "ServerlessHttpApi".to_string(),
+                    };
+                    http_apis.insert(api_logical);
+                    let route_key = match (ep["Path"].as_str(), ep["Method"].as_str()) {
+                        (Some(p), Some(m)) => format!("{} {}", m.to_uppercase(), p),
+                        (Some(p), None) => format!("ANY {p}"),
+                        (None, _) => "$default".to_string(),
+                    };
+                    let iid = id("Integration");
+                    out.insert(iid.clone(), json!({"Type": "AWS::ApiGatewayV2::Integration", "Properties": {
+                        "ApiId": api_ref, "IntegrationType": "AWS_PROXY",
+                        "IntegrationUri": {"Fn::GetAtt": [f, "Arn"]}, "PayloadFormatVersion": "2.0"}}));
+                    out.insert(id("Route"), json!({"Type": "AWS::ApiGatewayV2::Route", "Properties": {
+                        "ApiId": api_ref, "RouteKey": route_key,
+                        "Target": {"Fn::Join": ["/", ["integrations", {"Ref": iid}]]}}}));
+                }
+                "SQS" | "Kinesis" | "DynamoDB" => {
+                    let src = if ety == "SQS" { "Queue" } else if ety == "Kinesis" { "Stream" } else { "Stream" };
+                    let known: &[&str] = if ety == "DynamoDB" {
+                        &["Stream", "StartingPosition", "BatchSize", "Enabled", "MaximumBatchingWindowInSeconds"]
+                    } else {
+                        &[src, "StartingPosition", "BatchSize", "Enabled", "MaximumBatchingWindowInSeconds", "BisectBatchOnFunctionError"]
+                    };
+                    unknown_props(&ep, &format!("{ety} event"), known)?;
+                    let raw = ep.get(src).ok_or(format!("{ety} event needs {src}"))?;
+                    // Ref of a queue/stream resource is a URL or name; the mapping needs the ARN.
+                    let arn = match raw {
+                        Value::Object(m) if m.len() == 1 && m.contains_key("Ref") => json!({"Fn::GetAtt": [m["Ref"].clone(), "Arn"]}),
+                        v => v.clone(),
+                    };
+                    if ety != "SQS" && ep["StartingPosition"].is_null() {
+                        return Err(format!("{ety} event needs StartingPosition"));
+                    }
+                    let mut mp = json!({"FunctionName": {"Ref": f}, "EventSourceArn": arn});
+                    for k in ["StartingPosition", "BatchSize", "Enabled", "MaximumBatchingWindowInSeconds", "BisectBatchOnFunctionError"] {
+                        if !ep[k].is_null() {
+                            mp[k] = ep[k].clone();
+                        }
+                    }
+                    out.insert(id("Mapping"), json!({"Type": "AWS::Lambda::EventSourceMapping", "Properties": mp}));
+                }
+                "SNS" => {
+                    unknown_props(&ep, "SNS event", &["Topic", "FilterPolicy", "RawMessageDelivery"])?;
+                    let topic = ep.get("Topic").ok_or("SNS event needs Topic")?.clone();
+                    let mut sp = json!({"TopicArn": topic, "Protocol": "lambda", "Endpoint": {"Fn::GetAtt": [f, "Arn"]}});
+                    for k in ["FilterPolicy", "RawMessageDelivery"] {
+                        if !ep[k].is_null() {
+                            sp[k] = ep[k].clone();
+                        }
+                    }
+                    out.insert(id("Subscription"), json!({"Type": "AWS::SNS::Subscription", "Properties": sp}));
+                }
+                "Schedule" => {
+                    unknown_props(&ep, "Schedule event", &["Schedule", "Input", "Name", "Description", "Enabled"])?;
+                    let sched = ep["Schedule"].as_str().ok_or("Schedule event needs a Schedule expression")?.to_string();
+                    let mut target = json!({"Id": format!("{f}{ev}"), "Arn": {"Fn::GetAtt": [f, "Arn"]}});
+                    if let Some(i) = ep["Input"].as_str() {
+                        target["Input"] = i.into();
+                    }
+                    let mut rp = json!({"ScheduleExpression": sched,
+                        "State": if ep["Enabled"] == false { "DISABLED" } else { "ENABLED" }, "Targets": [target]});
+                    if let Some(n) = ep["Name"].as_str() {
+                        rp["Name"] = n.into();
+                    }
+                    if let Some(d) = ep["Description"].as_str() {
+                        rp["Description"] = d.into();
+                    }
+                    out.insert(id("Rule"), json!({"Type": "AWS::Events::Rule", "Properties": rp}));
+                }
+                other => return Err(format!("Event type {other} is not supported locally")),
+            }
+        }
+    }
+
+    // Pass 3: the implicit API (if any Api event had no RestApiId) and every deployment+stage.
+    if methods.contains_key("ServerlessRestApi") {
+        out.insert("ServerlessRestApi".into(), json!({"Type": "AWS::ApiGateway::RestApi", "Properties": {"Name": "ServerlessRestApi"}}));
+        api_stages.insert("ServerlessRestApi".into(), "Prod".into());
+    }
+    for logical in &http_apis {
+        if !out.contains_key(logical) {
+            out.insert(logical.clone(), json!({"Type": "AWS::ApiGatewayV2::Api", "Properties": {"Name": logical, "StageName": "$default"}}));
+        }
+    }
+    for (api, stage) in api_stages {
+        let mids = methods.get(&api).cloned().unwrap_or_default();
+        let dep = format!("{api}Deployment");
+        out.insert(dep.clone(), json!({"Type": "AWS::ApiGateway::Deployment", "DependsOn": mids, "Properties": {"RestApiId": {"Ref": api}}}));
+        out.insert(format!("{api}Stage"), json!({"Type": "AWS::ApiGateway::Stage", "Properties": {
+            "RestApiId": {"Ref": api}, "StageName": stage, "DeploymentId": {"Ref": dep}}}));
+    }
+    t["Resources"] = Value::Object(out);
+    Ok(())
 }
 
 fn text(v: &Value) -> String {
@@ -480,7 +896,11 @@ async fn create(app: &Arc<App>, stack: &str, logical: &str, ty: &str, p: &Value)
             let mut req = p.clone();
             req["TableName"] = n.clone().into();
             api(crate::ddb::handle(app, "CreateTable", req.to_string().as_bytes()))?;
-            (n.clone(), attrs(vec![("Arn", arn("dynamodb", &format!("table/{n}")).into())]))
+            let mut a = vec![("Arn", arn("dynamodb", &format!("table/{n}")).into())];
+            if !p["StreamSpecification"]["StreamViewType"].is_null() {
+                a.push(("StreamArn", json!(arn("dynamodb", &format!("table/{n}/stream/2026-11-26T00:00:00.000")))));
+            }
+            (n.clone(), attrs(a))
         }
         "AWS::IAM::Role" => {
             let n = name("RoleName", 64, false);
@@ -579,6 +999,49 @@ async fn create(app: &Arc<App>, stack: &str, logical: &str, ty: &str, p: &Value)
             (stage, Map::new())
         }
         "AWS::Lambda::Permission" => (uuid::Uuid::new_v4().to_string(), Map::new()),
+        "AWS::Lambda::LayerVersion" => {
+            // SAM::LayerVersion Content is a local-S3 object; the API only takes the zip inline.
+            let n = name("LayerName", 64, false);
+            let obj = app.s3.lock().unwrap().object(&s(&p["Content"]["S3Bucket"]), &crate::s3::pct_decode(&s(&p["Content"]["S3Key"])))
+                .ok_or("layer Content S3 object not found")?;
+            let mut req = json!({"Content": {"ZipFile": crate::b64(&obj)}});
+            for k in ["CompatibleRuntimes", "Description", "LicenseInfo"] {
+                if !p[k].is_null() {
+                    req[k] = p[k].clone();
+                }
+            }
+            let r = lambda_call(app, "PublishLayerVersion", &format!("/layers/{n}/versions"), req).await?;
+            let a = s(&r["LayerVersionArn"]);
+            (a.clone(), attrs(vec![("LayerVersionArn", a.into())]))
+        }
+        // HTTP API (V2) SAM target types; the control plane is called in-process.
+        "AWS::ApiGatewayV2::Api" => {
+            let n = name("Name", 64, false);
+            let mut gw = app.apigw.lock().unwrap();
+            let (_, r) = api(gw.handle("POST", "apis", &json!({"name": n})))?;
+            let id = s(&r["apiId"]);
+            if let Some(c) = p["CorsConfiguration"].as_object() {
+                api(gw.handle("PUT", &format!("apis/{id}/cors"), &Value::Object(c.clone())))?;
+            }
+            let stage = p["StageName"].as_str().unwrap_or("$default");
+            api(gw.handle("POST", &format!("apis/{id}/stages"), &json!({"stageName": stage, "autoDeploy": true})))?;
+            let url = json!(format!("{}/_api/{id}", crate::endpoint()));
+            (id.clone(), attrs(vec![("ApiId", id.into()), ("ApiEndpoint", url)]))
+        }
+        "AWS::ApiGatewayV2::Integration" => {
+            let api_id = s(&p["ApiId"]);
+            let r = api(app.apigw.lock().unwrap().handle("POST", &format!("apis/{api_id}/integrations"),
+                &json!({"integrationType": p["IntegrationType"], "integrationUri": p["IntegrationUri"], "payloadFormatVersion": p["PayloadFormatVersion"]})))?.1;
+            let iid = s(&r["integrationId"]);
+            (iid.clone(), attrs(vec![("IntegrationId", iid.into()), ("ApiId", api_id.into())]))
+        }
+        "AWS::ApiGatewayV2::Route" => {
+            let api_id = s(&p["ApiId"]);
+            let r = api(app.apigw.lock().unwrap().handle("POST", &format!("apis/{api_id}/routes"),
+                &json!({"routeKey": p["RouteKey"], "target": p["Target"], "authorizationType": "NONE"})))?.1;
+            let rid = s(&r["routeId"]);
+            (rid.clone(), attrs(vec![("RouteId", rid.into()), ("ApiId", api_id.into())]))
+        }
         "AWS::Lambda::EventSourceMapping" => {
             let r = lambda_call(app, "CreateEventSourceMapping", "/event-source-mappings", p.clone()).await?;
             (s(&r["UUID"]), Map::new())
@@ -656,6 +1119,21 @@ async fn delete(app: &Arc<App>, r: &Res) -> Result<(), String> {
     let p = &r.phys;
     match r.ty.as_str() {
         "AWS::CloudFormation::Stack" => nested_delete(app, p).await,
+        "AWS::ApiGatewayV2::Api" => api(app.apigw.lock().unwrap().handle("DELETE", &format!("apis/{p}"), &json!({}))).map(drop),
+        "AWS::ApiGatewayV2::Integration" | "AWS::ApiGatewayV2::Route" => {
+            let api_id = s(&r.attrs["ApiId"]);
+            let kind = if r.ty.ends_with("Route") { "routes" } else { "integrations" };
+            api(app.apigw.lock().unwrap().handle("DELETE", &format!("apis/{api_id}/{kind}/{p}"), &json!({}))).map(drop)
+        }
+        "AWS::Lambda::LayerVersion" => {
+            // phys is the layer version ARN: arn:aws:lambda:region:account:layer:{name}:{version}
+            let parts: Vec<&str> = p.rsplitn(3, ':').collect();
+            if parts.len() == 3 {
+                lambda_call(app, "DeleteLayerVersion", &format!("/layers/{}/versions/{}", parts[1], parts[0]), json!({})).await.map(drop)
+            } else {
+                Err("malformed layer version arn".into())
+            }
+        }
         "AWS::S3::Bucket" => s3_call(app, Method::DELETE, &format!("/{p}")).await,
         "AWS::SQS::Queue" => api(crate::sqs::handle(app, "DeleteQueue", json!({"QueueUrl": p}).to_string().as_bytes(), "local").await).map(drop),
         "AWS::SNS::Topic" => api(app.sns.lock().unwrap().handle(&q(&[("Action", "DeleteTopic".into()), ("TopicArn", p.clone())]))).map(drop),
@@ -796,7 +1274,7 @@ async fn deploy(app: &Arc<App>, name: &str, update: bool) {
          c.stacks.values().flat_map(|s| s.exports.iter().map(|(_, n, v)| (n.clone(), v.clone()))).collect::<HashMap<String, String>>(), st.exports.clone())
     };
     let (prefix, done, rollback) = if update { ("UPDATE", "UPDATE_COMPLETE", "UPDATE_ROLLBACK_COMPLETE") } else { ("CREATE", "CREATE_COMPLETE", "ROLLBACK_COMPLETE") };
-    let t = match parse(&template) {
+    let t = match parse_sam(&template) {
         Ok(t) => t,
         Err(e) => return set_status(app, name, rollback, &e.msg),
     };
@@ -980,7 +1458,7 @@ impl Cfn {
                     return Err(err("AlreadyExistsException", format!("Stack [{n}] already exists")));
                 }
                 let body = p("TemplateBody").map_err(|_| err("ValidationError", "TemplateBody is required (TemplateURL is not supported locally)"))?;
-                let t = parse(&body)?;
+                let t = parse_sam(&body)?;
                 order(&t).map_err(|e| err("ValidationError", e))?;
                 let id = format!("arn:aws:cloudformation:{}:{ACCOUNT}:stack/{n}/{}", *REGION, uuid::Uuid::new_v4());
                 self.stacks.insert(n.clone(), Stack { id: id.clone(), status: "CREATE_IN_PROGRESS".into(), reason: String::new(), created: chrono::Utc::now().to_rfc3339(),
@@ -993,7 +1471,7 @@ impl Cfn {
                     return Err(err("ValidationError", format!("Stack:{} is in {} state and can not be updated.", s.id, s.status)));
                 }
                 let body = if qs.get("UsePreviousTemplate").is_some_and(|v| v == "true") { s.template.clone() } else { p("TemplateBody")? };
-                parse(&body)?;
+                parse_sam(&body)?;
                 let mut new_params = params();
                 for (k, v) in &mut new_params {
                     if qs.iter().any(|(qk, qv)| qk.ends_with("UsePreviousValue") && qv == "true" && qs.get(&qk.replace("UsePreviousValue", "ParameterKey")) == Some(k)) {
@@ -1054,10 +1532,15 @@ impl Cfn {
             }
             "GetTemplate" => {
                 let (_, s) = self.find(&p("StackName")?)?;
-                (json!({"TemplateBody": s.template}), None)
+                let body = if qs.get("TemplateStage").is_some_and(|v| v == "Processed") {
+                    parse_sam(&s.template)?.to_string() // the SAM-expanded view of what was deployed
+                } else {
+                    s.template.clone()
+                };
+                (json!({"TemplateBody": body}), None)
             }
             "ValidateTemplate" => {
-                let t = parse(&p("TemplateBody")?)?;
+                let t = parse_sam(&p("TemplateBody")?)?;
                 order(&t).map_err(|e| err("ValidationError", e))?;
                 let ps: Vec<Value> = t["Parameters"].as_object().into_iter().flatten()
                     .map(|(k, d)| json!({"ParameterKey": k, "DefaultValue": d["Default"].as_str(), "NoEcho": d["NoEcho"] == true, "Description": d["Description"]})).collect();
@@ -1094,6 +1577,80 @@ impl Cfn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sam_transform_expands_function_and_events() {
+        let body = r#"
+Transform: AWS::Serverless-2016-10-31
+Globals:
+  Function:
+    Timeout: 5
+    Environment:
+      Variables:
+        FromGlobals: "1"
+Resources:
+  Fn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: s3://b/hello.zip
+      Handler: app.h
+      Runtime: python3.12
+      Policies: AmazonDynamoDBFullAccess
+      Events:
+        Api1: {Type: Api, Properties: {Path: /hello, Method: get}}
+        Sqs1: {Type: SQS, Properties: {Queue: !GetAtt Q.Arn, BatchSize: 5}}
+  Q:
+    Type: AWS::SQS::Queue
+  T:
+    Type: AWS::Serverless::SimpleTable
+    Properties: {PrimaryKey: {Name: pk, Type: Number}, SSE: true}
+  H:
+    Type: AWS::Serverless::HttpApi
+  L:
+    Type: AWS::Serverless::LayerVersion
+    Properties: {ContentUri: s3://b/layer.zip}
+"#;
+        let t = parse_sam(body).unwrap();
+        assert!(t.get("Transform").is_none() && t.get("Globals").is_none());
+        assert_eq!(t["Resources"]["Fn"]["Type"], "AWS::Lambda::Function");
+        let f = &t["Resources"]["Fn"]["Properties"];
+        assert_eq!(f["Timeout"], 5); // from Globals
+        assert_eq!(f["Environment"]["Variables"]["FromGlobals"], "1");
+        assert_eq!(f["Code"]["S3Bucket"], "b");
+        assert_eq!(f["Code"]["S3Key"], "hello.zip");
+        assert_eq!(f["Role"], json!({"Fn::GetAtt": ["FnRole", "Arn"]}));
+        assert_eq!(t["Resources"]["FnRole"]["Properties"]["ManagedPolicyArns"], json!(["AmazonDynamoDBFullAccess"]));
+        assert_eq!(t["Resources"]["FnApi1Method"]["Type"], "AWS::ApiGateway::Method");
+        assert_eq!(t["Resources"]["FnApi1Method"]["Properties"]["Integration"]["Uri"],
+            json!({"Fn::Sub": format!("arn:aws:apigw:{}:{}::lambda:path/2015-03-31/functions/${{Fn.Arn}}/invocations", *REGION, ACCOUNT)}));
+        assert_eq!(t["Resources"]["ServerlessRestApi"]["Type"], "AWS::ApiGateway::RestApi");
+        assert_eq!(t["Resources"]["ServerlessRestApiDeployment"]["DependsOn"], json!(["FnApi1Method"]));
+        assert_eq!(t["Resources"]["ServerlessRestApiStage"]["Properties"]["StageName"], "Prod");
+        assert_eq!(t["Resources"]["FnSqs1Mapping"]["Type"], "AWS::Lambda::EventSourceMapping");
+        assert_eq!(t["Resources"]["FnSqs1Mapping"]["Properties"]["EventSourceArn"], json!({"Fn::GetAtt": ["Q", "Arn"]}));
+        assert_eq!(t["Resources"]["T"]["Type"], "AWS::DynamoDB::Table");
+        assert_eq!(t["Resources"]["T"]["Properties"]["BillingMode"], "PAY_PER_REQUEST");
+        assert_eq!(t["Resources"]["T"]["Properties"]["KeySchema"], json!([{"KeyType": "HASH", "AttributeName": "pk"}]));
+        assert_eq!(t["Resources"]["H"]["Type"], "AWS::ApiGatewayV2::Api");
+        assert_eq!(t["Resources"]["H"]["Properties"]["StageName"], "$default");
+        assert_eq!(t["Resources"]["L"]["Type"], "AWS::Lambda::LayerVersion");
+        // deployment after the method it snapshots
+        let o = order(&t).unwrap();
+        assert!(o.iter().position(|x| x == "Fn").unwrap() < o.iter().position(|x| x == "FnApi1Method").unwrap());
+        assert!(o.iter().position(|x| x == "FnApi1Method").unwrap() < o.iter().position(|x| x == "ServerlessRestApiDeployment").unwrap());
+    }
+
+    #[test]
+    fn sam_transform_rejects_unknown() {
+        let mk = |p: &str| format!("Transform: AWS::Serverless-2016-10-31\nResources:\n  F:\n    Type: AWS::Serverless::Function\n    Properties: {{CodeUri: s3://b/z, Handler: a.b, Runtime: python3.12{p}}}\n");
+        assert!(parse_sam(&mk(", Tracing: Active")).unwrap_err().msg.contains("Tracing"));
+        assert!(parse_sam(&mk(", Events: {X: {Type: KinesisFirehose, Properties: {}}}")).unwrap_err().msg.contains("KinesisFirehose"));
+        assert!(parse_sam("Transform: AWS::Serverless-2016-10-31\nResources:\n  F:\n    Type: AWS::Serverless::Function\n    Properties: {Handler: a.b, Runtime: python3.12}\n").unwrap_err().msg.contains("CodeUri"));
+        assert!(parse_sam("Transform: AWS::SomethingElse\nResources:\n  A:\n    Type: AWS::S3::Bucket\n").unwrap_err().msg.contains("AWS::SomethingElse"));
+        // an unsatisfied Kinesis event needs StartingPosition
+        let bad = "Transform: AWS::Serverless-2016-10-31\nResources:\n  F:\n    Type: AWS::Serverless::Function\n    Properties: {CodeUri: s3://b/z, Handler: a.b, Runtime: python3.12, Events: {X: {Type: Kinesis, Properties: {Stream: arn:x}}}}\n";
+        assert!(parse_sam(bad).unwrap_err().msg.contains("StartingPosition"));
+    }
 
     #[test]
     fn yaml_tags_and_order() {

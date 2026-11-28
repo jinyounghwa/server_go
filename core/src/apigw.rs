@@ -1059,7 +1059,7 @@ impl ApiGw {
         while let Some((rid, at, params)) = queue.pop() {
             let r = snap.get(&rid)?;
             if at == segs.len() {
-                if r.methods.contains_key(method) {
+                if r.methods.contains_key(method) || r.methods.keys().any(|m| m == "ANY") {
                     found = Some((rid, params));
                     break;
                 }

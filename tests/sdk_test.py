@@ -3896,6 +3896,170 @@ Outputs:
         cf.delete_stack(StackName=n)
 
 
+SAM_APP = r"""
+import os
+def handler(event, ctx):
+    if "httpMethod" in event:
+        return {"statusCode": 200, "headers": {"content-type": "text/plain"}, "body": "api:" + event["path"]}
+    for r in event.get("Records", []):
+        with open("/tmp/samrecv-" + os.environ["RUNTAG"], "a") as f:
+            f.write(r["body"] + "\n")
+    return {"ok": True}
+"""
+
+SAM_TPL = """
+Transform: AWS::Serverless-2016-10-31
+Globals:
+  Function:
+    Timeout: 20
+    Environment:
+      Variables:
+        RUNTAG: @RUN@
+Resources:
+  HelloWorldFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: s3://@BUCKET@/hello.zip
+      Handler: app.handler
+      Runtime: python3.12
+      Architectures: [x86_64]
+      Events:
+        HelloWorld:
+          Type: Api
+          Properties: {Path: /hello, Method: get}
+        OnQueue:
+          Type: SQS
+          Properties: {Queue: !GetAtt MsgQueue.Arn, BatchSize: 10}
+  MsgQueue:
+    Type: AWS::SQS::Queue
+  Table:
+    Type: AWS::Serverless::SimpleTable
+    Properties: {PrimaryKey: {Name: pk, Type: String}}
+  MyHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties: {StageName: prod}
+  HFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      InlineCode: |
+        def handler(event, ctx):
+            return {"statusCode": 200, "body": "v2:" + event["rawPath"]}
+      Handler: index.handler
+      Runtime: python3.12
+      Events:
+        Default:
+          Type: HttpApi
+          Properties: {ApiId: !Ref MyHttpApi}
+  L:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      ContentUri: s3://@BUCKET@/layer.zip
+      CompatibleRuntimes: [python3.12]
+Outputs:
+  ApiId:
+    Value: !Ref ServerlessRestApi
+  FnArn:
+    Value: !GetAtt HelloWorldFunction.Arn
+  QueueUrl:
+    Value: !Ref MsgQueue
+  HttpApiId:
+    Value: !Ref MyHttpApi
+  LayerArn:
+    Value: !Ref L
+"""
+
+
+def test_cfn_sam():
+    import urllib.request
+    cf, s3, sqs, ddb, lam = (boto3.client(n, **kw) for n in ("cloudformation", "s3", "sqs", "dynamodb", "lambda"))
+    base, bucket = f"sam{run}", f"sam-cfn-{run}"
+    s3.create_bucket(Bucket=bucket)
+    recv = f"/tmp/samrecv-{run}"
+    if os.path.exists(recv):
+        os.remove(recv)
+    s3.put_object(Bucket=bucket, Key="hello.zip", Body=zipped({"app.py": SAM_APP}))
+    s3.put_object(Bucket=bucket, Key="layer.zip", Body=zipped({"helper/mod.py": "X = 1\n"}))
+
+    def wait(target, stack):
+        for _ in range(600):
+            st = cf.describe_stacks(StackName=stack)["Stacks"][0]
+            if not st["StackStatus"].endswith("_IN_PROGRESS"):
+                assert st["StackStatus"] == target, (st["StackStatus"], st.get("StackStatusReason"))
+                return st
+            time.sleep(0.1)
+        raise AssertionError("stack never settled")
+
+    stack = f"{base}-stack"
+    cf.create_stack(StackName=stack, TemplateBody=SAM_TPL.replace("@BUCKET@", bucket).replace("@RUN@", run))
+    st = wait("CREATE_COMPLETE", stack)
+    out = {o["OutputKey"]: o["OutputValue"] for o in st.get("Outputs", [])}
+
+    # the original template is kept; TemplateStage=Processed shows the expansion
+    assert "Transform" in cf.get_template(StackName=stack)["TemplateBody"]
+    processed = cf.get_template(StackName=stack, TemplateStage="Processed")["TemplateBody"]
+    if not isinstance(processed, str):
+        processed = json.dumps(processed)  # newer botocore parses the JSON body into a map
+    assert "AWS::Lambda::Function" in processed and "AWS::Serverless::Function" not in processed
+    assert "ServerlessRestApi" in processed and "AWS::ApiGatewayV2::Api" in processed
+
+    # REST v1 (v1 Api event) through the implicit ServerlessRestApi, stage Prod
+    r = urllib.request.urlopen(urllib.request.Request(f"{EP}/_restapi/{out['ApiId']}/Prod/hello"), timeout=30)
+    assert r.read() == b"api:/hello"
+    # HTTP API (v2 HttpApi event) through the $default route on a named stage
+    r = urllib.request.urlopen(f"{EP}/_api/{out['HttpApiId']}/prod/anything", timeout=30)
+    assert r.read().decode().startswith("v2:")
+
+    # SQS event: the message reaches the handler (it appends to the marker file)
+    sqs.send_message(QueueUrl=out["QueueUrl"], MessageBody="ping-sam")
+    for _ in range(300):
+        if os.path.exists(recv) and "ping-sam" in open(recv).read():
+            break
+        time.sleep(0.1)
+    else:
+        raise AssertionError("SQS event never reached the function")
+    os.remove(recv)
+
+    # SimpleTable -> PAY_PER_REQUEST DynamoDB table with the single pk key
+    tname = next(r["PhysicalResourceId"] for r in cf.list_stack_resources(StackName=stack)["StackResourceSummaries"]
+                 if r["ResourceType"] == "AWS::DynamoDB::Table")
+    d = ddb.describe_table(TableName=tname)["Table"]
+    assert d["BillingModeSummary"]["BillingMode"] == "PAY_PER_REQUEST"
+    assert d["KeySchema"] == [{"KeyType": "HASH", "AttributeName": "pk"}]
+
+    # the layer version was published from the S3 zip
+    lname = out["LayerArn"].split(":layer:")[1].rsplit(":", 1)[0]
+    assert len(lam.list_layer_versions(LayerName=lname)["LayerVersions"]) == 1
+
+    # unknown SAM properties are refused, not silently mimicked
+    assert code(cf.create_stack, StackName=f"{base}-bad",
+                TemplateBody="Transform: AWS::Serverless-2016-10-31\nResources:\n  F:\n    Type: AWS::Serverless::Function\n"
+                             "    Properties: {CodeUri: s3://b/k, Handler: a.b, Runtime: python3.12, Tracing: Active}\n") == "ValidationError"
+    assert code(cf.create_stack, StackName=f"{base}-bad2",
+                TemplateBody="Transform: AWS::Serverless-2016-10-31\nResources:\n  F:\n    Type: AWS::Serverless::Function\n"
+                             "    Properties: {CodeUri: s3://b/k, Handler: a.b, Runtime: python3.12, Events: {X: {Type: Stream, Properties: {}}}}\n") == "ValidationError"
+
+    cf.delete_stack(StackName=stack)
+    for _ in range(600):
+        if not any(s["StackName"] == stack for s in cf.list_stacks()["StackSummaries"]):
+            break
+        time.sleep(0.1)
+    else:
+        raise AssertionError("SAM stack left behind")
+    assert code(lam.get_function, FunctionName=out["FnArn"].rsplit(":", 1)[1]) == "ResourceNotFoundException"
+    try:
+        assert not lam.list_layer_versions(LayerName=lname)["LayerVersions"]
+    except ClientError:
+        pass  # the layer itself is gone too
+    for n in (f"{base}-bad", f"{base}-bad2"):
+        try:
+            cf.delete_stack(StackName=n)
+        except ClientError:
+            pass
+    for b in s3.list_objects(Bucket=bucket).get("Contents", []):
+        s3.delete_object(Bucket=bucket, Key=b["Key"])
+    s3.delete_bucket(Bucket=bucket)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
