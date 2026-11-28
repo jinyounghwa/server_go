@@ -458,7 +458,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - 끝나면 남은 컨테이너가 0개여야 한다.
   - 이미지 크기와 첫 호출 시간을 보고에 적는다.
 
-## 28일차 (2026-12-22): Cognito MFA (TOTP)
+## 28일차 (2026-12-22): Cognito MFA (TOTP) — ✅ 완료 (`3a1ca56`): Associate/VerifySoftwareToken(토큰·admin), SetUserMFAPreference·SetUserPoolMfaConfig(OFF·OPTIONAL·ON), 로그인 `SOFTWARE_TOKEN_MFA` 챌린지·±1 윈도·세션 유지 재시도, HMAC-SHA1(손구현 SHA-1)·RFC 6238 벡터 단위 테스트, States.Hash SHA-1 통일, botocore 무서명 토큰 연산 COGNITO_PUBLIC 추가, 단위/boto3(53/56)·두 모드 통과
 - 연산: `AssociateSoftwareToken`, `VerifySoftwareToken`, `SetUserMFAPreference`, `AdminSetUserMFAPreference`, `SetUserPoolMfaConfig`(OFF·OPTIONAL·ON)
 - 로그인할 때 `SOFTWARE_TOKEN_MFA` 챌린지를 내고 `RespondToAuthChallenge`로 답을 받는다.
 - **TOTP에는 HMAC-SHA1이 필요하다.** SHA-1을 짧게 직접 짠다(약 40줄). `sfn.rs`의 `States.Hash` SHA-1도 같은 함수로 열고, 288행 주석을 고친다. RFC 6238 테스트 벡터로 검증한다.
