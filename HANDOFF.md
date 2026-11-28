@@ -485,7 +485,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - 질문과 답 방식의 사용자 정의 챌린지 3단계 흐름이 되어야 한다.
   - 틀린 답 세 번이면 실패해야 한다.
 
-## 31일차 (2026-12-25): Cognito 호스팅 UI·OAuth2 (로컬만)
+## 31일차 (2026-12-25): Cognito 호스팅 UI·OAuth2 (로컬만) — ✅ 완료: authorize→login(CSRF 1회용 토큰·Origin 검사)→code(1회용·5분)→token(PKCE S256·refresh·client_credentials+리소스 서버 scope)·userInfo·logout, implicit 거부, id_token이 HTTP API JWT 인가자 통과, 틀린 redirect_uri·코드 재사용·PKCE 불일치 실패, 단위/boto3(56/59)·두 모드 통과·컨테이너 0
 - `/_cognito/{pool}/oauth2/authorize`, `/login`(최소 HTML 폼), `/oauth2/token`, `/oauth2/userInfo`, `/logout`을 넣는다.
 - 지원 흐름은 Authorization code + PKCE(S256)와 `client_credentials`(리소스 서버 scope)다. implicit은 거부한다.
 - **보안 조건:**

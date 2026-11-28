@@ -3,7 +3,8 @@
 // Issuer: {endpoint}/_cognito/{poolId}  (JWKS at /.well-known/jwks.json, discovery at /.well-known/openid-configuration)
 // USER_SRP_AUTH: PASSWORD_VERIFIER over the RFC 5054 3072-bit group, same math as amazon-cognito-identity-js (see srp_* below).
 // CUSTOM_AUTH runs DefineAuthChallenge/CreateAuthChallenge/VerifyAuthChallengeResponse (orchestrated by main.rs).
-// ponytail: no device SRP (DEVICE_SRP_AUTH is refused) or hosted UI/OAuth flows; MFA is software-token TOTP only (no SMS).
+// Hosted UI/OAuth2 (code+PKCE, client_credentials) lives under /_cognito/{pool}/ (see Web below).
+// ponytail: no device SRP (DEVICE_SRP_AUTH is refused); MFA is software-token TOTP only (no SMS).
 // Verification codes are published as events; trigger failures on PostConfirmation/PreToken are best-effort like AWS retries.
 use crate::{b64, epoch, err, need, ApiErr, ACCOUNT, REGION};
 use base64::Engine;
@@ -194,6 +195,7 @@ struct Pool {
     groups: BTreeMap<String, Group>,
     lambda_config: BTreeMap<String, String>, // trigger name -> Lambda function ARN
     mfa: &'static str, // OFF | OPTIONAL | ON (SetUserPoolMfaConfig)
+    resource_servers: BTreeMap<String, Value>, // identifier -> ResourceServer JSON (client_credentials scopes)
 }
 
 // A pending Lambda trigger: main.rs runs the function and applies the result.
@@ -210,6 +212,38 @@ struct Client {
     name: String,
     pool: String,
     secret: Option<String>,
+    oauth: OAuthCfg,
+}
+// Hosted UI / OAuth2 settings of an app client.
+#[derive(Default, Clone)]
+struct OAuthCfg {
+    callbacks: Vec<String>,
+    logouts: Vec<String>,
+    flows: Vec<String>,  // code | client_credentials (implicit is refused)
+    scopes: Vec<String>,
+}
+impl OAuthCfg {
+    fn from(r: &Value, has_secret: bool) -> Result<Self, ApiErr> {
+        let strs = |k: &str| r[k].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>();
+        let c = OAuthCfg { callbacks: strs("CallbackURLs"), logouts: strs("LogoutURLs"), flows: strs("AllowedOAuthFlows"), scopes: strs("AllowedOAuthScopes") };
+        for f in &c.flows {
+            match f.as_str() {
+                "code" => {}
+                "client_credentials" if has_secret => {}
+                "client_credentials" => return Err(e("InvalidOAuthFlowException", "client_credentials flow can not be selected if client does not have a client secret.")),
+                "implicit" => return Err(e("InvalidOAuthFlowException", "implicit flow is not supported locally; use code with PKCE")),
+                _ => return Err(e("InvalidOAuthFlowException", &format!("Unknown OAuth flow {f}"))),
+            }
+        }
+        Ok(c)
+    }
+    fn json(&self, out: &mut Value) {
+        out["CallbackURLs"] = json!(self.callbacks);
+        out["LogoutURLs"] = json!(self.logouts);
+        out["AllowedOAuthFlows"] = json!(self.flows);
+        out["AllowedOAuthScopes"] = json!(self.scopes);
+        out["AllowedOAuthFlowsUserPoolClient"] = json!(!self.flows.is_empty());
+    }
 }
 
 #[derive(Default)]
@@ -218,6 +252,8 @@ pub struct Cognito {
     clients: BTreeMap<String, Client>,
     refresh: HashMap<String, (String, String, String)>, // token -> (pool, username, client)
     sessions: HashMap<String, (String, String, String)>, // challenge session -> same
+    csrf: HashMap<String, (Authz, f64)>,                // hosted-UI form token -> validated authorize request
+    auth_codes: HashMap<String, (Authz, String, f64)>,  // OAuth code -> (request, user, expiry)
     custom: HashMap<String, CustomState>,               // CUSTOM_CHALLENGE session -> state
     srp: HashMap<String, SrpPending>,                   // SECRET_BLOCK (base64) -> handshake awaiting PASSWORD_VERIFIER
     codes: Vec<(String, String)>,                       // (username, code) to publish as events
@@ -520,13 +556,16 @@ impl Cognito {
 
     // Password check shared by InitiateAuth and AdminInitiateAuth.
     fn password_auth(&mut self, pool: &str, client: &str, name: &str, pw: &str) -> Result<Value, ApiErr> {
+        let uname = self.password_ok(pool, name, pw)?;
+        self.after_password(pool, client, uname)
+    }
+    fn password_ok(&self, pool: &str, name: &str, pw: &str) -> Result<String, ApiErr> {
         let p = &self.pools[pool];
         let uname = p.find(name).ok_or_else(|| e("UserNotFoundException", "User does not exist."))?;
-        let u = &p.users[&uname];
-        if hash_pw(&u.salt, pw) != u.pw {
+        if hash_pw(&p.users[&uname].salt, pw) != p.users[&uname].pw {
             return Err(bad_login());
         }
-        self.after_password(pool, client, uname)
+        Ok(uname)
     }
 
     // What follows a proven password (plain or SRP): status checks, NEW_PASSWORD_REQUIRED, MFA, then tokens.
@@ -616,7 +655,7 @@ impl Cognito {
                 let p = Pool { name: need(r, "PoolName")?.into(), created: epoch(), users: BTreeMap::new(),
                     policy: r["Policies"]["PasswordPolicy"].clone().as_object().map_or(json!({"MinimumLength": 8}), |o| json!(o)),
                     username_attrs: strs("UsernameAttributes"), auto_verified: strs("AutoVerifiedAttributes"),
-                    groups: BTreeMap::new(), lambda_config, mfa };
+                    groups: BTreeMap::new(), lambda_config, mfa, resource_servers: BTreeMap::new() };
                 let out = json!({"UserPool": Self::pool_json(&id, &p)});
                 self.pools.insert(id, p);
                 out
@@ -643,8 +682,10 @@ impl Cognito {
                 self.pools.get(&pool_id).ok_or_else(no_pool)?;
                 let id = uuid::Uuid::new_v4().simple().to_string()[..26].to_string();
                 let secret = (r["GenerateSecret"] == true).then(|| b64(&crate::rand_bytes(36)).replace(['+', '/', '='], "x"));
-                let c = Client { name: need(r, "ClientName")?.into(), pool: pool_id.clone(), secret: secret.clone() };
+                let oauth = OAuthCfg::from(r, secret.is_some())?;
+                let c = Client { name: need(r, "ClientName")?.into(), pool: pool_id.clone(), secret: secret.clone(), oauth };
                 let mut out = json!({"ClientId": id, "ClientName": c.name, "UserPoolId": pool_id, "ExplicitAuthFlows": r["ExplicitAuthFlows"]});
+                c.oauth.json(&mut out);
                 if let Some(s) = secret {
                     out["ClientSecret"] = s.into();
                 }
@@ -657,7 +698,43 @@ impl Cognito {
                 if let Some(s) = &c.secret {
                     out["ClientSecret"] = s.clone().into();
                 }
+                c.oauth.json(&mut out);
                 json!({ "UserPoolClient": out })
+            }
+            "UpdateUserPoolClient" => {
+                let (id, c) = self.client(r)?;
+                let oauth = OAuthCfg::from(r, c.secret.is_some())?;
+                let c = self.clients.get_mut(&id).unwrap();
+                if let Some(n) = r["ClientName"].as_str() {
+                    c.name = n.into();
+                }
+                c.oauth = oauth;
+                let mut out = json!({"ClientId": id, "ClientName": c.name, "UserPoolId": c.pool});
+                c.oauth.json(&mut out);
+                json!({ "UserPoolClient": out })
+            }
+            "CreateResourceServer" | "UpdateResourceServer" => {
+                let p = self.pools.get_mut(&pool_id).ok_or_else(no_pool)?;
+                let id = need(r, "Identifier")?.to_string();
+                if op == "CreateResourceServer" && p.resource_servers.contains_key(&id) {
+                    return Err(e("InvalidParameterException", "A resource server with this identifier already exists."));
+                }
+                if op == "UpdateResourceServer" && !p.resource_servers.contains_key(&id) {
+                    return Err(e("ResourceNotFoundException", "Resource server does not exist."));
+                }
+                let rs = json!({"UserPoolId": pool_id, "Identifier": id, "Name": need(r, "Name")?, "Scopes": r["Scopes"].as_array().cloned().unwrap_or_default()});
+                p.resource_servers.insert(id, rs.clone());
+                json!({"ResourceServer": rs})
+            }
+            "DescribeResourceServer" => {
+                let p = self.pools.get(&pool_id).ok_or_else(no_pool)?;
+                json!({"ResourceServer": p.resource_servers.get(need(r, "Identifier")?).ok_or_else(|| e("ResourceNotFoundException", "Resource server does not exist."))?})
+            }
+            "ListResourceServers" => json!({"ResourceServers": self.pools.get(&pool_id).ok_or_else(no_pool)?.resource_servers.values().collect::<Vec<_>>()}),
+            "DeleteResourceServer" => {
+                let p = self.pools.get_mut(&pool_id).ok_or_else(no_pool)?;
+                p.resource_servers.remove(need(r, "Identifier")?).ok_or_else(|| e("ResourceNotFoundException", "Resource server does not exist."))?;
+                json!({})
             }
             "ListUserPoolClients" => json!({"UserPoolClients": self.clients.iter().filter(|(_, c)| c.pool == pool_id)
                 .map(|(i, c)| json!({"ClientId": i, "ClientName": c.name, "UserPoolId": c.pool})).collect::<Vec<_>>()}),
@@ -1019,11 +1096,233 @@ impl Cognito {
     }
 }
 
+// ---- Hosted UI / OAuth2 (local only): /_cognito/{pool}/oauth2/authorize|token|userInfo, /login, /logout.
+// Authorization code (+PKCE S256) and client_credentials. The login form's CSRF token is a one-time server-side key
+// for the validated authorize request, so the POST carries nothing a cross-site page could forge.
+// ponytail: no hosted-UI session cookie (every authorize shows the form), no MFA/new-password screens, no external IdPs,
+// code-flow access tokens keep the aws.cognito.signin.user.admin scope and PreTokenGeneration is not run for them.
+pub enum Web {
+    Html(u16, String),
+    Redirect(String),
+    Json(u16, Value),
+}
+#[derive(Clone)]
+pub struct Authz {
+    pool: String,
+    client: String,
+    redirect: String,
+    state: Option<String>,
+    scope: String,
+    challenge: Option<String>,
+    nonce: Option<String>,
+}
+pub struct WebReq<'a> {
+    pub method: &'a str,
+    pub page: &'a str,                 // "oauth2/authorize", "login", ...
+    pub raw_query: &'a str,
+    pub q: HashMap<String, String>,    // query (GET) or form body (POST)
+    pub authorization: Option<&'a str>,
+    pub same_origin: bool,             // Origin / Sec-Fetch-Site allow a form POST
+}
+
+fn with_query(url: &str, pairs: &[(&str, &str)]) -> String {
+    let q: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}={}", crate::iam::pct_encode(v))).collect();
+    format!("{url}{}{}", if url.contains('?') { '&' } else { '?' }, q.join("&"))
+}
+fn oauth_err(status: u16, code: &str) -> Web {
+    Web::Json(status, json!({"error": code}))
+}
+fn page(status: u16, body: &str) -> Web {
+    Web::Html(status, format!("<!doctype html><meta charset=utf-8><title>rocalcloud sign in</title>\
+        <style>body{{font:15px system-ui;max-width:22rem;margin:4rem auto}}input,button{{display:block;width:100%;margin:.4rem 0;padding:.5rem}}.e{{color:#b91c1c}}</style>{body}"))
+}
+
+impl Cognito {
+    // Validates an authorize request. Until client_id and redirect_uri check out, errors are shown, never redirected.
+    fn authz_from(&self, pool: &str, q: &HashMap<String, String>) -> Result<Authz, Web> {
+        let g = |k: &str| q.get(k).map(String::as_str).unwrap_or("");
+        let c = self.clients.get(g("client_id")).filter(|c| c.pool == pool).ok_or_else(|| page(400, "<p class=e>Unknown client_id for this user pool.</p>"))?;
+        let redirect = g("redirect_uri");
+        if !c.oauth.callbacks.iter().any(|u| u == redirect) {
+            return Err(page(400, "<p class=e>redirect_uri does not exactly match a CallbackURL of this app client.</p>"));
+        }
+        let state = q.get("state").cloned();
+        let back = |err: &str| {
+            let mut p = vec![("error", err)];
+            if let Some(s) = &state {
+                p.push(("state", s));
+            }
+            Web::Redirect(with_query(redirect, &p))
+        };
+        match g("response_type") {
+            "code" if c.oauth.flows.iter().any(|f| f == "code") => {}
+            "code" => return Err(back("unauthorized_client")),
+            _ => return Err(back("unsupported_response_type")), // implicit (token) is refused locally
+        }
+        let challenge = q.get("code_challenge").cloned();
+        if challenge.is_some() && g("code_challenge_method") != "S256" {
+            return Err(back("invalid_request"));
+        }
+        let scope = if g("scope").is_empty() { c.oauth.scopes.join(" ") } else { g("scope").to_string() };
+        if scope.split(' ').any(|s| !c.oauth.scopes.iter().any(|a| a == s)) {
+            return Err(back("invalid_scope"));
+        }
+        Ok(Authz { pool: pool.into(), client: g("client_id").into(), redirect: redirect.into(), state, scope, challenge, nonce: q.get("nonce").cloned() })
+    }
+
+    fn login_form(&mut self, a: Authz, error: &str) -> Web {
+        let now = epoch();
+        self.csrf.retain(|_, (_, exp)| *exp > now);
+        let token = b64url(&crate::rand_bytes(24));
+        let name = crate::s3::esc(&self.clients[&a.client].name);
+        self.csrf.insert(token.clone(), (a, now + 600.0));
+        let err = if error.is_empty() { String::new() } else { format!("<p class=e>{}</p>", crate::s3::esc(error)) };
+        page(200, &format!("<h1>Sign in</h1><p>{name}</p>{err}<form method=post action=login>\
+            <input type=hidden name=_csrf value=\"{token}\"><input name=username placeholder=Username autocomplete=username required>\
+            <input name=password type=password placeholder=Password autocomplete=current-password required><button>Sign in</button></form>"))
+    }
+
+    pub fn web(&mut self, pool: &str, r: WebReq) -> Web {
+        if !self.pools.contains_key(pool) {
+            return page(404, "<p class=e>User pool does not exist.</p>");
+        }
+        let g = |k: &str| r.q.get(k).map(String::as_str).unwrap_or("");
+        match (r.method, r.page) {
+            ("GET", "oauth2/authorize") => match self.authz_from(pool, &r.q) {
+                Ok(_) => Web::Redirect(format!("/_cognito/{pool}/login?{}", r.raw_query)),
+                Err(w) => w,
+            },
+            ("GET", "login") => match self.authz_from(pool, &r.q) {
+                Ok(a) => self.login_form(a, ""),
+                Err(w) => w,
+            },
+            ("POST", "login") => {
+                if !r.same_origin {
+                    return page(403, "<p class=e>Cross-site sign-in form submissions are refused.</p>");
+                }
+                let Some((a, exp)) = self.csrf.remove(g("_csrf")) else {
+                    return page(403, "<p class=e>This sign-in form expired or was already used. Start again from the app.</p>");
+                };
+                if exp < epoch() || a.pool != pool {
+                    return page(403, "<p class=e>This sign-in form expired. Start again from the app.</p>");
+                }
+                let user = match self.password_ok(pool, g("username"), g("password")) {
+                    Ok(u) => u,
+                    Err(_) => return self.login_form(a, "Incorrect username or password."),
+                };
+                let u = &self.pools[pool].users[&user];
+                let mfa = u.totp.as_ref().is_some_and(|t| t.verified && (self.pools[pool].mfa == "ON" || t.preferred));
+                if !u.enabled || u.status != "CONFIRMED" || mfa {
+                    return self.login_form(a, "This account needs a step the local hosted UI does not offer (confirmation, new password or MFA).");
+                }
+                let code = b64url(&crate::rand_bytes(24));
+                let now = epoch();
+                self.auth_codes.retain(|_, (_, _, exp)| *exp > now);
+                let mut p = vec![("code", code.as_str())];
+                if let Some(s) = &a.state {
+                    p.push(("state", s));
+                }
+                let to = with_query(&a.redirect, &p);
+                self.auth_codes.insert(code.clone(), (a, user, now + 300.0));
+                Web::Redirect(to)
+            }
+            ("POST", "oauth2/token") => self.token_endpoint(pool, &r),
+            ("GET", "oauth2/userInfo") => {
+                let claims = r.authorization.and_then(|h| h.strip_prefix("Bearer ")).and_then(verify).filter(|c| c["token_use"] == "access");
+                let Some(c) = claims else { return oauth_err(401, "invalid_token") };
+                let user = c["username"].as_str().unwrap_or("");
+                let Some(u) = self.pools[pool].users.get(user).filter(|_| c["iss"] == issuer(pool)) else { return oauth_err(401, "invalid_token") };
+                let mut out = json!({"sub": u.sub, "username": user});
+                for (k, v) in &u.attrs {
+                    out[k.as_str()] = if k.ends_with("_verified") { json!(v == "true") } else { json!(v) };
+                }
+                Web::Json(200, out)
+            }
+            ("GET", "logout") => {
+                let ok = self.clients.get(g("client_id")).filter(|c| c.pool == pool).is_some_and(|c| c.oauth.logouts.iter().any(|u| u == g("logout_uri")));
+                if ok { Web::Redirect(g("logout_uri").into()) } else { page(400, "<p class=e>logout_uri does not match a LogoutURL of this app client.</p>") }
+            }
+            _ => page(404, "<p class=e>Not found.</p>"),
+        }
+    }
+
+    fn token_endpoint(&mut self, pool: &str, r: &WebReq) -> Web {
+        let g = |k: &str| r.q.get(k).map(String::as_str).unwrap_or("");
+        // Client authentication: HTTP Basic or client_id (+client_secret) in the body.
+        let basic = r.authorization.and_then(|h| h.strip_prefix("Basic ")).and_then(|b| base64::engine::general_purpose::STANDARD.decode(b.trim()).ok())
+            .and_then(|b| String::from_utf8(b).ok());
+        let (cid, secret) = match &basic {
+            Some(b) => match b.split_once(':') {
+                Some((i, s)) => (crate::s3::pct_decode(i), Some(crate::s3::pct_decode(s))),
+                None => return oauth_err(401, "invalid_client"),
+            },
+            None => (g("client_id").to_string(), r.q.get("client_secret").cloned()),
+        };
+        let Some(c) = self.clients.get(&cid).filter(|c| c.pool == pool) else { return oauth_err(401, "invalid_client") };
+        if c.secret.is_some() && c.secret != secret {
+            return oauth_err(401, "invalid_client");
+        }
+        match g("grant_type") {
+            "authorization_code" => {
+                // One use only: the code is gone whether or not the exchange succeeds.
+                let Some((a, user, exp)) = self.auth_codes.remove(g("code")) else { return oauth_err(400, "invalid_grant") };
+                if exp < epoch() || a.client != cid || a.redirect != g("redirect_uri") || !self.pools[pool].users.contains_key(&user) {
+                    return oauth_err(400, "invalid_grant");
+                }
+                if let Some(ch) = &a.challenge {
+                    if g("code_verifier").is_empty() || b64url(&Sha256::digest(g("code_verifier").as_bytes())) != *ch {
+                        return oauth_err(400, "invalid_grant");
+                    }
+                }
+                let add = a.nonce.as_ref().map(|n| json!({"nonce": n}).as_object().unwrap().clone());
+                let t = self.tokens_inner(pool, &user, &cid, true, add.as_ref(), &[], false);
+                let t = &t["AuthenticationResult"];
+                let mut out = json!({"access_token": t["AccessToken"], "refresh_token": t["RefreshToken"], "expires_in": 3600, "token_type": "Bearer"});
+                if a.scope.split(' ').any(|s| s == "openid") {
+                    out["id_token"] = t["IdToken"].clone();
+                }
+                Web::Json(200, out)
+            }
+            "refresh_token" => {
+                let Some((p, user, client)) = self.refresh.get(g("refresh_token")).cloned() else { return oauth_err(400, "invalid_grant") };
+                if p != pool || client != cid || !self.pools[pool].users.contains_key(&user) {
+                    return oauth_err(400, "invalid_grant");
+                }
+                let t = self.tokens_inner(pool, &user, &cid, false, None, &[], false);
+                let t = &t["AuthenticationResult"];
+                Web::Json(200, json!({"access_token": t["AccessToken"], "id_token": t["IdToken"], "expires_in": 3600, "token_type": "Bearer"}))
+            }
+            "client_credentials" => {
+                if c.secret.is_none() || !c.oauth.flows.iter().any(|f| f == "client_credentials") {
+                    return oauth_err(400, "unauthorized_client");
+                }
+                let scope = if g("scope").is_empty() { c.oauth.scopes.join(" ") } else { g("scope").to_string() };
+                let rs = &self.pools[pool].resource_servers;
+                let known = |s: &str| s.rsplit_once('/').is_some_and(|(id, name)| {
+                    rs.get(id).is_some_and(|v| v["Scopes"].as_array().into_iter().flatten().any(|x| x["ScopeName"] == name))
+                });
+                if scope.is_empty() || scope.split(' ').any(|s| !c.oauth.scopes.iter().any(|a| a == s) || !known(s)) {
+                    return oauth_err(400, "invalid_scope");
+                }
+                let now = epoch().floor();
+                let tok = sign(&json!({"sub": cid, "client_id": cid, "iss": issuer(pool), "token_use": "access", "scope": scope,
+                                        "auth_time": now, "iat": now, "exp": now + 3600.0, "jti": uuid::Uuid::new_v4().to_string()}));
+                Web::Json(200, json!({"access_token": tok, "expires_in": 3600, "token_type": "Bearer"}))
+            }
+            "" => oauth_err(400, "invalid_request"),
+            _ => oauth_err(400, "unsupported_grant_type"),
+        }
+    }
+}
+
 // Discovery document so OIDC/JWT libraries can find the JWKS.
 pub fn openid_config(pool: &str) -> Value {
     let iss = issuer(pool);
     json!({"issuer": iss, "jwks_uri": format!("{iss}/.well-known/jwks.json"), "id_token_signing_alg_values_supported": ["RS256"],
-           "response_types_supported": ["code", "token"], "subject_types_supported": ["public"]})
+           "authorization_endpoint": format!("{iss}/oauth2/authorize"), "token_endpoint": format!("{iss}/oauth2/token"),
+           "userinfo_endpoint": format!("{iss}/oauth2/userInfo"), "end_session_endpoint": format!("{iss}/logout"),
+           "response_types_supported": ["code"], "grant_types_supported": ["authorization_code", "refresh_token", "client_credentials"],
+           "code_challenge_methods_supported": ["S256"], "subject_types_supported": ["public"]})
 }
 
 #[cfg(test)]
@@ -1186,5 +1485,35 @@ mod tests {
         let mut odd = init;
         odd["__rcCustom"] = json!({"define": {"challengeName": "SMS_MFA"}});
         assert_eq!(c.handle("InitiateAuth", &odd).unwrap_err().code, "InvalidLambdaResponseException");
+    }
+
+    // Hosted UI code flow with PKCE: one-time CSRF form token, one-time code, verifier check.
+    #[test]
+    fn oauth_code_pkce() {
+        use super::*;
+        let mut c = Cognito::default();
+        let pool = c.handle("CreateUserPool", &json!({"PoolName": "p"})).unwrap()["UserPool"]["Id"].as_str().unwrap().to_string();
+        let cid = c.handle("CreateUserPoolClient", &json!({"UserPoolId": pool, "ClientName": "spa", "CallbackURLs": ["http://localhost/cb"],
+            "AllowedOAuthFlows": ["code"], "AllowedOAuthScopes": ["openid"]})).unwrap()["UserPoolClient"]["ClientId"].as_str().unwrap().to_string();
+        c.handle("AdminCreateUser", &json!({"UserPoolId": pool, "Username": "o"})).unwrap();
+        c.handle("AdminSetUserPassword", &json!({"UserPoolId": pool, "Username": "o", "Password": "Str0ng!pass", "Permanent": true})).unwrap();
+        let req = |method: &'static str, page: &'static str, kv: &[(&str, &str)], same_origin: bool| WebReq { method, page, raw_query: "", authorization: None, same_origin,
+            q: kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect() };
+        let ch = b64url(&Sha256::digest(b"verifier"));
+        let q = [("response_type", "code"), ("client_id", cid.as_str()), ("redirect_uri", "http://localhost/cb"), ("state", "s"), ("code_challenge", ch.as_str()), ("code_challenge_method", "S256")];
+        assert!(matches!(c.web(&pool, req("GET", "login", &[("client_id", &cid), ("redirect_uri", "http://x/")], true)), Web::Html(400, _)));
+        let Web::Html(200, html) = c.web(&pool, req("GET", "login", &q, true)) else { panic!() };
+        let csrf = html.split("name=_csrf value=\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+        assert!(matches!(c.web(&pool, req("POST", "login", &[("_csrf", &csrf), ("username", "o"), ("password", "Str0ng!pass")], false)), Web::Html(403, _)));
+        // the cross-site attempt above did not consume the token; a same-origin POST does
+        let Web::Redirect(to) = c.web(&pool, req("POST", "login", &[("_csrf", &csrf), ("username", "o"), ("password", "Str0ng!pass")], true)) else { panic!() };
+        assert!(matches!(c.web(&pool, req("POST", "login", &[("_csrf", &csrf), ("username", "o"), ("password", "Str0ng!pass")], true)), Web::Html(403, _)));
+        let code = to.split("code=").nth(1).unwrap().split('&').next().unwrap().to_string();
+        assert!(to.ends_with("&state=s"));
+        let tok = |c: &mut Cognito, v: &str| c.web(&pool, req("POST", "oauth2/token", &[("grant_type", "authorization_code"), ("client_id", &cid),
+            ("redirect_uri", "http://localhost/cb"), ("code", &code), ("code_verifier", v)], true));
+        assert!(matches!(tok(&mut c, "wrong"), Web::Json(400, _)));
+        // the failed exchange burned the code
+        assert!(matches!(tok(&mut c, "verifier"), Web::Json(400, _)));
     }
 }

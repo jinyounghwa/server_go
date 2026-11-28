@@ -3706,6 +3706,117 @@ def test_cognito_custom_auth():
     idp.admin_create_user(UserPoolId=pool2, Username="quiz")
     assert code(idp.initiate_auth, ClientId=cid2, AuthFlow="CUSTOM_AUTH", AuthParameters={"USERNAME": "quiz"}) == "InvalidParameterException"
 
+def test_cognito_hosted_ui_oauth():
+    import base64, hashlib, re, urllib.parse, urllib.request, urllib.error
+    idp, gw, lam = boto3.client("cognito-idp", **kw), boto3.client("apigatewayv2", **kw), boto3.client("lambda", **kw)
+    p = f"oau{run}"
+    cb, out_url = "http://localhost:3000/cb", "http://localhost:3000/bye"
+    pool = idp.create_user_pool(PoolName=p)["UserPool"]["Id"]
+    web = f"{EP}/_cognito/{pool}"
+    cid = idp.create_user_pool_client(UserPoolId=pool, ClientName="spa", CallbackURLs=[cb], LogoutURLs=[out_url], AllowedOAuthFlows=["code"],
+                                      AllowedOAuthScopes=["openid", "email"], AllowedOAuthFlowsUserPoolClient=True)["UserPoolClient"]["ClientId"]
+    assert idp.describe_user_pool_client(UserPoolId=pool, ClientId=cid)["UserPoolClient"]["CallbackURLs"] == [cb]
+    assert code(idp.create_user_pool_client, UserPoolId=pool, ClientName="old", CallbackURLs=[cb], AllowedOAuthFlows=["implicit"],
+                AllowedOAuthScopes=["openid"], AllowedOAuthFlowsUserPoolClient=True) == "InvalidOAuthFlowException"
+    idp.admin_create_user(UserPoolId=pool, Username="olive", UserAttributes=[{"Name": "email", "Value": f"{p}@example.com"}])
+    idp.admin_set_user_password(UserPoolId=pool, Username="olive", Password="Str0ng!pass", Permanent=True)
+    assert json.load(urllib.request.urlopen(f"{web}/.well-known/openid-configuration"))["token_endpoint"] == f"{web}/oauth2/token"
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+    opener = urllib.request.build_opener(NoRedirect)
+
+    def call(url, data=None, headers=None):
+        req = urllib.request.Request(url, data=urllib.parse.urlencode(data).encode() if data is not None else None, headers=headers or {})
+        try:
+            r = opener.open(req)
+        except urllib.error.HTTPError as e:
+            r = e
+        return r.status if hasattr(r, "status") else r.code, r.headers.get("Location"), r.read().decode()
+
+    verifier = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode()
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    q = dict(response_type="code", client_id=cid, redirect_uri=cb, state="st8", scope="openid email", code_challenge=challenge, code_challenge_method="S256")
+    authorize = lambda **over: call(f"{web}/oauth2/authorize?" + urllib.parse.urlencode({**q, **over}))
+
+    # never redirect to an unregistered URI; implicit is refused back at the callback with the state echoed
+    st, loc, _ = authorize(redirect_uri="http://localhost:3000/evil")
+    assert st == 400 and loc is None
+    st, loc, _ = authorize(response_type="token")
+    assert st == 302 and loc.startswith(cb + "?") and "error=unsupported_response_type" in loc and "state=st8" in loc, loc
+
+    def get_code(password="Str0ng!pass", origin=None):
+        st, loc, _ = authorize()
+        assert st == 302 and "/login?" in loc, (st, loc)
+        st, _, html = call(EP + loc)
+        assert st == 200
+        csrf = re.search(r'name=_csrf value="([^"]+)"', html).group(1)
+        return call(f"{web}/login", {"_csrf": csrf, "username": "olive", "password": password}, {"Origin": origin} if origin else {})
+
+    assert get_code(origin="http://evil.example")[0] == 403
+    st, _, html = get_code("Wr0ng!pass")
+    assert st == 200 and "Incorrect username or password" in html
+    # a used (or forged) form token is refused
+    assert call(f"{web}/login", {"_csrf": "forged", "username": "olive", "password": "Str0ng!pass"})[0] == 403
+
+    def fresh_code():
+        st, loc, _ = get_code()
+        assert st == 302 and loc.startswith(cb), (st, loc)
+        got = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
+        assert got["state"] == ["st8"]
+        return got["code"][0]
+
+    token = lambda **d: call(f"{web}/oauth2/token", {"grant_type": "authorization_code", "client_id": cid, "redirect_uri": cb, **d})
+    st, _, body = token(code=fresh_code(), code_verifier="not-the-verifier")
+    assert st == 400 and json.loads(body)["error"] == "invalid_grant"
+    assert json.loads(token(code=fresh_code(), code_verifier=verifier, redirect_uri=cb + "x")[2])["error"] == "invalid_grant"
+    c = fresh_code()
+    st, _, body = token(code=c, code_verifier=verifier)
+    assert st == 200, body
+    toks = json.loads(body)
+    assert {"id_token", "access_token", "refresh_token"} <= toks.keys()
+    # codes are single use
+    assert json.loads(token(code=c, code_verifier=verifier)[2])["error"] == "invalid_grant"
+
+    # the id_token passes the local JWT authorizer of an HTTP API
+    echo = lam.create_function(FunctionName=f"{p}-echo", Runtime="python3.12", Role="arn:aws:iam::000000000000:role/x", Handler="app.handler",
+                               Code={"ZipFile": zipped({"app.py": 'def handler(e, c):\n    return {"sub": e["requestContext"]["authorizer"]["jwt"]["claims"]["sub"]}\n'})})["FunctionArn"]
+    api = gw.create_api(Name=p, ProtocolType="HTTP")["ApiId"]
+    integ = gw.create_integration(ApiId=api, IntegrationType="AWS_PROXY", IntegrationUri=echo, PayloadFormatVersion="2.0")["IntegrationId"]
+    aid = gw.create_authorizer(ApiId=api, Name="jwt", AuthorizerType="JWT", IdentitySource=["$request.header.Authorization"],
+                               JwtConfiguration={"Issuer": web, "Audience": [cid]})["AuthorizerId"]
+    gw.create_route(ApiId=api, RouteKey="GET /me", Target=f"integrations/{integ}", AuthorizationType="JWT", AuthorizerId=aid)
+    base = gw.get_api(ApiId=api)["ApiEndpoint"]
+    st, _, body = call(base + "/me", headers={"Authorization": "Bearer " + toks["id_token"]})
+    assert st == 200 and json.loads(body)["sub"], (st, body)
+    assert call(base + "/me", headers={"Authorization": "Bearer x." + toks["id_token"][2:]})[0] in (401, 403)
+
+    # userInfo, refresh, logout
+    st, _, body = call(f"{web}/oauth2/userInfo", headers={"Authorization": "Bearer " + toks["access_token"]})
+    assert st == 200 and json.loads(body)["email"] == f"{p}@example.com"
+    assert call(f"{web}/oauth2/userInfo")[0] == 401
+    st, _, body = call(f"{web}/oauth2/token", {"grant_type": "refresh_token", "client_id": cid, "refresh_token": toks["refresh_token"]})
+    assert st == 200 and "id_token" in json.loads(body)
+    assert call(f"{web}/logout?" + urllib.parse.urlencode({"client_id": cid, "logout_uri": out_url}))[:2] == (302, out_url)
+    assert call(f"{web}/logout?" + urllib.parse.urlencode({"client_id": cid, "logout_uri": "http://evil.example/"}))[0] == 400
+
+    # client_credentials with resource-server scopes
+    idp.create_resource_server(UserPoolId=pool, Identifier="api", Name="API", Scopes=[{"ScopeName": "read", "ScopeDescription": "read"}])
+    assert idp.list_resource_servers(UserPoolId=pool, MaxResults=10)["ResourceServers"][0]["Identifier"] == "api"
+    m2m = idp.create_user_pool_client(UserPoolId=pool, ClientName="m2m", GenerateSecret=True, AllowedOAuthFlows=["client_credentials"],
+                                      AllowedOAuthScopes=["api/read"], AllowedOAuthFlowsUserPoolClient=True)["UserPoolClient"]
+    basic = lambda s: {"Authorization": "Basic " + base64.b64encode(f"{m2m['ClientId']}:{s}".encode()).decode()}
+    st, _, body = call(f"{web}/oauth2/token", {"grant_type": "client_credentials", "scope": "api/read"}, basic(m2m["ClientSecret"]))
+    assert st == 200, body
+    import jwt
+    claims = jwt.decode(json.loads(body)["access_token"], options={"verify_signature": False})
+    assert claims["scope"] == "api/read" and claims["client_id"] == m2m["ClientId"]
+    assert call(f"{web}/oauth2/token", {"grant_type": "client_credentials"}, basic("wrong"))[0] == 401
+    assert json.loads(call(f"{web}/oauth2/token", {"grant_type": "client_credentials", "scope": "api/write"}, basic(m2m["ClientSecret"]))[2])["error"] == "invalid_scope"
+    assert code(idp.create_user_pool_client, UserPoolId=pool, ClientName="nosecret", AllowedOAuthFlows=["client_credentials"],
+                AllowedOAuthScopes=["api/read"], AllowedOAuthFlowsUserPoolClient=True) == "InvalidOAuthFlowException"
+
 
 if __name__ == "__main__":
     for name, fn in list(globals().items()):

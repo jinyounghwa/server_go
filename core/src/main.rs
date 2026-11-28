@@ -1365,6 +1365,29 @@ async fn cognito_wellknown(axum::extract::Path((pool, doc)): axum::extract::Path
     Json(if doc == "jwks.json" { cognito::jwks() } else { cognito::openid_config(&pool) })
 }
 
+// Hosted UI / OAuth2 pages of a user pool: /_cognito/{pool}/oauth2/{authorize,token,userInfo}, /login, /logout.
+async fn cognito_web(State(app): State<Arc<App>>, method: Method, uri: Uri, h: HeaderMap, body: Bytes) -> Response {
+    let rest = uri.path().trim_start_matches("/_cognito/");
+    let (pool, page) = rest.split_once('/').unwrap_or((rest, ""));
+    let raw_query = uri.query().unwrap_or("");
+    let src = if method == Method::POST { std::str::from_utf8(&body).unwrap_or("") } else { raw_query };
+    let hv = |k: &str| h.get(k).and_then(|v| v.to_str().ok());
+    // A form POST must come from our own pages: a browser's Origin / Sec-Fetch-Site would show a cross-site sender.
+    let host = hv("host").unwrap_or("");
+    let same_origin = hv("origin").is_none_or(|o| o == format!("http://{host}")) && hv("sec-fetch-site").is_none_or(|s| s == "same-origin" || s == "none");
+    let req = cognito::WebReq { method: method.as_str(), page, raw_query, q: form(src).collect(), authorization: hv("authorization"), same_origin };
+    let out = app.cognito.lock().unwrap().web(pool, req);
+    let b = Response::builder().header("cache-control", "no-store");
+    match out {
+        cognito::Web::Redirect(to) => b.status(302).header("location", to).body(Body::empty()),
+        cognito::Web::Json(st, v) => b.status(st).header("content-type", "application/json").body(Body::from(v.to_string())),
+        cognito::Web::Html(st, html) => b.status(st).header("content-type", "text/html; charset=utf-8")
+            .header("content-security-policy", "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'")
+            .header("x-frame-options", "DENY").header("referrer-policy", "no-referrer").body(Body::from(html)),
+    }
+    .unwrap()
+}
+
 // GET /_admin/reach?from=internet|i-..&to=...&protocol=tcp&port=22
 async fn reach(State(app): State<Arc<App>>, axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>) -> Json<Value> {
     let g = |k: &str, d: &str| q.get(k).cloned().unwrap_or_else(|| d.to_string());
@@ -1569,6 +1592,9 @@ async fn serve() {
         .route("/_api/{*rest}", axum::routing::any(api_invoke))
         .route("/_restapi/{*rest}", axum::routing::any(rest_api_invoke))
         .route("/_cognito/{pool}/.well-known/{doc}", get(cognito_wellknown))
+        .route("/_cognito/{pool}/oauth2/{page}", get(cognito_web).post(cognito_web))
+        .route("/_cognito/{pool}/login", get(cognito_web).post(cognito_web))
+        .route("/_cognito/{pool}/logout", get(cognito_web))
         .route("/_admin/chaos", get(get_chaos).post(set_chaos))
         .fallback(handle)
         .layer(DefaultBodyLimit::max(MAX_BODY)) // ponytail: 256 MiB per request, bodies are held in memory
