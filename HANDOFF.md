@@ -474,7 +474,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
 - 사용자 저장 방식이 비밀번호 원문이면 SRP 검증값을 같이 저장한다. 스냅샷 호환성을 확인한다.
 - 테스트: boto3에는 SRP 도우미가 없으므로 테스트 안에 작은 SRP 클라이언트를 직접 둔다. 공개된 warrant·amazon-cognito-identity-js 계산식을 참고한다.
 
-## 30일차 (2026-12-24): Cognito SRP (2/2) + 사용자 정의 인증 챌린지
+## 30일차 (2026-12-24): Cognito SRP (2/2) + 사용자 정의 인증 챌린지 — ✅ 완료: SRP→MFA 연결 테스트·DEVICE_SRP_AUTH 거부·JS SRP 테스트(9개), CUSTOM_AUTH 3트리거(main.rs `custom_auth` 오케스트레이션, 3단계 질문/답·세 번 틀리면 실패), `__rc*` 주입 차단(보안 수정, 기존 `__rcConfirm` 자가 확인 구멍도 막힘), 단위/boto3/JS(55/58/9)·두 모드 통과·컨테이너 0
 - SRP를 마무리한다.
   - `DEVICE_SRP_AUTH`는 거부한다.
   - SRP 흐름에서도 28일차 MFA 챌린지로 이어지게 한다.

@@ -2,7 +2,8 @@
 // Lambda triggers (PreSignUp before creation, PostConfirmation after, PreTokenGeneration at issue).
 // Issuer: {endpoint}/_cognito/{poolId}  (JWKS at /.well-known/jwks.json, discovery at /.well-known/openid-configuration)
 // USER_SRP_AUTH: PASSWORD_VERIFIER over the RFC 5054 3072-bit group, same math as amazon-cognito-identity-js (see srp_* below).
-// ponytail: no device SRP, hosted UI/OAuth flows or custom auth challenges; MFA is software-token TOTP only (no SMS).
+// CUSTOM_AUTH runs DefineAuthChallenge/CreateAuthChallenge/VerifyAuthChallengeResponse (orchestrated by main.rs).
+// ponytail: no device SRP (DEVICE_SRP_AUTH is refused) or hosted UI/OAuth flows; MFA is software-token TOTP only (no SMS).
 // Verification codes are published as events; trigger failures on PostConfirmation/PreToken are best-effort like AWS retries.
 use crate::{b64, epoch, err, need, ApiErr, ACCOUNT, REGION};
 use base64::Engine;
@@ -109,6 +110,29 @@ fn srp_server(a_hex: &str, v: &BigUint) -> Option<(BigUint, Vec<u8>)> {
     let s = (a * v.modpow(&u, n)).modpow(&b, n);
     Some((big_b, srp_key(&s, &u)))
 }
+// LambdaConfig keys we store (CustomMessage/PostAuthentication are kept but never invoked).
+const TRIGGERS: [&str; 8] = ["PreSignUp", "PostConfirmation", "PreTokenGeneration", "CustomMessage", "PostAuthentication",
+                             "DefineAuthChallenge", "CreateAuthChallenge", "VerifyAuthChallengeResponse"];
+
+// CUSTOM_AUTH: main.rs runs Define/Create/Verify (async Lambda calls) with this context, then hands the
+// outcome back to handle() as "__rcCustom" so the sync code issues tokens or the next challenge.
+pub struct CustomCtx {
+    pub define: String,
+    pub create: String,
+    pub verify: String,
+    pub base: Value,          // event fields shared by the three triggers
+    pub session: Vec<Value>,  // [{challengeName, challengeResult, challengeMetadata}]
+    pub private: Value,       // privateChallengeParameters of the pending challenge
+    pub metadata: Value,      // its challengeMetadata
+}
+struct CustomState {
+    pool: String,
+    user: String,
+    client: String,
+    session: Vec<Value>,
+    private: Value,
+    metadata: Value,
+}
 struct SrpPending {
     pool: String,
     user: String,
@@ -194,6 +218,7 @@ pub struct Cognito {
     clients: BTreeMap<String, Client>,
     refresh: HashMap<String, (String, String, String)>, // token -> (pool, username, client)
     sessions: HashMap<String, (String, String, String)>, // challenge session -> same
+    custom: HashMap<String, CustomState>,               // CUSTOM_CHALLENGE session -> state
     srp: HashMap<String, SrpPending>,                   // SECRET_BLOCK (base64) -> handshake awaiting PASSWORD_VERIFIER
     codes: Vec<(String, String)>,                       // (username, code) to publish as events
     pub triggers: Vec<Trigger>,                         // pending triggers for main.rs
@@ -322,6 +347,76 @@ impl Cognito {
                           "response": {"autoConfirmUser": false, "autoVerifyEmail": false, "autoVerifyPhone": false}}),
             pool: pool.clone(), user: uname.into(), client: cid.into(), with_refresh: false,
         })
+    }
+
+    // Context for main.rs to run the custom-auth triggers, or None when the request is not a CUSTOM_AUTH step.
+    pub fn custom_ctx(&self, op: &str, r: &Value) -> Result<Option<CustomCtx>, ApiErr> {
+        let respond = op == "RespondToAuthChallenge" && r["ChallengeName"] == "CUSTOM_CHALLENGE";
+        if !(op == "InitiateAuth" && r["AuthFlow"] == "CUSTOM_AUTH") && !respond {
+            return Ok(None);
+        }
+        let (cid, c) = self.client(r)?;
+        let (pool, user, session, private, metadata) = if respond {
+            let st = self.custom.get(need(r, "Session")?).filter(|s| s.client == cid).ok_or_else(|| e("NotAuthorizedException", "Invalid session for the user."))?;
+            (st.pool.clone(), st.user.clone(), st.session.clone(), st.private.clone(), st.metadata.clone())
+        } else {
+            let name = r["AuthParameters"]["USERNAME"].as_str().ok_or_else(|| e("InvalidParameterException", "Missing required parameter USERNAME"))?;
+            Self::check_secret(c, &cid, name, r["AuthParameters"]["SECRET_HASH"].as_str())?;
+            let uname = self.pools[&c.pool].find(name).ok_or_else(|| e("UserNotFoundException", "User does not exist."))?;
+            let u = &self.pools[&c.pool].users[&uname];
+            if !u.enabled {
+                return Err(e("NotAuthorizedException", "User is disabled."));
+            }
+            if u.status == "UNCONFIRMED" {
+                return Err(e("UserNotConfirmedException", "User is not confirmed."));
+            }
+            (c.pool.clone(), uname, vec![], Value::Null, Value::Null)
+        };
+        let p = &self.pools[&pool];
+        let fns: Vec<String> = ["DefineAuthChallenge", "CreateAuthChallenge", "VerifyAuthChallengeResponse"].iter().filter_map(|t| p.lambda_config.get(*t).cloned()).collect();
+        let [define, create, verify] = <[String; 3]>::try_from(fns)
+            .map_err(|_| e("InvalidParameterException", "CUSTOM_AUTH needs DefineAuthChallenge, CreateAuthChallenge and VerifyAuthChallengeResponse triggers"))?;
+        let u = &p.users[&user];
+        let mut attrs = json!({"sub": u.sub, "cognito:user_status": u.status});
+        for (k, v) in &u.attrs {
+            attrs[k.as_str()] = v.as_str().into();
+        }
+        let base = json!({"version": "1", "region": *REGION, "userPoolId": pool, "userName": user, "callerContext": {"clientId": cid},
+                          "request": {"userAttributes": attrs, "userNotFound": false}});
+        Ok(Some(CustomCtx { define, create, verify, base, session, private, metadata }))
+    }
+
+    // Applies what main.rs learned from the triggers: {"session": [...], "define": response, "create": response}.
+    fn custom_step(&mut self, r: &Value) -> Result<Value, ApiErr> {
+        let out = &r["__rcCustom"];
+        let (cid, _) = self.client(r)?;
+        let (pool, user) = if r["ChallengeName"] == "CUSTOM_CHALLENGE" {
+            let st = self.custom.remove(need(r, "Session")?).ok_or_else(|| e("NotAuthorizedException", "Invalid session for the user."))?;
+            (st.pool, st.user)
+        } else {
+            let name = r["AuthParameters"]["USERNAME"].as_str().unwrap_or("");
+            let pool = self.clients[&cid].pool.clone();
+            let uname = self.pools[&pool].find(name).ok_or_else(|| e("UserNotFoundException", "User does not exist."))?;
+            (pool, uname)
+        };
+        let d = &out["define"];
+        if d["failAuthentication"] == true {
+            return Err(e("NotAuthorizedException", "Incorrect username or password."));
+        }
+        if d["issueTokens"] == true {
+            return Ok(self.tokens(&pool, &user, &cid, true));
+        }
+        if d["challengeName"] != "CUSTOM_CHALLENGE" {
+            // ponytail: Define may only pick CUSTOM_CHALLENGE locally (no PASSWORD_VERIFIER/SMS_MFA mixed into custom auth).
+            return Err(e("InvalidLambdaResponseException", "DefineAuthChallenge must fail, issue tokens or pick CUSTOM_CHALLENGE locally"));
+        }
+        let c = &out["create"];
+        let session = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+        let mut params = c["publicChallengeParameters"].as_object().cloned().unwrap_or_default();
+        params.insert("USERNAME".into(), user.clone().into());
+        self.custom.insert(session.clone(), CustomState { pool, user, client: cid, session: out["session"].as_array().cloned().unwrap_or_default(),
+                                                          private: c["privateChallengeParameters"].clone(), metadata: c["challengeMetadata"].clone() });
+        Ok(json!({"ChallengeName": "CUSTOM_CHALLENGE", "Session": session, "ChallengeParameters": params}))
     }
 
     // Re-issue tokens with PreTokenGeneration claim overrides applied (no new trigger).
@@ -511,8 +606,7 @@ impl Cognito {
             "CreateUserPool" => {
                 let id = format!("{}_{}", *REGION, &uuid::Uuid::new_v4().simple().to_string()[..9]);
                 let strs = |k: &str| r[k].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>();
-                let lambda_config = ["PreSignUp", "PostConfirmation", "PreTokenGeneration", "CustomMessage", "PostAuthentication"]
-                    .iter().filter_map(|t| r["LambdaConfig"][t].as_str().map(|v| (t.to_string(), v.to_string()))).collect();
+                let lambda_config = TRIGGERS.iter().filter_map(|t| r["LambdaConfig"][t].as_str().map(|v| (t.to_string(), v.to_string()))).collect();
                 let mfa: &'static str = match r["MfaConfiguration"].as_str().unwrap_or("OFF") {
                     "OFF" => "OFF",
                     "OPTIONAL" => "OPTIONAL",
@@ -529,7 +623,7 @@ impl Cognito {
             }
             "UpdateUserPool" => {
                 let p = self.pools.get_mut(&pool_id).ok_or_else(no_pool)?;
-                for t in ["PreSignUp", "PostConfirmation", "PreTokenGeneration"] {
+                for t in TRIGGERS {
                     match r["LambdaConfig"][t].as_str() {
                         Some(v) => { p.lambda_config.insert(t.into(), v.into()); }
                         None if r["LambdaConfig"].as_object().is_some_and(|o| o.contains_key(t)) => { p.lambda_config.remove(t); }
@@ -730,6 +824,7 @@ impl Cognito {
                 let uname = p.find(need(r, "Username")?).ok_or_else(no_user)?;
                 json!({"Groups": p.groups.iter().filter(|(_, g)| g.members.contains(&uname)).map(|(n, g)| g.json(n, &pool_id)).collect::<Vec<_>>()})
             }
+            "InitiateAuth" | "RespondToAuthChallenge" if r.get("__rcCustom").is_some() => self.custom_step(r)?,
             "InitiateAuth" | "AdminInitiateAuth" => {
                 let (cid, c) = self.client(r)?;
                 let pool = c.pool.clone();
@@ -758,6 +853,7 @@ impl Cognito {
                         json!({"ChallengeName": "PASSWORD_VERIFIER", "ChallengeParameters": {"SALT": salt, "SRP_B": b.to_str_radix(16),
                                "SECRET_BLOCK": block, "USER_ID_FOR_SRP": uname, "USERNAME": uname}})
                     }
+                    "DEVICE_SRP_AUTH" => return Err(e("InvalidParameterException", "DEVICE_SRP_AUTH is not supported locally (no device tracking)")),
                     "REFRESH_TOKEN_AUTH" | "REFRESH_TOKEN" => {
                         let rt = p["REFRESH_TOKEN"].as_str().unwrap_or("");
                         let (pool, user, client) = self.refresh.get(rt).cloned().filter(|(_, _, c)| *c == cid)
@@ -1055,5 +1151,40 @@ mod tests {
         // A = 0 (mod N) is rejected before any handshake
         let zero = c.handle("InitiateAuth", &json!({"ClientId": cid, "AuthFlow": "USER_SRP_AUTH", "AuthParameters": {"USERNAME": "srp1", "SRP_A": SRP_N}}));
         assert_eq!(zero.unwrap_err().code, "InvalidParameterException");
+    }
+
+    // CUSTOM_AUTH bookkeeping: what handle() does with the trigger outcomes main.rs injects.
+    #[test]
+    fn custom_auth_steps() {
+        use super::*;
+        let mut c = Cognito::default();
+        let pool = c.handle("CreateUserPool", &json!({"PoolName": "p", "LambdaConfig": {"DefineAuthChallenge": "fn:d", "CreateAuthChallenge": "fn:c",
+            "VerifyAuthChallengeResponse": "fn:v"}})).unwrap()["UserPool"]["Id"].as_str().unwrap().to_string();
+        let cid = c.handle("CreateUserPoolClient", &json!({"UserPoolId": pool, "ClientName": "web"})).unwrap()["UserPoolClient"]["ClientId"].as_str().unwrap().to_string();
+        c.handle("AdminCreateUser", &json!({"UserPoolId": pool, "Username": "q"})).unwrap();
+        let init = json!({"ClientId": cid, "AuthFlow": "CUSTOM_AUTH", "AuthParameters": {"USERNAME": "q"}});
+        let ctx = c.custom_ctx("InitiateAuth", &init).unwrap().unwrap();
+        assert_eq!((ctx.define.as_str(), ctx.session.len()), ("fn:d", 0));
+        assert!(c.custom_ctx("InitiateAuth", &json!({"ClientId": cid, "AuthFlow": "USER_PASSWORD_AUTH"})).unwrap().is_none());
+
+        let mut step = init.clone();
+        step["__rcCustom"] = json!({"session": [], "define": {"challengeName": "CUSTOM_CHALLENGE"},
+                                    "create": {"publicChallengeParameters": {"q": "2+2"}, "privateChallengeParameters": {"a": "4"}, "challengeMetadata": "M"}});
+        let ch = c.handle("InitiateAuth", &step).unwrap();
+        assert_eq!((ch["ChallengeName"].as_str(), ch["ChallengeParameters"]["q"].as_str()), (Some("CUSTOM_CHALLENGE"), Some("2+2")));
+        let resp = json!({"ClientId": cid, "ChallengeName": "CUSTOM_CHALLENGE", "Session": ch["Session"], "ChallengeResponses": {"ANSWER": "4"}});
+        let ctx = c.custom_ctx("RespondToAuthChallenge", &resp).unwrap().unwrap();
+        assert_eq!((ctx.private["a"].as_str(), ctx.metadata.as_str()), (Some("4"), Some("M")));
+        let mut ok = resp.clone();
+        ok["__rcCustom"] = json!({"session": [{"challengeResult": true}], "define": {"issueTokens": true}});
+        assert!(c.handle("RespondToAuthChallenge", &ok).unwrap()["AuthenticationResult"]["IdToken"].is_string());
+        // the session was consumed
+        assert_eq!(c.custom_ctx("RespondToAuthChallenge", &resp).err().unwrap().code, "NotAuthorizedException");
+        let mut fail = init.clone();
+        fail["__rcCustom"] = json!({"define": {"failAuthentication": true}});
+        assert_eq!(c.handle("InitiateAuth", &fail).unwrap_err().code, "NotAuthorizedException");
+        let mut odd = init;
+        odd["__rcCustom"] = json!({"define": {"challengeName": "SMS_MFA"}});
+        assert_eq!(c.handle("InitiateAuth", &odd).unwrap_err().code, "InvalidLambdaResponseException");
     }
 }

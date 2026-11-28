@@ -41,6 +41,7 @@
 - 2026-11-28 추가30(27일차): Lambda 컨테이너 이미지 — `PackageType=Image`+`Code.ImageUri`(로컬 docker에 있는 이미지만, `docker image inspect` 검증, 없으면 InvalidParameterValueException; ECR 흉내·pull 없음). 실행은 `docker run -d --rm -p 127.0.0.1:{free}:8080 --memory {MemorySize}m --add-host host.docker.internal:host-gateway` 후 `POST /2015-03-31/functions/function/invocations`(자체 최소 HTTP 클라이언트, 청크 디코딩 포함, RIE 부팅 재시도), 로그는 `docker logs` 증분. 풀·유휴 5분·forget(삭제·코드/설정 변경)·`x-rc-cold-start`·Init Duration은 26일차와 같은 규칙. 함정: docker CLI에서 `-e` 등 옵션은 반드시 이미지 이름 **앞**에(뒤에 붙으면 컨테이너 인자가 되어 엔트리포인트 exit 142); 공식 베이스 이미지의 RIE는 핸들러를 CMD로 받음; App이 셧다운 때 드롭되지 않을 수 있어 main 끝에서 img 풀을 명시적으로 비움(Drop이 docker rm -f). 함수 오류는 RIE의 `Lambda-Runtime-Function-Error-Type` 헤더로 구분. 단위 테스트 52개, boto3 테스트 55개.
 - 2026-11-28 추가31(28일차): Cognito TOTP MFA — HMAC-SHA1은 sigv4의 손구현 SHA-1 위에 직접 구현, RFC 6238 표준 벡터 단위 테스트(6자리·30초 스텝, ±1 윈도). 연산: Associate/VerifySoftwareToken(토큰·admin 변형), SetUserMFAPreference·AdminSetUserMFAPreference(와이어 키 `SoftwareTokenMfaSettings`/`PreferredMfa` — 대소문자 함정), SetUserPoolMfaConfig·GetUserPoolMfaConfig(OFF·OPTIONAL·ON). 로그인: 등록+검증 사용자가 ON 풀이거나 OPTIONAL에서 선호 켰으면 `SOFTWARE_TOKEN_MFA` 챌린지, RespondToAuthChallenge가 코드 검증(틀리면 CodeMismatchException, 세션 유지). sfn `States.Hash`의 SHA-1도 sigv4::sha1로 통일. 함정: botocore는 AccessToken 인증 연산(Associate/VerifySoftwareToken·SetUserMFAPreference·GetUser)을 **SigV4 없이** 보냄 → COGNITO_PUBLIC에 추가(토큰이 곧 인증). 단위 테스트 53개, boto3 테스트 56개.
 - 2026-11-28 추가32(29일차): Cognito SRP — `InitiateAuth(USER_SRP_AUTH)` → `PASSWORD_VERIFIER`(RFC 5054 3072비트 그룹, π 공식으로 상수 검증, `k = H(pad(N)|pad(g))`, `SALT`·`SRP_B`·`SECRET_BLOCK`·`USER_ID_FOR_SRP`), HKDF("Caldera Derived Key")·서명 HMAC은 기존 hmac_sha256 위에. 큰 수는 `rsa::BigUint`(rsa가 다시 내보내는 num-bigint-dig — 새 크레이트 없음). 비밀번호를 설정하는 모든 경로(`User::set_pw`)가 해시와 SRP 검증값 `g^x`를 같이 갱신, Cognito는 스냅샷 대상이 아니라 호환성 문제 없음. 비밀 블록이 핸드셰이크 키(클라이언트가 Session 안 보냄)·1회용·5분 만료, `A mod N = 0` 거부, 증명 뒤는 `after_password`(상태·NEW_PASSWORD_REQUIRED·MFA)로 이어짐. 테스트는 JS 라이브러리 공식으로 짠 자체 Python 클라이언트 + pycognito `AWSSRP`로 별도 상호 운용 확인(커밋 안 함). TIMESTAMP 값은 검사 안 함(ponytail). 단위 테스트 54개, boto3 테스트 57개.
+- 2026-11-28 추가33(30일차): SRP 마무리·CUSTOM_AUTH — SRP 증명 뒤 TOTP MFA 챌린지로 이어짐(테스트), `DEVICE_SRP_AUTH`는 명확히 거부, JS 스위트에 Amplify 방식 SRP 테스트(`@aws-sdk/client-cognito-identity-provider` + BigInt, 9개). CUSTOM_AUTH: `DefineAuthChallenge`/`CreateAuthChallenge`/`VerifyAuthChallengeResponse`는 main.rs `custom_auth()`가 비동기로 호출(답 → Verify → 세션 목록에 결과·메타데이터 추가 → Define → 필요하면 Create)하고 결과를 `__rcCustom`으로 `handle()`에 넘겨 토큰·다음 챌린지·`NotAuthorizedException`을 결정. 세 트리거가 다 없으면 `InvalidParameterException`, Define이 CUSTOM_CHALLENGE 외 챌린지를 고르면 `InvalidLambdaResponseException`(ponytail), 람다 실패는 `UserLambdaValidationException`. **보안 수정**: cognito 요청 본문에서 `__rc*` 키를 항상 제거(전에는 클라이언트가 `__rcConfirm`을 직접 넣어 자가 확인할 수 있었음; 이제 `__rcCustom` 주입으로 토큰을 받는 우회를 테스트로 막음). Admin* 변형의 CUSTOM_AUTH는 미지원. 단위 테스트 55개, boto3 테스트 58개, JS 9개.
 - 2026-11-27 추가29(25일차): Lambda 레이어 — `PublishLayerVersion`(zip, `/2018-10-31/layers` 경로)·`GetLayerVersion`·`GetLayerVersionByArn`(`?find=LayerVersion`)·`ListLayers`·`ListLayerVersions`(최신 먼저, `CompatibleRuntime` 필터)·`DeleteLayerVersion`(멱등, 번호 재사용 안 함, 이미 쓰는 함수는 계속 동작)·`Add/Get/RemoveLayerVersionPermission`(이 계정 또는 `*`만). 함수 `Layers`(최대 5개, 레이어당 한 버전)는 실행 시 뒤 레이어가 먼저 오도록 `PYTHONPATH`(`python/`·`python/lib/<runtime>/site-packages`)·`NODE_PATH`(`nodejs/node_modules`, require만)로 연결. 경로 탈출 zip은 거부. 단위 테스트 52개, boto3 테스트 53개.
 - 2026-11-25 추가20: 검증 에이전트 시나리오 6개 추가(21→27: 보안 4종 `sec-clock-skew`·`sec-sts-expired`·`sec-strict-delivery`·`sec-jwt-bypass`, 사고 2종 `inc-lambda-dest`·`inc-events-dlq`, `poll_sqs_body`·`xml_tag` 리팩토링), JS v3(5→8)·Rust SDK(4→7) 스위트 확장(FIFO·고정밀 숫자 키·중첩 경로·IAM 조건/버킷 정책·S3 페이지네이션), 연대기 섬 숫자 동기화.
 - `v0.1.0` 릴리스 완료(2026-11-21): 바이너리 3종 + SHA256SUMS, Homebrew sha256 반영.
@@ -64,7 +65,7 @@ core/            Rust 단일 바이너리 (axum + tokio), 모든 서비스가 �
   src/<svc>.rs   서비스별 모듈. 상태 struct + handle() + admin()
   src/ui.html    관리 GUI (/_ui), town.html 캐릭터 마을 (/_town) — include_str!로 내장
 gui/             Tauri 2 창. /_ui를 여는 껍데기일 뿐
-tests/sdk_test.py  boto3 호환성 테스트 57개 (주 통합 테스트), tests/js·tests/rust는 JS v3(8개)·Rust SDK(7개) 스위트
+tests/sdk_test.py  boto3 호환성 테스트 58개 (주 통합 테스트), tests/js·tests/rust는 JS v3(9개)·Rust SDK(7개) 스위트
 netlify.toml     예전 Netlify 설정(지금은 GitHub Pages `pages.yml`로 배포)
 ```
 
@@ -151,7 +152,7 @@ uv run --with boto3 --with "pyjwt[crypto]" --with pg8000 --with pymysql --with r
 최신 태그는 `v0.1.4`, `v0.1.7` 릴리스 준비 완료(v0.1.5·v0.1.6·v0.1.7 태그 푸시는 사용자 승인 대기). HANDOFF.md 1~28일차 완료, 29~75일차 계획이 이어진다. 남은 한계는 각 파일의 `ponytail:` 주석(`grep -rn ponytail core/src`)이 목록이다.
 
 1. **실기기 점검**(사용자 도움 필요): 실제 휴대폰·실제 Safari·GPU가 약한 노트북에서 Pages 마을을 연다.
-   연대기 섬 숫자(SDK 테스트 57/8/7개, 시나리오 27개, GPU 65°C)는 `town.html` 12절에 손으로 적은 값이니 바뀌면 같이 고친다.
+   연대기 섬 숫자(SDK 테스트 58/9/7개, 시나리오 27개, GPU 65°C)는 `town.html` 12절에 손으로 적은 값이니 바뀌면 같이 고친다.
 2. (선택) `?api=`로 IPv6 `[::1]`: CSP가 IPv6 리터럴을 못 받으므로 요청이 있을 때만.
 3. (선택) SigV4a: ECDSA P-256 크레이트 추가가 필요하므로 사용자 요청이 있을 때만.
 4. 26일차(2026-12-20)부터 HANDOFF.md의 Lambda 레이어·웜 실행·컨테이너 이미지·Cognito MFA 등 계획을 따른다.

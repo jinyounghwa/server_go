@@ -3621,6 +3621,90 @@ def test_cognito_srp():
     idp.change_password(AccessToken=tok["AccessToken"], PreviousPassword="Str0ng!pass", ProposedPassword="N3w!passw0rd")
     assert "AuthenticationResult" in idp.respond_to_auth_challenge(**login("N3w!passw0rd"))
     assert code(idp.respond_to_auth_challenge, **login("Str0ng!pass")) == "NotAuthorizedException"
+    # SRP continues into the TOTP MFA challenge like a password login
+    def totp(secret_b32):
+        mac = hmac.new(base64.b32decode(secret_b32), int(time.time() // 30).to_bytes(8, "big"), hashlib.sha1).digest()
+        o = mac[19] & 15
+        return f"{(int.from_bytes(mac[o:o + 4], 'big') & 0x7fffffff) % 1_000_000:06d}"
+    tok = idp.respond_to_auth_challenge(**login("N3w!passw0rd"))["AuthenticationResult"]
+    secret = idp.associate_software_token(AccessToken=tok["AccessToken"])["SecretCode"]
+    idp.verify_software_token(AccessToken=tok["AccessToken"], UserCode=totp(secret))
+    idp.set_user_pool_mfa_config(UserPoolId=pool, MfaConfiguration="ON")
+    ch = idp.respond_to_auth_challenge(**login("N3w!passw0rd"))
+    assert ch["ChallengeName"] == "SOFTWARE_TOKEN_MFA", ch
+    res = idp.respond_to_auth_challenge(ClientId=cid, ChallengeName="SOFTWARE_TOKEN_MFA", Session=ch["Session"],
+                                        ChallengeResponses={"USERNAME": name, "SOFTWARE_MFA_CODE": totp(secret), "SECRET_HASH": sh(name)})
+    assert "IdToken" in res["AuthenticationResult"]
+    assert code(idp.initiate_auth, ClientId=cid, AuthFlow="DEVICE_SRP_AUTH", AuthParameters={"USERNAME": name, "SRP_A": "02", "SECRET_HASH": sh(name)}) == "InvalidParameterException"
+
+
+def test_cognito_custom_auth():
+    import json, urllib.request
+    idp, lam = boto3.client("cognito-idp", **kw), boto3.client("lambda", **kw)
+    p = f"cca{run}"
+    define = (
+        'def handler(e, c):\n'
+        '    s, r = e["request"]["session"], e["response"]\n'
+        '    if s and s[-1]["challengeResult"]:\n'
+        '        r.update(issueTokens=True, failAuthentication=False)\n'
+        '    elif len(s) >= 3:\n'
+        '        r.update(issueTokens=False, failAuthentication=True)\n'
+        '    else:\n'
+        '        r.update(issueTokens=False, failAuthentication=False, challengeName="CUSTOM_CHALLENGE")\n'
+        '    return e\n'
+    )
+    create = (
+        'def handler(e, c):\n'
+        '    n = len(e["request"]["session"]) + 1\n'
+        '    e["response"] = {"publicChallengeParameters": {"question": "2+2?"}, "privateChallengeParameters": {"answer": "4"}, "challengeMetadata": f"Q{n}"}\n'
+        '    return e\n'
+    )
+    verify = (
+        'def handler(e, c):\n'
+        '    e["response"]["answerCorrect"] = e["request"]["challengeAnswer"] == e["request"]["privateChallengeParameters"]["answer"]\n'
+        '    return e\n'
+    )
+    mk = lambda n, src: lam.create_function(FunctionName=f"{p}-{n}", Runtime="python3.12", Role="arn:aws:iam::000000000000:role/x",
+                                             Handler="app.handler", Code={"ZipFile": zipped({"app.py": src})})["FunctionArn"]
+    pool = idp.create_user_pool(PoolName=p, LambdaConfig={"DefineAuthChallenge": mk("define", define), "CreateAuthChallenge": mk("create", create),
+                                                         "VerifyAuthChallengeResponse": mk("verify", verify)})["UserPool"]["Id"]
+    cid = idp.create_user_pool_client(UserPoolId=pool, ClientName="web")["UserPoolClient"]["ClientId"]
+    idp.admin_create_user(UserPoolId=pool, Username="quiz")
+    idp.admin_set_user_password(UserPoolId=pool, Username="quiz", Password="Str0ng!pass", Permanent=True)
+
+    start = lambda: idp.initiate_auth(ClientId=cid, AuthFlow="CUSTOM_AUTH", AuthParameters={"USERNAME": "quiz"})
+    answer = lambda ch, a: idp.respond_to_auth_challenge(ClientId=cid, ChallengeName="CUSTOM_CHALLENGE", Session=ch["Session"],
+                                                          ChallengeResponses={"USERNAME": "quiz", "ANSWER": a})
+    ch = start()
+    assert ch["ChallengeName"] == "CUSTOM_CHALLENGE" and ch["ChallengeParameters"]["question"] == "2+2?", ch
+    assert "IdToken" in answer(ch, "4")["AuthenticationResult"]
+    # two wrong answers keep the challenge going, the third try may still succeed
+    ch = answer(answer(start(), "5"), "6")
+    assert ch["ChallengeName"] == "CUSTOM_CHALLENGE"
+    assert "AccessToken" in answer(ch, "4")["AuthenticationResult"]
+    # three wrong answers fail the login; the consumed session is gone
+    ch1 = start()
+    ch3 = answer(answer(ch1, "1"), "2")
+    assert code(answer, ch3, "3") == "NotAuthorizedException"
+    assert code(answer, ch1, "4") == "NotAuthorizedException"
+    assert code(idp.initiate_auth, ClientId=cid, AuthFlow="CUSTOM_AUTH", AuthParameters={"USERNAME": "nobody"}) == "UserNotFoundException"
+
+    # a client cannot smuggle the internal trigger outcome ("__rc*") into the request
+    body = json.dumps({"ClientId": cid, "AuthFlow": "USER_PASSWORD_AUTH", "AuthParameters": {"USERNAME": "quiz", "PASSWORD": "wrong"},
+                       "__rcCustom": {"define": {"issueTokens": True}}}).encode()
+    req = urllib.request.Request(EP, data=body, headers={"X-Amz-Target": "AWSCognitoIdentityProviderService.InitiateAuth",
+                                                              "Content-Type": "application/x-amz-json-1.1"})
+    try:
+        urllib.request.urlopen(req)
+        raise AssertionError("smuggled __rcCustom was honoured")
+    except urllib.error.HTTPError as e:
+        assert e.code == 400 and b"NotAuthorized" in e.read()
+
+    # a pool without the three triggers refuses CUSTOM_AUTH
+    pool2 = idp.create_user_pool(PoolName=f"{p}2")["UserPool"]["Id"]
+    cid2 = idp.create_user_pool_client(UserPoolId=pool2, ClientName="web")["UserPoolClient"]["ClientId"]
+    idp.admin_create_user(UserPoolId=pool2, Username="quiz")
+    assert code(idp.initiate_auth, ClientId=cid2, AuthFlow="CUSTOM_AUTH", AuthParameters={"USERNAME": "quiz"}) == "InvalidParameterException"
 
 
 if __name__ == "__main__":

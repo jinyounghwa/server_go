@@ -356,6 +356,36 @@ fn checks(app: &App, svc: &Svc, body: &[u8]) -> Vec<(String, String)> {
     }
 }
 
+// One CUSTOM_AUTH step: Verify the answer (when responding), Define the next move, Create a challenge if one is needed.
+async fn custom_auth(app: &Arc<App>, ctx: cognito::CustomCtx, j: &Value) -> Result<Value, ApiErr> {
+    async fn trigger(app: &Arc<App>, f: &str, base: &Value, source: &str, req: Value) -> Result<Value, ApiErr> {
+        let mut ev = base.clone();
+        ev["triggerSource"] = source.into();
+        for (k, v) in req.as_object().into_iter().flatten() {
+            ev["request"][k] = v.clone();
+        }
+        ev["response"] = json!({});
+        match crate::lambda::invoke(app, &crate::lambda::name_of(f), ev).await {
+            Ok(inv) if inv.error.is_none() => Ok(inv.payload["response"].clone()),
+            _ => Err(err("UserLambdaValidationException", format!("{} failed due to function error", source.split('_').next().unwrap_or(source)))),
+        }
+    }
+    let mut session = ctx.session;
+    if j["ChallengeName"] == "CUSTOM_CHALLENGE" {
+        let answer = j["ChallengeResponses"]["ANSWER"].as_str().ok_or_else(|| err("InvalidParameterException", "ANSWER is required"))?;
+        let v = trigger(app, &ctx.verify, &ctx.base, "VerifyAuthChallengeResponse_Authentication",
+                        json!({"privateChallengeParameters": ctx.private, "challengeAnswer": answer})).await?;
+        session.push(json!({"challengeName": "CUSTOM_CHALLENGE", "challengeResult": v["answerCorrect"] == true, "challengeMetadata": ctx.metadata}));
+    }
+    let define = trigger(app, &ctx.define, &ctx.base, "DefineAuthChallenge_Authentication", json!({"session": session})).await?;
+    let create = if define["challengeName"] == "CUSTOM_CHALLENGE" && define["issueTokens"] != true && define["failAuthentication"] != true {
+        trigger(app, &ctx.create, &ctx.base, "CreateAuthChallenge_Authentication", json!({"challengeName": "CUSTOM_CHALLENGE", "session": session})).await?
+    } else {
+        Value::Null
+    };
+    Ok(json!({"session": session, "define": define, "create": create}))
+}
+
 async fn handle(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
     let t0 = Instant::now();
     let rid = uuid::Uuid::new_v4().to_string();
@@ -622,6 +652,19 @@ async fn handle(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<std:
                 Ok(j) => j,
                 Err(e) => return json_reply("cognito-idp", Err(err("SerializationException", e.to_string()))),
             };
+            // "__rc*" keys carry trigger outcomes into handle(); a client must never be able to supply them.
+            if let Some(o) = j.as_object_mut() {
+                o.retain(|k, _| !k.starts_with("__rc"));
+            }
+            let custom = app.cognito.lock().unwrap().custom_ctx(&op, &j);
+            match custom {
+                Err(e) => return json_reply("cognito-idp", Err(e)),
+                Ok(Some(ctx)) => match custom_auth(&app, ctx, &j).await {
+                    Ok(v) => j["__rcCustom"] = v,
+                    Err(e) => return json_reply("cognito-idp", Err(e)),
+                },
+                Ok(None) => {}
+            }
             // PreSignUp trigger runs before the user is created; a failing function refuses the sign-up.
             if op == "SignUp" {
                 let presign = app.cognito.lock().unwrap().presignup_event(&j);

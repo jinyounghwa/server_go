@@ -11,6 +11,7 @@ import { STSClient, GetCallerIdentityCommand } from "@aws-sdk/client-sts";
 import { SSMClient, PutParameterCommand, GetParameterCommand, DeleteParameterCommand } from "@aws-sdk/client-ssm";
 import { SecretsManagerClient, CreateSecretCommand, GetSecretValueCommand, DeleteSecretCommand } from "@aws-sdk/client-secrets-manager";
 import { KMSClient, CreateKeyCommand, EncryptCommand, DecryptCommand } from "@aws-sdk/client-kms";
+import { CognitoIdentityProviderClient, CreateUserPoolCommand, CreateUserPoolClientCommand, AdminCreateUserCommand, AdminSetUserPasswordCommand, InitiateAuthCommand, RespondToAuthChallengeCommand, DeleteUserPoolCommand } from "@aws-sdk/client-cognito-identity-provider";
 import { SNSClient, CreateTopicCommand, SubscribeCommand, PublishCommand, DeleteTopicCommand } from "@aws-sdk/client-sns";
 
 const endpoint = process.env.ROCALCLOUD_URL || "http://127.0.0.1:4566";
@@ -232,6 +233,46 @@ async function testIAMConditionsAndBucketPolicy() {
   await s3Root.send(new DeleteBucketCommand({ Bucket }));
 }
 
+// USER_SRP_AUTH the way Amplify / amazon-cognito-identity-js computes it, on native BigInt.
+async function testCognitoSrp() {
+  const idp = new CognitoIdentityProviderClient(cfg());
+  const N = BigInt("0xFFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200CBBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF");
+  const g = 2n;
+  const modPow = (b, e, m) => { let r = 1n; b %= m; for (; e > 0n; e >>= 1n, b = (b * b) % m) if (e & 1n) r = (r * b) % m; return r; };
+  const padHex = (n) => { let h = n.toString(16); if (h.length % 2) h = "0" + h; return "89abcdef".includes(h[0]) ? "00" + h : h; };
+  const hexHash = (h) => BigInt("0x" + crypto.createHash("sha256").update(Buffer.from(h, "hex")).digest("hex"));
+  const hmac = (k, m) => crypto.createHmac("sha256", k).update(m).digest();
+  const k = hexHash(padHex(N) + padHex(g));
+
+  const pool = (await idp.send(new CreateUserPoolCommand({ PoolName: `js-srp-${run}` }))).UserPool.Id;
+  const cid = (await idp.send(new CreateUserPoolClientCommand({ UserPoolId: pool, ClientName: "amplify" }))).UserPoolClient.ClientId;
+  await idp.send(new AdminCreateUserCommand({ UserPoolId: pool, Username: "amy" }));
+  await idp.send(new AdminSetUserPasswordCommand({ UserPoolId: pool, Username: "amy", Password: "Str0ng!pass", Permanent: true }));
+  const poolName = pool.split("_")[1];
+
+  const login = async (password) => {
+    const a = BigInt("0x" + crypto.randomBytes(32).toString("hex"));
+    const A = modPow(g, a, N);
+    const ch = await idp.send(new InitiateAuthCommand({ ClientId: cid, AuthFlow: "USER_SRP_AUTH", AuthParameters: { USERNAME: "amy", SRP_A: A.toString(16) } }));
+    assert.equal(ch.ChallengeName, "PASSWORD_VERIFIER");
+    const p = ch.ChallengeParameters;
+    const B = BigInt("0x" + p.SRP_B), salt = BigInt("0x" + p.SALT), uid = p.USER_ID_FOR_SRP;
+    const u = hexHash(padHex(A) + padHex(B));
+    const x = hexHash(padHex(salt) + crypto.createHash("sha256").update(`${poolName}${uid}:${password}`).digest("hex"));
+    const S = modPow(((B - k * modPow(g, x, N)) % N + N) % N, a + u * x, N);
+    const key = hmac(hmac(Buffer.from(padHex(u), "hex"), Buffer.from(padHex(S), "hex")), "Caldera Derived Key\u0001").subarray(0, 16);
+    const d = new Date();
+    const ts = `${d.toUTCString().slice(0, 3)} ${d.toUTCString().slice(8, 11)} ${d.getUTCDate()} ${d.toISOString().slice(11, 19)} UTC ${d.getUTCFullYear()}`;
+    const sig = hmac(key, Buffer.concat([Buffer.from(poolName), Buffer.from(uid), Buffer.from(p.SECRET_BLOCK, "base64"), Buffer.from(ts)])).toString("base64");
+    return idp.send(new RespondToAuthChallengeCommand({ ClientId: cid, ChallengeName: "PASSWORD_VERIFIER", ChallengeResponses: {
+      USERNAME: uid, PASSWORD_CLAIM_SECRET_BLOCK: p.SECRET_BLOCK, PASSWORD_CLAIM_SIGNATURE: sig, TIMESTAMP: ts } }));
+  };
+  const ok = await login("Str0ng!pass");
+  assert.ok(ok.AuthenticationResult.IdToken);
+  await expectError(() => login("Wr0ng!pass"), ["NotAuthorizedException"]);
+  await idp.send(new DeleteUserPoolCommand({ UserPoolId: pool }));
+}
+
 for (const [name, fn] of [
   ["js_dynamodb", testDynamoDB],
   ["js_s3", testS3],
@@ -241,6 +282,7 @@ for (const [name, fn] of [
   ["js_sns_fifo", testSNSFifo],
   ["js_ddb_decimal_and_nested", testDynamoDBDecimalAndNested],
   ["js_iam_conditions_and_policy", testIAMConditionsAndBucketPolicy],
+  ["js_cognito_srp", testCognitoSrp],
 ]) {
   await fn();
   console.log("ok", name);
