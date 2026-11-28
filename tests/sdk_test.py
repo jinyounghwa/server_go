@@ -3506,6 +3506,63 @@ def test_lambda_container_image():
 
 
 
+def test_cognito_totp():
+    import base64, hashlib, hmac, struct, time
+    idp = boto3.client("cognito-idp", **kw)
+    pool = idp.create_user_pool(PoolName=f"totp{run}")["UserPool"]["Id"]
+    cid = idp.create_user_pool_client(UserPoolId=pool, ClientName="web", ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"])["UserPoolClient"]["ClientId"]
+    name = f"mfa{run}"
+    idp.sign_up(ClientId=cid, Username=name, Password="Str0ng!pass")
+    idp.admin_confirm_sign_up(UserPoolId=pool, Username=name)
+
+    auth = lambda: idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH", AuthParameters={"USERNAME": name, "PASSWORD": "Str0ng!pass"})
+
+    def totp(secret_b32, t=None):
+        key = base64.b32decode(secret_b32)
+        c = int((t or time.time()) // 30)
+        mac = hmac.new(key, struct.pack(">Q", c), hashlib.sha1).digest()
+        o = mac[19] & 15
+        return "{:06d}".format(((mac[o] & 0x7f) << 24 | mac[o + 1] << 16 | mac[o + 2] << 8 | mac[o + 3]) % 1_000_000)
+
+    # no MFA yet: password logins straight through
+    tok = auth()["AuthenticationResult"]
+    secret = idp.associate_software_token(AccessToken=tok["AccessToken"])["SecretCode"]
+    # wrong code -> CodeMismatchException; the right code verifies the enrollment
+    assert code(idp.verify_software_token, AccessToken=tok["AccessToken"], UserCode="000000" if totp(secret) != "000000" else "000001") == "CodeMismatchException"
+    assert idp.verify_software_token(AccessToken=tok["AccessToken"], UserCode=totp(secret))["Status"] == "SUCCESS"
+
+    # OPTIONAL pool + user preference ON: challenge appears
+    idp.set_user_pool_mfa_config(UserPoolId=pool, MfaConfiguration="OPTIONAL")
+    assert idp.get_user_pool_mfa_config(UserPoolId=pool)["MfaConfiguration"] == "OPTIONAL"
+    auth()  # preference not set yet -> no challenge
+    idp.set_user_mfa_preference(AccessToken=tok["AccessToken"], SoftwareTokenMfaSettings={"Enabled": True, "PreferredMfa": True})
+    ch = auth()
+    assert ch["ChallengeName"] == "SOFTWARE_TOKEN_MFA", ch
+    res = idp.respond_to_auth_challenge(ClientId=cid, ChallengeName="SOFTWARE_TOKEN_MFA", Session=ch["Session"],
+                                        ChallengeResponses={"USERNAME": name, "SOFTWARE_MFA_CODE": totp(secret)})["AuthenticationResult"]
+    assert "IdToken" in res
+
+    # pool ON: everyone enrolled is challenged; wrong code is CodeMismatchException with the session kept
+    idp.set_user_pool_mfa_config(UserPoolId=pool, MfaConfiguration="ON")
+    ch = auth()
+    assert ch["ChallengeName"] == "SOFTWARE_TOKEN_MFA"
+    wrong = "000000" if totp(secret) != "000000" else "000001"
+    got = code(idp.respond_to_auth_challenge, ClientId=cid, ChallengeName="SOFTWARE_TOKEN_MFA", Session=ch["Session"],
+               ChallengeResponses={"USERNAME": name, "SOFTWARE_MFA_CODE": wrong})
+    assert got == "CodeMismatchException", got
+    # retry the same session with the right code
+    res = idp.respond_to_auth_challenge(ClientId=cid, ChallengeName="SOFTWARE_TOKEN_MFA", Session=ch["Session"],
+                                        ChallengeResponses={"USERNAME": name, "SOFTWARE_MFA_CODE": totp(secret)})["AuthenticationResult"]
+    assert "AccessToken" in res
+    # admin variant of the preference (botocore has no admin software-token associate/verify)
+    idp.admin_set_user_mfa_preference(UserPoolId=pool, Username=name, SoftwareTokenMfaSettings={"Enabled": True, "PreferredMfa": True})
+    # turning the preference off under OPTIONAL stops the challenge
+    idp.set_user_pool_mfa_config(UserPoolId=pool, MfaConfiguration="OPTIONAL")
+    idp.set_user_mfa_preference(AccessToken=res["AccessToken"], SoftwareTokenMfaSettings={"Enabled": False})
+    assert "AuthenticationResult" in auth()
+
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

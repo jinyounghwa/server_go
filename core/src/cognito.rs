@@ -1,7 +1,7 @@
 // Cognito user pools (JSON 1.1): users, app clients, groups, password auth, RS256 JWTs (JWKS endpoint) and
 // Lambda triggers (PreSignUp before creation, PostConfirmation after, PreTokenGeneration at issue).
 // Issuer: {endpoint}/_cognito/{poolId}  (JWKS at /.well-known/jwks.json, discovery at /.well-known/openid-configuration)
-// ponytail: no SRP, MFA, hosted UI/OAuth flows, custom auth challenges (only NEW_PASSWORD_REQUIRED).
+// ponytail: no SRP (29일차), hosted UI/OAuth flows or custom auth challenges; MFA is software-token TOTP only (no SMS).
 // Verification codes are published as events; trigger failures on PostConfirmation/PreToken are best-effort like AWS retries.
 use crate::{b64, epoch, err, need, ApiErr, ACCOUNT, REGION};
 use base64::Engine;
@@ -64,6 +64,14 @@ struct User {
     enabled: bool,
     created: f64,
     code: Option<String>,
+    totp: Option<Totp>, // software token MFA enrollment
+}
+
+// RFC 6238 TOTP over the stored raw secret (hex); verified users can answer the MFA challenge.
+struct Totp {
+    secret: String, // 16 random bytes as hex
+    verified: bool,
+    preferred: bool, // the user turned it on (needed when the pool is OPTIONAL)
 }
 struct Group {
     description: String,
@@ -88,6 +96,7 @@ struct Pool {
     auto_verified: Vec<String>,
     groups: BTreeMap<String, Group>,
     lambda_config: BTreeMap<String, String>, // trigger name -> Lambda function ARN
+    mfa: &'static str, // OFF | OPTIONAL | ON (SetUserPoolMfaConfig)
 }
 
 // A pending Lambda trigger: main.rs runs the function and applies the result.
@@ -118,6 +127,60 @@ pub struct Cognito {
 
 fn e(code: &str, msg: &str) -> ApiErr {
     err(code, msg)
+}
+
+// HMAC-SHA1 on top of the hand-rolled SHA-1 in sigv4 (RFC 6238 needs it for TOTP).
+fn hmac_sha1(key: &[u8], msg: &[u8]) -> Vec<u8> {
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..20].copy_from_slice(&crate::sigv4::sha1(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let ipad: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
+    let opad: Vec<u8> = k.iter().map(|b| b ^ 0x5c).collect();
+    crate::sigv4::sha1(&[opad, crate::sigv4::sha1(&[ipad, msg.to_vec()].concat()).to_vec()].concat()).to_vec()
+}
+
+// RFC 6238: 6 digits, 30-second step. The caller checks the +/-1 step window.
+fn totp_at(secret: &[u8], counter: u64) -> String {
+    let mac = hmac_sha1(secret, &counter.to_be_bytes());
+    let off = (mac[19] & 0xf) as usize;
+    let bin = (((mac[off] as u32) & 0x7f) << 24) | ((mac[off + 1] as u32) << 16) | ((mac[off + 2] as u32) << 8) | mac[off + 3] as u32;
+    format!("{:06}", bin % 1_000_000)
+}
+
+// A code matches within the current or neighbouring 30-second step.
+fn totp_matches(secret: &str, code: &str) -> bool {
+    let raw = (0..secret.len() / 2)
+        .filter_map(|i| u8::from_str_radix(&secret[i * 2..i * 2 + 2], 16).ok())
+        .collect::<Vec<u8>>();
+    let now = epoch() as u64;
+    ((now / 30).saturating_sub(1)..=(now / 30) + 1)
+        .map(|c| totp_at(&raw, c))
+        .any(|c| c == code)
+}
+
+// Standard base32 (A-Z, 2-7, RFC 4648 padding) used for SecretCode.
+fn base32(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut out = String::new();
+    let (mut buf, mut bits) = (0u64, 0u32);
+    for &b in data {
+        buf = (buf << 8) | b as u64;
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(CHARS[((buf >> bits) & 31) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        out.push(CHARS[((buf << (5 - bits)) & 31) as usize] as char);
+    }
+    while out.len() % 8 != 0 {
+        out.push('=');
+    }
+    out
 }
 fn bad_login() -> ApiErr {
     e("NotAuthorizedException", "Incorrect username or password.")
@@ -305,7 +368,19 @@ impl Cognito {
                 Ok(json!({"ChallengeName": "NEW_PASSWORD_REQUIRED", "Session": session,
                           "ChallengeParameters": {"USER_ID_FOR_SRP": uname, "requiredAttributes": "[]", "userAttributes": "{}"}}))
             }
-            _ => Ok(self.tokens(pool, &uname, client, true)),
+            _ => {
+                // MFA: required when the pool is ON (enrolled users) or the user enabled it under OPTIONAL.
+                // ponytail: a pool set to ON with an unenrolled user still lets the password through.
+                let need = u.totp.as_ref().is_some_and(|t| t.verified && (p.mfa == "ON" || t.preferred));
+                if need {
+                    let session = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+                    self.sessions.insert(session.clone(), (pool.into(), uname.clone(), client.into()));
+                    Ok(json!({"ChallengeName": "SOFTWARE_TOKEN_MFA", "Session": session,
+                              "ChallengeParameters": {"USER_ID_FOR_SRP": uname}}))
+                } else {
+                    Ok(self.tokens(pool, &uname, client, true))
+                }
+            }
         }
     }
 
@@ -322,7 +397,7 @@ impl Cognito {
     fn pool_json(id: &str, p: &Pool) -> Value {
         json!({"Id": id, "Name": p.name, "Arn": format!("arn:aws:cognito-idp:{}:{ACCOUNT}:userpool/{id}", *REGION), "CreationDate": p.created,
                "LastModifiedDate": p.created, "Policies": {"PasswordPolicy": p.policy}, "UsernameAttributes": p.username_attrs,
-               "AutoVerifiedAttributes": p.auto_verified, "EstimatedNumberOfUsers": p.users.len()})
+               "AutoVerifiedAttributes": p.auto_verified, "EstimatedNumberOfUsers": p.users.len(), "MfaConfiguration": p.mfa})
     }
     fn user_json(name: &str, u: &User) -> Value {
         json!({"Username": name, "Attributes": attrs_json(u), "UserCreateDate": u.created, "UserLastModifiedDate": u.created,
@@ -341,7 +416,7 @@ impl Cognito {
             return Err(e("UsernameExistsException", "An account with the given username already exists."));
         }
         let salt = uuid::Uuid::new_v4().simple().to_string();
-        p.users.insert(uname.clone(), User { sub, pw: hash_pw(&salt, pw), salt, attrs, status, enabled: true, created: epoch(), code: None });
+        p.users.insert(uname.clone(), User { sub, pw: hash_pw(&salt, pw), salt, attrs, status, enabled: true, created: epoch(), code: None, totp: None });
         Ok(uname)
     }
 
@@ -355,10 +430,16 @@ impl Cognito {
                 let strs = |k: &str| r[k].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>();
                 let lambda_config = ["PreSignUp", "PostConfirmation", "PreTokenGeneration", "CustomMessage", "PostAuthentication"]
                     .iter().filter_map(|t| r["LambdaConfig"][t].as_str().map(|v| (t.to_string(), v.to_string()))).collect();
+                let mfa: &'static str = match r["MfaConfiguration"].as_str().unwrap_or("OFF") {
+                    "OFF" => "OFF",
+                    "OPTIONAL" => "OPTIONAL",
+                    "ON" => "ON",
+                    _ => return Err(e("InvalidParameterException", "MfaConfiguration must be OFF, OPTIONAL or ON")),
+                };
                 let p = Pool { name: need(r, "PoolName")?.into(), created: epoch(), users: BTreeMap::new(),
                     policy: r["Policies"]["PasswordPolicy"].clone().as_object().map_or(json!({"MinimumLength": 8}), |o| json!(o)),
                     username_attrs: strs("UsernameAttributes"), auto_verified: strs("AutoVerifiedAttributes"),
-                    groups: BTreeMap::new(), lambda_config };
+                    groups: BTreeMap::new(), lambda_config, mfa };
                 let out = json!({"UserPool": Self::pool_json(&id, &p)});
                 self.pools.insert(id, p);
                 out
@@ -593,14 +674,97 @@ impl Cognito {
             }
             "RespondToAuthChallenge" | "AdminRespondToAuthChallenge" => {
                 let (pool, user, client) = self.sessions.remove(need(r, "Session")?).ok_or_else(|| e("NotAuthorizedException", "Invalid session for the user."))?;
+                if r["ChallengeName"] == "SOFTWARE_TOKEN_MFA" {
+                    let code = r["ChallengeResponses"]["SOFTWARE_MFA_CODE"].as_str().ok_or_else(|| e("InvalidParameterException", "SOFTWARE_MFA_CODE is required"))?;
+                    let session = need(r, "Session")?.to_string();
+                    let ok = self.pools[&pool].users.get(&user).is_some_and(|u| u.totp.as_ref().is_some_and(|t| totp_matches(&t.secret, code)));
+                    if !ok {
+                        // keep the session so the client can retry with a fresh code
+                        self.sessions.insert(session, (pool, user, client));
+                        return Err(e("CodeMismatchException", "Invalid code or authentication failed."));
+                    }
+                    return Ok(self.tokens(&pool, &user, &client, true));
+                }
                 if r["ChallengeName"] != "NEW_PASSWORD_REQUIRED" {
-                    return Err(e("InvalidParameterException", "Only NEW_PASSWORD_REQUIRED is supported locally"));
+                    return Err(e("InvalidParameterException", "Only NEW_PASSWORD_REQUIRED and SOFTWARE_TOKEN_MFA are supported locally"));
                 }
                 let pw = r["ChallengeResponses"]["NEW_PASSWORD"].as_str().ok_or_else(|| e("InvalidParameterException", "NEW_PASSWORD is required"))?;
                 self.pools[&pool].check_policy(pw)?;
                 let u = self.pools.get_mut(&pool).unwrap().users.get_mut(&user).unwrap();
                 (u.pw, u.status) = (hash_pw(&u.salt, pw), "CONFIRMED");
                 self.tokens(&pool, &user, &client, true)
+            }
+            "AssociateSoftwareToken" | "AdminAssociateSoftwareToken" => {
+                let (pool, user) = if op == "AssociateSoftwareToken" {
+                    self.user_from_token(r)?
+                } else {
+                    let pool = pool_id.to_string();
+                    let name = need(r, "Username")?;
+                    let uname = self.pools.get(&pool).ok_or_else(|| e("ResourceNotFoundException", "User pool does not exist."))?.find(name).ok_or_else(|| e("UserNotFoundException", "User does not exist."))?.to_string();
+                    (pool, uname)
+                };
+                // A fresh secret replaces any old enrollment (unverified until VerifySoftwareToken).
+                let secret: String = (0..2).map(|_| uuid::Uuid::new_v4().simple().to_string()).collect();
+                let raw: Vec<u8> = (0..secret.len() / 2).map(|i| u8::from_str_radix(&secret[i * 2..i * 2 + 2], 16).unwrap_or(0)).collect();
+                let u = self.pools.get_mut(&pool).unwrap().users.get_mut(&user).unwrap();
+                u.totp = Some(Totp { secret, verified: false, preferred: false });
+                json!({"SecretCode": base32(&raw)})
+            }
+            "VerifySoftwareToken" | "AdminVerifySoftwareToken" => {
+                let (pool, user) = self.user_from_token(r)?;
+                let code = need(r, "UserCode")?;
+                let u = self.pools.get_mut(&pool).unwrap().users.get_mut(&user).unwrap();
+                let t = u.totp.as_mut().ok_or_else(|| e("InvalidParameterException", "No software token is associated"))?;
+                if !totp_matches(&t.secret, code) {
+                    return Err(e("CodeMismatchException", "Invalid code or authentication failed."));
+                }
+                t.verified = true;
+                json!({"Status": "SUCCESS"})
+            }
+            "SetUserMFAPreference" | "AdminSetUserMFAPreference" => {
+                let (pool, user) = if op == "SetUserMFAPreference" {
+                    self.user_from_token(r)?
+                } else {
+                    let pool = pool_id.to_string();
+                    let name = need(r, "Username")?;
+                    let uname = self.pools.get(&pool).ok_or_else(|| e("ResourceNotFoundException", "User pool does not exist."))?.find(name).ok_or_else(|| e("UserNotFoundException", "User does not exist."))?.to_string();
+                    (pool, uname)
+                };
+                // botocore sends SoftwareTokenMfaSettings (lowercase "fa"); accept both spellings.
+                let s = r.get("SoftwareTokenMfaSettings").or_else(|| r.get("SoftwareTokenMFASettings")).unwrap_or(&Value::Null);
+                let enabled = s["Enabled"].as_bool().unwrap_or(false);
+                let preferred = s.get("PreferredMfa").or(s.get("PreferredMFA")).and_then(Value::as_bool).unwrap_or(false);
+                let u = self.pools.get_mut(&pool).unwrap().users.get_mut(&user).unwrap();
+                match u.totp.as_mut() {
+                    Some(t) => {
+                        if enabled {
+                            // enabling implies the token is usable (AWS requires verification first)
+                            if !t.verified && preferred {
+                                return Err(e("InvalidParameterException", "Software token must be verified before becoming the preferred MFA"));
+                            }
+                            t.preferred = preferred || enabled;
+                        } else {
+                            t.preferred = false;
+                        }
+                    }
+                    None => return Err(e("InvalidParameterException", "No software token is associated")),
+                }
+                json!({})
+            }
+            "SetUserPoolMfaConfig" => {
+                let p = self.pools.get_mut(&pool_id).ok_or_else(|| e("ResourceNotFoundException", "User pool does not exist."))?;
+                let m: &'static str = match r["MfaConfiguration"].as_str().unwrap_or("OFF") {
+                    "OFF" => "OFF",
+                    "OPTIONAL" => "OPTIONAL",
+                    "ON" => "ON",
+                    _ => return Err(e("InvalidParameterException", "MfaConfiguration must be OFF, OPTIONAL or ON")),
+                };
+                p.mfa = m;
+                json!({"MfaConfiguration": p.mfa, "SoftwareTokenMfaConfiguration": {"Enabled": p.mfa != "OFF"}})
+            }
+            "GetUserPoolMfaConfig" => {
+                let p = self.pools.get(&pool_id).ok_or_else(|| e("ResourceNotFoundException", "User pool does not exist."))?;
+                json!({"MfaConfiguration": p.mfa, "SoftwareTokenMfaConfiguration": {"Enabled": p.mfa != "OFF"}})
             }
             "GetUser" => {
                 let (pool, user) = self.user_from_token(r)?;
@@ -656,6 +820,20 @@ mod tests {
         // RFC 4231 test case 2
         let mac = super::hmac_sha256(b"Jefe", b"what do ya want for nothing?");
         assert_eq!(mac.iter().map(|b| format!("{b:02x}")).collect::<String>(), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    }
+
+    // RFC 6238 test vectors (SHA-1, truncated to 6 digits as Cognito uses).
+    #[test]
+    fn totp_rfc6238_vectors() {
+        use super::{base32, totp_at};
+        let secret = b"12345678901234567890";
+        assert_eq!(totp_at(secret, 59 / 30), "287082");
+        assert_eq!(totp_at(secret, 1111111109 / 30), "081804");
+        assert_eq!(totp_at(secret, 1111111111 / 30), "050471");
+        assert_eq!(totp_at(secret, 1234567890 / 30), "005924");
+        assert_eq!(totp_at(secret, 2000000000 / 30), "279037");
+        assert_eq!(totp_at(secret, 20000000000 / 30), "353130");
+        assert_eq!(base32(&[0xf8, 0x1d, 0x4f, 0xa8]), "7AOU7KA=");
     }
 
     #[test]

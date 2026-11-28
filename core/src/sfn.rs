@@ -285,7 +285,7 @@ fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-// ponytail: States.Hash supports MD5, SHA-256, SHA-384, SHA-512 (no SHA-1 crate); other algorithms return States.Runtime.
+// States.Hash: MD5/SHA-1 use hand-rolled implementations in sigv4 (no extra crates); other algorithms return States.Runtime.
 fn intrinsic(e: &str, input: &Value, ctx: &Value) -> Result<Value, Fail> {
     let (name, rest) = e.split_once('(').ok_or_else(|| fail("States.Runtime", format!("Bad intrinsic {e}")))?;
     let a: Vec<Value> = args(rest.strip_suffix(')').unwrap_or(rest)).iter().map(|x| value_of(x, input, ctx)).collect::<Result<_, _>>()?;
@@ -366,6 +366,7 @@ fn intrinsic(e: &str, input: &Value, ctx: &Value) -> Result<Value, Fail> {
             let algo = a.get(1).and_then(Value::as_str).ok_or_else(|| fail("States.Runtime", "States.Hash algorithm must be a string"))?;
             let digest = match algo {
                 "MD5" => hex_lower(&Md5::digest(data.as_bytes())),
+                "SHA-1" => crate::sigv4::sha1(data.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>(),
                 "SHA-256" => hex_lower(&Sha256::digest(data.as_bytes())),
                 "SHA-384" => hex_lower(&Sha384::digest(data.as_bytes())),
                 "SHA-512" => hex_lower(&Sha512::digest(data.as_bytes())),
@@ -1010,7 +1011,7 @@ mod tests {
         assert!(ev("States.Base64Decode('!!!')").is_err());
         assert_eq!(ev("States.Hash('hello', 'SHA-256')").unwrap(), json!("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"));
         assert_eq!(ev("States.Hash('hello', 'MD5')").unwrap(), json!("5d41402abc4b2a76b9719d911017c592"));
-        assert!(ev("States.Hash('hello', 'SHA-1')").is_err());
+        assert_eq!(ev("States.Hash('hello', 'SHA-1')").unwrap(), json!("aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"));
         assert_eq!(ev("States.StringSplit($.csv, ',;')").unwrap(), json!(["a", "b", "c", "d"]));
         assert_eq!(ev("States.JsonMerge($.o1, $.o2, false)").unwrap(), json!({"a": 1, "b": {"y": 2}, "c": 3}));
         assert_eq!(ev("States.JsonMerge($.o1, $.o2, true)").unwrap(), json!({"a": 1, "b": {"x": 1, "y": 2}, "c": 3}));

@@ -237,7 +237,9 @@ pub(crate) fn error_of(body: &[u8]) -> Option<Value> {
 }
 
 const COGNITO_PUBLIC: &[&str] = &["SignUp", "ConfirmSignUp", "InitiateAuth", "RespondToAuthChallenge", "ForgotPassword",
-    "ConfirmForgotPassword", "GetUser", "ChangePassword", "GlobalSignOut"];
+    "ConfirmForgotPassword", "GetUser", "ChangePassword", "GlobalSignOut",
+    // botocore sends these token-authenticated MFA ops without a SigV4 header (the AccessToken authorizes)
+    "AssociateSoftwareToken", "VerifySoftwareToken", "SetUserMFAPreference"];
 
 enum Svc {
     Cfn(HashMap<String, String>),
