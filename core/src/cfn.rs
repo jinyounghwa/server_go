@@ -1,11 +1,12 @@
 // CloudFormation (Query): JSON/YAML templates (short tags included), parameters, conditions, mappings, intrinsic
 // functions, dependency ordering, outputs, create/update/delete with rollback. Resources are created by calling the
 // emulator's own services.
-// ponytail: no nested stacks, change sets, macros/transforms (SAM), custom resources or drift.
+// Nested stacks (AWS::CloudFormation::Stack) read TemplateURL from this emulator's S3 only and deploy depth-first.
+// ponytail: no change sets, macros/transforms (SAM), custom resources or drift.
 use crate::{err, ApiErr, App, ACCOUNT, REGION};
 use axum::http::{HeaderMap, Method, Uri};
 use serde_json::{json, Map, Value};
-use std::{collections::{BTreeMap, HashMap, HashSet}, sync::Arc};
+use std::{collections::{BTreeMap, HashMap, HashSet}, future::Future, pin::Pin, sync::Arc};
 
 const NOVALUE: &str = "__rocalcloud_novalue__";
 
@@ -29,6 +30,9 @@ struct Stack {
     exports: Vec<(String, String, String)>, // (output key, export name, value) for Fn::ImportValue
     resources: Vec<Res>,
     events: Vec<Value>,
+    parent: Option<String>, // nested stacks: ParentId / RootId (stack ids) and nesting depth
+    root: Option<String>,
+    depth: u8,
 }
 
 #[derive(Default)]
@@ -366,12 +370,72 @@ async fn update_res(app: &Arc<App>, prev: &Res, p: &Value) -> Result<(), String>
 }
 
 // Create one resource; returns its physical id (Ref value) and attributes (Fn::GetAtt).
+// Template body of a nested stack: only objects in this emulator's S3 (s3://bucket/key or {endpoint}/bucket/key).
+fn template_location(url: &str, ep: &str) -> Result<(String, String), String> {
+    let rest = url.strip_prefix("s3://")
+        .or_else(|| url.strip_prefix(&format!("{ep}/")))
+        .or_else(|| url.strip_prefix(&format!("{}/", ep.replace("127.0.0.1", "localhost"))))
+        .ok_or_else(|| format!("TemplateURL must be an object in this emulator's S3 (s3://bucket/key or {ep}/bucket/key), got {url}"))?;
+    let (b, k) = rest.split_once('/').filter(|(b, k)| !b.is_empty() && !k.is_empty()).ok_or("TemplateURL needs a bucket and a key")?;
+    Ok((b.into(), k.into()))
+}
+fn local_template(app: &App, url: &str) -> Result<String, String> {
+    let (b, k) = template_location(url, &crate::endpoint())?;
+    let body = app.s3.lock().unwrap().object(&b, &crate::s3::pct_decode(&k)).ok_or_else(|| format!("TemplateURL object s3://{b}/{k} does not exist"))?;
+    String::from_utf8(body.to_vec()).map_err(|_| "TemplateURL object is not UTF-8 text".to_string())
+}
+
+type Made = Result<(String, Map<String, Value>), String>;
+// Boxed so deploy -> create -> nested deploy can recurse. The child's Outputs become "Outputs.X" attributes.
+// ponytail: a nested stack whose properties change is replaced (deleted and re-created), not updated in place.
+fn nested_create<'a>(app: &'a Arc<App>, parent: &'a str, logical: &'a str, p: &'a Value) -> Pin<Box<dyn Future<Output = Made> + Send + 'a>> {
+    Box::pin(async move {
+        let body = local_template(app, p["TemplateURL"].as_str().unwrap_or(""))?;
+        parse(&body).map_err(|e| e.msg)?;
+        let params = p["Parameters"].as_object().into_iter().flatten().map(|(k, v)| (k.clone(), text(v))).collect();
+        let child = gen_name(parent, logical, 128, false);
+        let id = {
+            let mut c = app.cfn.lock().unwrap();
+            let ps = &c.stacks[parent];
+            let (pid, root, depth) = (ps.id.clone(), ps.root.clone().unwrap_or_else(|| ps.id.clone()), ps.depth + 1);
+            if depth > 5 {
+                return Err("Nested stacks are limited to 5 levels (is the TemplateURL circular?)".into());
+            }
+            let id = format!("arn:aws:cloudformation:{}:{ACCOUNT}:stack/{child}/{}", *REGION, uuid::Uuid::new_v4());
+            c.stacks.insert(child.clone(), Stack { id: id.clone(), status: "CREATE_IN_PROGRESS".into(), reason: String::new(), created: chrono::Utc::now().to_rfc3339(),
+                template: body, params, outputs: vec![], exports: vec![], resources: vec![], events: vec![], parent: Some(pid), root: Some(root), depth });
+            id
+        };
+        deploy(app, &child, false).await;
+        let (status, reason, outs) = {
+            let c = app.cfn.lock().unwrap();
+            let st = &c.stacks[&child];
+            (st.status.clone(), st.reason.clone(), st.outputs.clone())
+        };
+        if status != "CREATE_COMPLETE" {
+            destroy(app, &child).await; // its resources were already rolled back
+            return Err(format!("Embedded stack {id} was not successfully created: {reason}"));
+        }
+        Ok((id, outs.into_iter().map(|(k, v, _)| (format!("Outputs.{k}"), Value::String(v))).collect()))
+    })
+}
+fn nested_delete<'a>(app: &'a Arc<App>, id: &'a str) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(async move {
+        let name = app.cfn.lock().unwrap().stacks.iter().find(|(_, s)| s.id == id).map(|(n, _)| n.clone());
+        let Some(name) = name else { return Ok(()) };
+        destroy(app, &name).await;
+        let left = app.cfn.lock().unwrap().stacks.get(&name).map(|s| s.reason.clone());
+        left.map_or(Ok(()), Err)
+    })
+}
+
 async fn create(app: &Arc<App>, stack: &str, logical: &str, ty: &str, p: &Value) -> Result<(String, Map<String, Value>), String> {
     let name = |key: &str, max: usize, lower: bool| p[key].as_str().map_or_else(|| gen_name(stack, logical, max, lower), String::from);
     let attrs = |pairs: Vec<(&str, Value)>| pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect::<Map<String, Value>>();
     let arn = |svc: &str, rest: &str| format!("arn:aws:{svc}:{}:{ACCOUNT}:{rest}", *REGION);
     let root = crate::iam::Principal::Root;
     Ok(match ty {
+        "AWS::CloudFormation::Stack" => nested_create(app, stack, logical, p).await?,
         "AWS::S3::Bucket" => {
             let n = name("BucketName", 63, true);
             s3_call(app, Method::PUT, &format!("/{n}")).await?;
@@ -591,6 +655,7 @@ async fn delete(app: &Arc<App>, r: &Res) -> Result<(), String> {
     let root = crate::iam::Principal::Root;
     let p = &r.phys;
     match r.ty.as_str() {
+        "AWS::CloudFormation::Stack" => nested_delete(app, p).await,
         "AWS::S3::Bucket" => s3_call(app, Method::DELETE, &format!("/{p}")).await,
         "AWS::SQS::Queue" => api(crate::sqs::handle(app, "DeleteQueue", json!({"QueueUrl": p}).to_string().as_bytes(), "local").await).map(drop),
         "AWS::SNS::Topic" => api(app.sns.lock().unwrap().handle(&q(&[("Action", "DeleteTopic".into()), ("TopicArn", p.clone())]))).map(drop),
@@ -888,6 +953,7 @@ pub async fn run(app: Arc<App>, job: Job) {
 impl Cfn {
     fn stack_json(&self, name: &str, s: &Stack) -> Value {
         json!({"StackId": s.id, "StackName": name, "StackStatus": s.status, "StackStatusReason": s.reason, "CreationTime": s.created,
+            "ParentId": s.parent, "RootId": s.root,
             "Parameters": s.params.iter().map(|(k, v)| json!({"ParameterKey": k, "ParameterValue": v})).collect::<Vec<_>>(),
             "Outputs": s.outputs.iter().map(|(k, v, d)| {
                 let mut o = json!({"OutputKey": k, "OutputValue": v, "Description": d});
@@ -918,7 +984,7 @@ impl Cfn {
                 order(&t).map_err(|e| err("ValidationError", e))?;
                 let id = format!("arn:aws:cloudformation:{}:{ACCOUNT}:stack/{n}/{}", *REGION, uuid::Uuid::new_v4());
                 self.stacks.insert(n.clone(), Stack { id: id.clone(), status: "CREATE_IN_PROGRESS".into(), reason: String::new(), created: chrono::Utc::now().to_rfc3339(),
-                    template: body, params: params(), outputs: vec![], exports: vec![], resources: vec![], events: vec![] });
+                    template: body, params: params(), outputs: vec![], exports: vec![], resources: vec![], events: vec![], parent: None, root: None, depth: 0 });
                 (json!({ "StackId": id }), Some(Job::Deploy(n, false)))
             }
             "UpdateStack" => {
@@ -973,7 +1039,8 @@ impl Cfn {
                 };
                 (json!({ "Stacks": list }), None)
             }
-            "ListStacks" => (json!({"StackSummaries": self.stacks.iter().map(|(n, s)| json!({"StackId": s.id, "StackName": n, "StackStatus": s.status, "CreationTime": s.created})).collect::<Vec<_>>()}), None),
+            "ListStacks" => (json!({"StackSummaries": self.stacks.iter().map(|(n, s)| json!({"StackId": s.id, "StackName": n, "StackStatus": s.status, "CreationTime": s.created,
+                "ParentId": s.parent, "RootId": s.root})).collect::<Vec<_>>()}), None),
             "DescribeStackResources" | "ListStackResources" => {
                 let (n, s) = self.find(&p("StackName")?)?;
                 let list: Vec<Value> = s.resources.iter().map(|r| json!({"StackName": n, "StackId": s.id, "LogicalResourceId": r.logical, "PhysicalResourceId": r.phys,
@@ -1001,9 +1068,20 @@ impl Cfn {
     }
 
     pub fn admin(&self) -> Value {
-        self.stacks
-            .iter()
+        // Tree order: each nested stack right under its parent, indented by depth.
+        fn path<'a>(all: &'a BTreeMap<String, Stack>, mut s: &'a Stack, n: &str) -> Vec<String> {
+            let mut p = vec![n.to_string()];
+            while let Some((pn, ps)) = s.parent.as_ref().and_then(|id| all.iter().find(|(_, x)| &x.id == id)) {
+                p.insert(0, pn.clone());
+                s = ps;
+            }
+            p
+        }
+        let mut list: Vec<(&String, &Stack)> = self.stacks.iter().collect();
+        list.sort_by_cached_key(|(n, s)| path(&self.stacks, s, n));
+        list.into_iter()
             .map(|(n, s)| {
+                let n = &format!("{}{n}", "↳ ".repeat(s.depth as usize));
                 let rows: Vec<Value> = s.resources.iter().map(|r| json!([r.logical, r.ty, r.phys, r.status])).collect();
                 let outs: Vec<String> = s.outputs.iter().map(|(k, v, _)| format!("{k}={v}")).collect();
                 json!({"name": n, "count": rows.len(), "sub": format!("{}{} · 출력: {}", s.status, if s.reason.is_empty() { String::new() } else { format!(" ({})", s.reason) }, outs.join(", ")),
@@ -1041,6 +1119,18 @@ mod tests {
         // Fn::ImportValue resolves from already deployed exports.
         assert_eq!(c.resolve(&json!({"Fn::ImportValue": "shared"})).unwrap(), "value-of-shared");
         assert!(c.resolve(&json!({"Fn::ImportValue": "missing"})).is_err());
+    }
+
+    #[test]
+    fn nested_template_urls() {
+        let ep = "http://127.0.0.1:4566";
+        let ok = |u: &str| super::template_location(u, ep).unwrap();
+        assert_eq!(ok("s3://b/dir/t.yaml"), ("b".into(), "dir/t.yaml".into()));
+        assert_eq!(ok("http://127.0.0.1:4566/b/t.json"), ("b".into(), "t.json".into()));
+        assert_eq!(ok("http://localhost:4566/b/t.json").0, "b");
+        for bad in ["https://b.s3.amazonaws.com/t.json", "http://127.0.0.1:9999/b/t", "http://127.0.0.1:4566.evil.com/b/t", "s3://b", "s3:///t"] {
+            assert!(super::template_location(bad, ep).is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -3817,6 +3817,84 @@ def test_cognito_hosted_ui_oauth():
     assert code(idp.create_user_pool_client, UserPoolId=pool, ClientName="nosecret", AllowedOAuthFlows=["client_credentials"],
                 AllowedOAuthScopes=["api/read"], AllowedOAuthFlowsUserPoolClient=True) == "InvalidOAuthFlowException"
 
+def test_cloudformation_nested_stacks():
+    cf, s3, sqs = boto3.client("cloudformation", **kw), boto3.client("s3", **kw), boto3.client("sqs", **kw)
+    base, bucket = f"nst{run}", f"nst-tpl-{run}"
+    s3.create_bucket(Bucket=bucket)
+
+    def wait(target, stack):
+        for _ in range(300):
+            st = cf.describe_stacks(StackName=stack)["Stacks"][0]
+            if not st["StackStatus"].endswith("_IN_PROGRESS"):
+                assert st["StackStatus"] == target, (st["StackStatus"], st.get("StackStatusReason"))
+                return st
+            time.sleep(0.1)
+        raise AssertionError("stack never settled")
+    put = lambda key, t: s3.put_object(Bucket=bucket, Key=key, Body=json.dumps(t).encode())
+
+    # parent -> child -> grandchild (an SQS queue); parameters flow down, outputs flow up
+    put("grand.json", {"Parameters": {"Prefix": {"Type": "String"}},
+                       "Resources": {"Q": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": {"Fn::Sub": "${Prefix}-q"}}}},
+                       "Outputs": {"Url": {"Value": {"Ref": "Q"}}}})
+    put("child.json", {"Parameters": {"Prefix": {"Type": "String"}},
+                       "Resources": {"G": {"Type": "AWS::CloudFormation::Stack", "Properties": {
+                           "TemplateURL": f"s3://{bucket}/grand.json", "Parameters": {"Prefix": {"Ref": "Prefix"}}}}},
+                       "Outputs": {"Url": {"Value": {"Fn::GetAtt": ["G", "Outputs.Url"]}}}})
+    parent = f"{base}-p"
+    cf.create_stack(StackName=parent, TemplateBody=f"""
+Resources:
+  C:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: {EP}/{bucket}/child.json
+      Parameters:
+        Prefix: {base}
+Outputs:
+  QueueUrl:
+    Value: !GetAtt C.Outputs.Url
+""")
+    st = wait("CREATE_COMPLETE", parent)
+    url = st["Outputs"][0]["OutputValue"]
+    assert url == sqs.get_queue_url(QueueName=f"{base}-q")["QueueUrl"], url
+    nested = [s for s in cf.list_stacks()["StackSummaries"] if s.get("RootId") == st["StackId"]]
+    assert len(nested) == 2 and any(s.get("ParentId") == st["StackId"] for s in nested), nested
+    child = cf.describe_stacks(StackName=next(s for s in nested if s["ParentId"] == st["StackId"])["StackName"])["Stacks"][0]
+    assert child["ParentId"] == child["RootId"] == st["StackId"]
+    # deleting the parent deletes the whole tree
+    cf.delete_stack(StackName=parent)
+    for _ in range(100):
+        if not any(s.get("RootId") == st["StackId"] or s["StackName"] == parent for s in cf.list_stacks()["StackSummaries"]):
+            break
+        time.sleep(0.1)
+    else:
+        raise AssertionError("nested stacks left behind")
+    assert code(sqs.get_queue_url, QueueName=f"{base}-q") == "AWS.SimpleQueueService.NonExistentQueue"
+
+    # a failing child rolls the parent back (the parent's own queue is removed again)
+    put("bad.json", {"Resources": {"X": {"Type": "AWS::Nope::Thing", "Properties": {}}}})
+    bad = f"{base}-bad"
+    cf.create_stack(StackName=bad, TemplateBody=json.dumps({"Resources": {
+        "Mine": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": f"{base}-mine"}},
+        "C": {"Type": "AWS::CloudFormation::Stack", "DependsOn": "Mine", "Properties": {"TemplateURL": f"s3://{bucket}/bad.json"}}}}))
+    st = wait("ROLLBACK_COMPLETE", bad)
+    assert "Embedded stack" in st["StackStatusReason"], st["StackStatusReason"]
+    assert code(sqs.get_queue_url, QueueName=f"{base}-mine") == "AWS.SimpleQueueService.NonExistentQueue"
+    assert not [s for s in cf.list_stacks()["StackSummaries"] if s.get("RootId") == st["StackId"]]
+
+    # only this emulator's S3 is accepted; a template that nests itself stops at depth 5
+    ext = f"{base}-ext"
+    cf.create_stack(StackName=ext, TemplateBody=json.dumps({"Resources": {"C": {"Type": "AWS::CloudFormation::Stack",
+                                                                                "Properties": {"TemplateURL": "https://example.com/t.json"}}}}))
+    assert "TemplateURL must be" in wait("ROLLBACK_COMPLETE", ext)["StackStatusReason"]
+    put("loop.json", {"Resources": {"C": {"Type": "AWS::CloudFormation::Stack", "Properties": {"TemplateURL": f"s3://{bucket}/loop.json"}}}})
+    loop = f"{base}-loop"
+    cf.create_stack(StackName=loop, TemplateBody=json.dumps({"Resources": {"C": {"Type": "AWS::CloudFormation::Stack",
+                                                                                 "Properties": {"TemplateURL": f"s3://{bucket}/loop.json"}}}}))
+    assert "limited to 5 levels" in wait("ROLLBACK_COMPLETE", loop)["StackStatusReason"]
+    assert not [s for s in cf.list_stacks()["StackSummaries"] if s.get("RootId") and s["StackName"].startswith(loop)]
+    for n in (bad, ext, loop):
+        cf.delete_stack(StackName=n)
+
 
 if __name__ == "__main__":
     for name, fn in list(globals().items()):

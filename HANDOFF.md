@@ -498,7 +498,7 @@ ssh ubuntu 'bash ~/work/projects/rocalcloud/tools/ubuntu_verify.sh'   # 큰 변�
   - requests로 authorize → login POST → code → token 교환까지 가면 id_token이 7일차 JWT 인가자를 통과해야 한다.
   - 틀린 `redirect_uri`, 재사용한 코드, PKCE 불일치는 모두 실패해야 한다.
 
-## 32일차 (2026-12-26): CloudFormation 중첩 스택
+## 32일차 (2026-12-26): CloudFormation 중첩 스택 — ✅ 완료: 로컬 S3 TemplateURL만·Parameters·`GetAtt X.Outputs.Y`·2단 중첩 SQS·자식 실패→부모 롤백·외부 URL 거부·깊이 5·ParentId/RootId·GUI 들여쓰기, 단위/boto3(57/60)·두 모드 통과·컨테이너 0
 - `AWS::CloudFormation::Stack`과 `TemplateURL`을 넣는다.
   - URL은 **로컬 S3 객체만** 받는다(`http://127.0.0.1:4566/bucket/key` 형식이나 `s3://`). 그 밖은 거부한다.
 - `Parameters` 전달, `Fn::GetAtt NestedStack.Outputs.X`, 부모를 삭제하거나 롤백할 때 자식도 함께 처리한다. 순환 중첩은 깊이 5에서 거부한다.
